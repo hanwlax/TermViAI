@@ -112,6 +112,22 @@ vec4 to_srgb(vec4 linearRGB)
 
 void main() {
   vec4 fg_color = mix(o_fg_color, o_fg_color_alt, o_fg_color_mix);
+  if (o_has_color >= 32.0) {
+    // One coverage mask for the whole rounded rectangle. Splitting a rounded
+    // background into nine separately blended pieces can expose dark seams
+    // along their shared edges at fractional device-pixel coordinates.
+    vec2 q = abs(o_tex) - o_hsv.xy + o_hsv.z;
+    float distance = length(max(q, vec2(0.0)))
+      + min(max(q.x, q.y), 0.0) - o_hsv.z;
+    float coverage = clamp(0.5 - distance, 0.0, 1.0);
+    float outline = o_has_color - 32.0;
+    if (outline > 0.0) {
+      coverage -= clamp(0.5 - distance - outline, 0.0, 1.0);
+    }
+    color = to_srgb(vec4(fg_color.rgb, fg_color.a * coverage));
+    colorMask = vec4(fg_color.a * coverage);
+    return;
+  }
   if (o_has_color == 3.0) {
     // Solid color block
     color = fg_color;

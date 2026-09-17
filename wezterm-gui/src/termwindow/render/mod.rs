@@ -94,6 +94,7 @@ pub struct LineToElementParams<'a> {
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 pub struct LineToEleShapeCacheKey {
+    pub font_id: wezterm_font::LoadedFontId,
     pub shape_hash: [u8; 16],
     pub composing: Option<(usize, String)>,
     pub shape_generation: usize,
@@ -354,7 +355,8 @@ impl crate::TermWindow {
             .config
             .window_padding
             .left
-            .evaluate_as_pixels(h_context);
+            .evaluate_as_pixels(h_context)
+            + self.termviai_sidebar_pixel_width(h_context.dpi);
         let padding_right = self.config.window_padding.right;
         let padding_top = self.config.window_padding.top.evaluate_as_pixels(v_context);
         let padding_bottom = self
@@ -786,7 +788,12 @@ impl crate::TermWindow {
         metrics: &RenderMetrics,
     ) -> anyhow::Result<Rc<Vec<ShapedInfo>>> {
         let shape_resolve_start = Instant::now();
+        let font = match font {
+            Some(font) => Rc::clone(font),
+            None => self.fonts.resolve_font(style)?,
+        };
         let key = BorrowedShapeCacheKey {
+            font_id: font.id(),
             style,
             text: &cluster.text,
         };
@@ -794,10 +801,6 @@ impl crate::TermWindow {
             Some(Ok(info)) => info,
             Some(Err(err)) => return Err(err),
             None => {
-                let font = match font {
-                    Some(f) => Rc::clone(f),
-                    None => self.fonts.resolve_font(style)?,
-                };
                 let window = self.window.as_ref().unwrap().clone();
 
                 let presentation_width = PresentationWidth::with_cluster(&cluster);

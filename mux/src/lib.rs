@@ -47,6 +47,7 @@ pub mod termwiztermtab;
 pub mod tmux;
 pub mod tmux_commands;
 mod tmux_pty;
+pub mod user_input;
 pub mod window;
 
 use crate::activity::Activity;
@@ -922,7 +923,7 @@ impl Mux {
             };
             for (window_id, win) in windows.iter_mut() {
                 win.prune_dead_tabs(&live_tab_ids);
-                if win.is_empty() {
+                if win.is_empty() && !win.keep_alive_when_empty() {
                     log::trace!("prune_dead_windows: window is now empty");
                     dead_windows.push(*window_id);
                 }
@@ -946,7 +947,7 @@ impl Mux {
             self.remove_window_internal(window_id);
         }
 
-        if self.is_empty() {
+        if self.is_empty() && !self.has_keep_alive_windows() {
             log::trace!("prune_dead_windows: is_empty, send MuxNotification::Empty");
             self.notify(MuxNotification::Empty);
         } else {
@@ -1027,6 +1028,15 @@ impl Mux {
 
     pub fn is_empty(&self) -> bool {
         self.panes.read().is_empty()
+    }
+
+    /// GUI application windows may outlive their final terminal pane.
+    /// This is separate from `is_empty`, whose callers count terminal sessions.
+    pub fn has_keep_alive_windows(&self) -> bool {
+        self.windows
+            .read()
+            .values()
+            .any(|window| window.keep_alive_when_empty())
     }
 
     pub fn is_workspace_empty(&self, workspace: &str) -> bool {
@@ -1335,17 +1345,23 @@ impl Mux {
             let window = self
                 .get_window_mut(window_id)
                 .ok_or_else(|| anyhow!("window_id {} not found on this server", window_id))?;
-            let tab = window
-                .get_active_tab()
-                .ok_or_else(|| anyhow!("window {} has no tabs", window_id))?;
-            let pane = tab
-                .get_active_pane()
-                .ok_or_else(|| anyhow!("active tab in window {} has no panes", window_id))?;
-            term_config = pane.get_config();
-
-            let size = tab.get_size();
-
-            (window_id, size)
+            match window.get_active_tab() {
+                Some(tab) => {
+                    let pane = tab.get_active_pane().ok_or_else(|| {
+                        anyhow!("active tab in window {} has no panes", window_id)
+                    })?;
+                    term_config = pane.get_config();
+                    (window_id, tab.get_size())
+                }
+                None if window.keep_alive_when_empty() => {
+                    // Hosts/New Tab owns a real empty GUI window. Its first SSH
+                    // session uses the GUI's measured content size and default
+                    // terminal config, rather than inheriting a dummy shell.
+                    term_config = None;
+                    (window_id, size)
+                }
+                None => anyhow::bail!("window {} has no tabs", window_id),
+            }
         } else {
             term_config = None;
             window_builder = self.new_empty_window(Some(workspace_for_new_window), window_position);
@@ -1471,5 +1487,80 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
                 data: Arc::new(data),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod empty_gui_window_tests {
+    use super::*;
+
+    fn insert_window(mux: &Mux, keep_alive: bool) -> WindowId {
+        // No global mux, shell, PTY or GUI is needed to exercise pruning.
+        let mut window = Window::new(Some("hosts".to_owned()), None);
+        window.set_keep_alive_when_empty(keep_alive);
+        let id = window.window_id();
+        mux.windows.write().insert(id, window);
+        id
+    }
+
+    fn notifications(mux: &Mux) -> Arc<Mutex<Vec<MuxNotification>>> {
+        let notifications = Arc::new(Mutex::new(vec![]));
+        let saved = Arc::clone(&notifications);
+        mux.subscribe(move |notification| {
+            saved.lock().push(notification);
+            true
+        });
+        notifications
+    }
+
+    #[test]
+    fn pane_free_gui_window_survives_pruning_and_does_not_signal_exit() {
+        let mux = Mux::new(None);
+        let id = insert_window(&mux, true);
+        let events = notifications(&mux);
+        mux.prune_dead_windows();
+        mux.prune_dead_windows();
+        assert!(mux.is_empty());
+        assert!(mux.has_keep_alive_windows());
+        assert!(mux.get_window(id).is_some());
+        assert_eq!(mux.iter_windows_in_workspace("hosts"), vec![id]);
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            MuxNotification::Empty | MuxNotification::WindowRemoved(_)
+        )));
+    }
+
+    #[test]
+    fn explicit_close_removes_empty_gui_window_and_signals_exit() {
+        let mux = Mux::new(None);
+        let id = insert_window(&mux, true);
+        let events = notifications(&mux);
+        mux.kill_window(id);
+        assert!(mux.get_window(id).is_none());
+        assert!(!mux.has_keep_alive_windows());
+        let events = events.lock();
+        assert!(events.iter().any(
+            |event| matches!(event, MuxNotification::WindowRemoved(removed) if *removed == id)
+        ));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, MuxNotification::Empty)));
+    }
+
+    #[test]
+    fn transient_empty_windows_still_prune_while_another_gui_window_is_retained() {
+        let mux = Mux::new(None);
+        let home = insert_window(&mux, true);
+        let temporary = insert_window(&mux, false);
+        let other_home = insert_window(&mux, true);
+        let events = notifications(&mux);
+        mux.prune_dead_windows();
+        assert!(mux.get_window(temporary).is_none());
+        mux.kill_window(other_home);
+        assert!(mux.get_window(home).is_some());
+        assert!(!events
+            .lock()
+            .iter()
+            .any(|event| matches!(event, MuxNotification::Empty)));
     }
 }

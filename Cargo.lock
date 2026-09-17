@@ -6027,6 +6027,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "termviai-broadcast"
+version = "0.1.0"
+
+[[package]]
 name = "textwrap"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7105,7 +7109,7 @@ dependencies = [
 
 [[package]]
 name = "wezterm-gui"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "anyhow",
  "benchmarking",
@@ -7162,6 +7166,7 @@ dependencies = [
  "terminfo",
  "termwiz",
  "termwiz-funcs",
+ "termviai-broadcast",
  "textwrap",
  "thiserror 1.0.69",
  "tiny-skia",
@@ -7182,6 +7187,7 @@ dependencies = [
  "wezterm-ssh",
  "wezterm-term",
  "wezterm-toast-notification",
+ "wezterm-version",
  "wgpu",
  "winapi",
  "window",

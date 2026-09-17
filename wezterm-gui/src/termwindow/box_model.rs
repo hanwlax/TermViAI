@@ -499,6 +499,76 @@ struct Rects {
     translate: euclid::Vector2D<f32, PixelUnit>,
 }
 
+fn filled_rounded_background_radius(
+    element: &ComputedElement,
+    colors: &ElementColors,
+) -> Option<f32> {
+    // Keep the general corner API for custom shapes and real borders. The
+    // native UI's standard solid roundrects can use one continuous mask.
+    if element.border_rect != element.padding
+        || colors.bg != InheritableColor::Color(colors.border.top)
+        || colors.border.top != colors.border.right
+        || colors.border.top != colors.border.bottom
+        || colors.border.top != colors.border.left
+    {
+        return None;
+    }
+    uniform_filled_corner_radius(element.border_corners.as_ref()?)
+}
+
+fn uniform_filled_corner_radius(c: &PixelCorners) -> Option<f32> {
+    use super::render::corners::*;
+    let radius = c.top_left.width;
+    if radius <= 0.
+        || !radius.is_finite()
+        || c.top_left.poly != TOP_LEFT_ROUNDED_CORNER
+        || c.top_right.poly != TOP_RIGHT_ROUNDED_CORNER
+        || c.bottom_left.poly != BOTTOM_LEFT_ROUNDED_CORNER
+        || c.bottom_right.poly != BOTTOM_RIGHT_ROUNDED_CORNER
+        || [c.top_left, c.top_right, c.bottom_left, c.bottom_right]
+            .iter()
+            .any(|corner| corner.width != radius || corner.height != radius)
+    {
+        None
+    } else {
+        Some(radius)
+    }
+}
+
+#[cfg(test)]
+mod termviai_rounded_rectangle_tests {
+    use super::*;
+    use crate::termwindow::render::corners::*;
+
+    fn corners(radius: f32) -> PixelCorners {
+        let corner = |poly| PixelSizedPoly {
+            poly,
+            width: radius,
+            height: radius,
+        };
+        PixelCorners {
+            top_left: corner(TOP_LEFT_ROUNDED_CORNER),
+            top_right: corner(TOP_RIGHT_ROUNDED_CORNER),
+            bottom_left: corner(BOTTOM_LEFT_ROUNDED_CORNER),
+            bottom_right: corner(BOTTOM_RIGHT_ROUNDED_CORNER),
+        }
+    }
+
+    #[test]
+    fn standard_fills_use_continuous_mask_but_custom_corners_are_preserved() {
+        for radius in [1., 9., 13.5, 24.] {
+            assert_eq!(uniform_filled_corner_radius(&corners(radius)), Some(radius));
+        }
+        let mut custom = corners(9.);
+        custom.top_left.poly = TOP_RIGHT_ROUNDED_CORNER;
+        assert_eq!(uniform_filled_corner_radius(&custom), None);
+        let mut asymmetric = corners(9.);
+        asymmetric.bottom_left.height = 6.;
+        assert_eq!(uniform_filled_corner_radius(&asymmetric), None);
+        assert_eq!(uniform_filled_corner_radius(&corners(0.)), None);
+    }
+}
+
 impl Element {
     fn compute_rects(&self, context: &LayoutContext, content_rect: RectF) -> Rects {
         let padding = self.padding.to_pixels(context);
@@ -540,6 +610,23 @@ impl Element {
 }
 
 impl super::TermWindow {
+    /// Draw a filled rounded rectangle (line_width == 0) or an inward outline
+    /// with a transparent center, using one quad and no atlas allocation.
+    /// All dimensions are physical pixels. Use background/overlay layers (0/2).
+    pub fn rounded_rectangle_outline<'a>(
+        &self,
+        layers: &'a mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        line_width: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<QuadImpl<'a>> {
+        let mut quad = self.filled_rectangle(layers, layer_num, rect, color)?;
+        quad.set_rounded_rectangle(rect.width(), rect.height(), radius, line_width);
+        Ok(quad)
+    }
+
     pub fn compute_element<'a>(
         &self,
         context: &LayoutContext,
@@ -931,13 +1018,17 @@ impl super::TermWindow {
                 if element.content_rect.width() >= poly.width {
                     let mut quad = self.poly_quad(
                         &mut layers,
-                        1,
+                        2,
                         element.content_rect.origin,
                         poly.poly,
                         *line_width,
                         euclid::size2(poly.width, poly.height),
                         LinearRgba::TRANSPARENT,
                     )?;
+                    // UI vectors have a grayscale alpha mask. The text shader
+                    // replaces foreground alpha and can make fading icons
+                    // remain opaque; the overlay path multiplies both alphas.
+                    quad.set_grayscale();
                     self.resolve_text(colors, inherited_colors).apply(&mut quad);
                 }
             }
@@ -1015,6 +1106,18 @@ impl super::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
         inherited_colors: Option<&ElementColors>,
     ) -> anyhow::Result<()> {
+        if let Some(radius) = filled_rounded_background_radius(element, colors) {
+            let mut quad = self.rounded_rectangle_outline(
+                layers,
+                0,
+                element.border_rect,
+                radius,
+                0.,
+                LinearRgba::TRANSPARENT,
+            )?;
+            self.resolve_bg(colors, inherited_colors).apply(&mut quad);
+            return Ok(());
+        }
         let mut top_left_width = 0.;
         let mut top_left_height = 0.;
         let mut top_right_width = 0.;

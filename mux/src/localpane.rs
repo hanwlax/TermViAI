@@ -437,6 +437,11 @@ impl Pane for LocalPane {
         Ok(Some(self.pty.lock().try_clone_reader()?))
     }
 
+    fn send_raw_input(&self, bytes: &[u8]) -> Result<(), Error> {
+        Mux::get().record_input_for_current_identity();
+        self.terminal.lock().send_raw_input(bytes)
+    }
+
     fn send_paste(&self, text: &str) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
         if self.tmux_domain.lock().is_some() {
@@ -1014,6 +1019,7 @@ impl LocalPane {
     ) -> Self {
         let (process, signaller, pid) = split_child(process);
 
+        terminal.set_input_capture_id(pane_id);
         terminal.set_device_control_handler(Box::new(LocalPaneDCSHandler {
             pane_id,
             tmux_domain: None,

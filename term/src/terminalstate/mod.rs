@@ -355,6 +355,7 @@ pub struct TerminalState {
     term_version: String,
 
     writer: BufWriter<ThreadedWriter>,
+    input_capture_id: Option<usize>,
 
     image_cache: lru::LruCache<[u8; 32], Arc<ImageData>>,
     sixel_scrolls_right: bool,
@@ -461,7 +462,7 @@ impl ThreadedWriter {
             while let Ok(msg) = receiver.recv() {
                 match msg {
                     WriterMessage::Data(buf) => {
-                        if writer.write(&buf).is_err() {
+                        if writer.write_all(&buf).is_err() {
                             break;
                         }
                     }
@@ -567,6 +568,7 @@ impl TerminalState {
             term_program: term_program.to_string(),
             term_version: term_version.to_string(),
             writer,
+            input_capture_id: None,
             image_cache: lru::LruCache::new(NonZeroUsize::new(16).unwrap()),
             user_vars: HashMap::new(),
             kitty_img: Default::default(),
@@ -816,6 +818,27 @@ impl TerminalState {
         }
     }
 
+    /// Bind explicit user-input capture to the embedding pane. Parser replies
+    /// continue to use the ordinary writer and never enter this input method.
+    pub fn set_input_capture_id(&mut self, id: usize) {
+        self.input_capture_id = Some(id);
+    }
+
+    /// Submit already encoded user input through the existing asynchronous
+    /// writer. Capture happens before BufWriter/ThreadedWriter, on the caller's
+    /// thread, and never captures buffered protocol replies.
+    pub fn send_raw_input(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if let Some(id) = self.input_capture_id {
+            if let Some(result) = crate::user_input::write(id, bytes) {
+                result?;
+                return Ok(());
+            }
+        }
+        self.writer.write_all(bytes)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Send text to the terminal that is the result of pasting.
     /// If bracketed paste mode is enabled, the paste is enclosed
     /// in the bracketing, otherwise it is fed to the writer as-is.
@@ -841,9 +864,7 @@ impl TerminalState {
             buf.push_str("\x1b[201~");
         }
 
-        self.writer.write_all(buf.as_bytes())?;
-        self.writer.flush()?;
-        Ok(())
+        self.send_raw_input(buf.as_bytes())
     }
 
     /// Informs the terminal that the viewport of the window has resized to the

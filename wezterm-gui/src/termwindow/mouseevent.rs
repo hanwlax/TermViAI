@@ -59,6 +59,24 @@ impl super::TermWindow {
     }
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        if self.termviai_mouse(&event, context) {
+            return;
+        }
+        // The zoom target is the selected session, not whichever pane happens
+        // to be under the mouse. Consume it before terminal mouse reporting or
+        // broadcast routing can turn Ctrl+wheel into remote input.
+        if self.config.termviai_ui
+            && self.get_modal().is_none()
+            && event.modifiers.contains(::window::Modifiers::CTRL)
+        {
+            if let WMEK::VertWheel(delta) = event.kind {
+                if let Err(err) = self.termviai_adjust_session_font(delta) {
+                    self.termviai_broadcast.error = format!("{:#}", err);
+                }
+                context.invalidate();
+                return;
+            }
+        }
         log::trace!("{:?}", event);
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
@@ -69,11 +87,12 @@ impl super::TermWindow {
 
         let border = self.get_os_border();
 
-        let first_line_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.) as isize
-        } else {
-            0
-        } + border.top.get() as isize;
+        let first_line_offset =
+            if self.show_tab_bar && (self.config.termviai_ui || !self.config.tab_bar_at_bottom) {
+                self.tab_bar_pixel_height().unwrap_or(0.) as isize
+            } else {
+                0
+            } + border.top.get() as isize;
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -300,14 +319,44 @@ impl super::TermWindow {
         } else {
             0.
         };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let (top_bar_height, bottom_bar_height) =
+            if !self.config.termviai_ui && self.config.tab_bar_at_bottom {
+                (0.0, tab_bar_height)
+            } else {
+                (tab_bar_height, 0.0)
+            };
 
         let border = self.get_os_border();
-        let y_offset = top_bar_height + border.top.get() as f32;
+        let default_offset = top_bar_height + border.top.get() as f32;
+        let default_height = self.dimensions.pixel_height.saturating_sub(
+            default_offset as usize + border.bottom.get() + bottom_bar_height as usize,
+        );
+        let (y_offset, scrollbar_height) = if self.config.termviai_ui {
+            let (_, padding_top) = self.padding_left_top();
+            self.get_panes_to_render()
+                .iter()
+                .find(|pos| pos.pane.pane_id() == pane.pane_id())
+                .map(|pos| {
+                    (
+                        default_offset
+                            + padding_top
+                            + self
+                                .termviai_pane_visual_offset(
+                                    self.termviai_font_source_pane(pos.pane.pane_id()),
+                                )
+                                .1
+                            + pos.top as f32 * self.render_metrics.cell_size.height as f32,
+                        self.termviai_pane_visual_content_height(
+                            self.termviai_font_source_pane(pos.pane.pane_id()),
+                        )
+                        .map(|height| height.max(0.0) as usize)
+                        .unwrap_or(pos.pane.get_dimensions().pixel_height),
+                    )
+                })
+                .unwrap_or((default_offset, default_height))
+        } else {
+            (default_offset, default_height)
+        };
 
         let from_top = start_event.coords.y.saturating_sub(item.y as isize);
         let effective_thumb_top = event
@@ -322,10 +371,8 @@ impl super::TermWindow {
             effective_thumb_top,
             &*pane,
             current_viewport,
-            self.dimensions.pixel_height.saturating_sub(
-                y_offset as usize + border.bottom.get() + bottom_bar_height as usize,
-            ),
-            self.min_scroll_bar_height() as usize,
+            scrollbar_height,
+            (self.min_scroll_bar_height() as usize).min(scrollbar_height),
         );
         self.set_viewport(pane.pane_id(), Some(row), dims);
         context.invalidate();
@@ -668,12 +715,48 @@ impl super::TermWindow {
         );
 
         for pos in self.get_panes_to_render() {
-            if !is_already_captured
-                && row >= pos.top as i64
-                && row <= (pos.top + pos.height) as i64
-                && column >= pos.left
-                && column <= pos.left + pos.width
-            {
+            let contains_pointer = if self.config.termviai_ui {
+                let (padding_left, padding_top) = self.padding_left_top();
+                let border = self.get_os_border();
+                let tab_height = if self.show_tab_bar {
+                    self.tab_bar_pixel_height().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let (dx, dy) =
+                    self.termviai_pane_visual_offset(self.termviai_font_source_pane(pos.pane.pane_id()));
+                let content_padding = self.termviai_pane_content_padding_pixels(
+                    self.termviai_font_source_pane(pos.pane.pane_id()),
+                );
+                let left = padding_left
+                    + border.left.get() as f32
+                    + dx
+                    - content_padding
+                    + pos.left as f32 * self.render_metrics.cell_size.width as f32;
+                let top = padding_top
+                    + border.top.get() as f32
+                    + tab_height
+                    + dy
+                    - content_padding
+                    + pos.top as f32 * self.render_metrics.cell_size.height as f32;
+                let pane_dimensions = pos.pane.get_dimensions();
+                let width = pane_dimensions.pixel_width as f32 + content_padding * 2.;
+                let height = self
+                    .termviai_pane_visual_content_height(
+                        self.termviai_font_source_pane(pos.pane.pane_id()),
+                    )
+                    .unwrap_or(pane_dimensions.pixel_height as f32)
+                    + content_padding * 2.;
+                let x = event.coords.x as f32;
+                let y = event.coords.y as f32;
+                x >= left && x < left + width && y >= top && y < top + height
+            } else {
+                row >= pos.top as i64
+                    && row <= (pos.top + pos.height) as i64
+                    && column >= pos.left
+                    && column <= pos.left + pos.width
+            };
+            if !is_already_captured && contains_pointer {
                 if pane.pane_id() != pos.pane.pane_id() {
                     // We're over a pane that isn't active
                     match &event.kind {
@@ -721,6 +804,42 @@ impl super::TermWindow {
                 }
 
                 break;
+            }
+        }
+
+        if self.config.termviai_ui {
+            if let Some(pos) = self
+                .get_panes_to_render()
+                .into_iter()
+                .find(|pos| pos.pane.pane_id() == pane.pane_id())
+            {
+                let metrics = self.termviai_pane_metrics(pane.pane_id());
+                let (padding_left, padding_top) = self.padding_left_top();
+                let border = self.get_os_border();
+                let tab_height = if self.show_tab_bar {
+                    self.tab_bar_pixel_height().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let (dx, dy) =
+                    self.termviai_pane_visual_offset(self.termviai_font_source_pane(pos.pane.pane_id()));
+                let px = event.coords.x
+                    - (padding_left + border.left.get() as f32 + dx).round() as isize
+                    - pos.left as isize * self.render_metrics.cell_size.width;
+                let py = event.coords.y
+                    - (padding_top + border.top.get() as f32 + tab_height + dy).round() as isize
+                    - pos.top as isize * self.render_metrics.cell_size.height;
+                let mapped = super::termviai_font::session_cell_position(
+                    px,
+                    py,
+                    metrics.cell_size.width,
+                    metrics.cell_size.height,
+                    pane.is_mouse_grabbed(),
+                );
+                column = mapped.column;
+                row = mapped.row;
+                x_pixel_offset = mapped.x_pixel_offset;
+                y_pixel_offset = mapped.y_pixel_offset;
             }
         }
 

@@ -275,6 +275,10 @@ pub trait WindowOps {
     /// Resize the inner or client area of the window
     fn set_inner_size(&self, width: usize, height: usize);
 
+    /// Set the minimum inner or client size in logical pixels. Backends that
+    /// cannot express this constraint may leave the default implementation.
+    fn set_min_inner_size(&self, _width: usize, _height: usize) {}
+
     /// Use for windows snap layouts
     fn set_maximize_button_position(&self, _rect: ScreenRect) {}
 

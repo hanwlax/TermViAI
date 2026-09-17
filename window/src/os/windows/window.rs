@@ -127,6 +127,7 @@ pub(crate) struct WindowInner {
     config: ConfigHandle,
     paint_throttled: bool,
     invalidated: bool,
+    min_inner_size: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -547,6 +548,7 @@ impl Window {
             config: config.clone(),
             paint_throttled: false,
             invalidated: true,
+            min_inner_size: None,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -939,6 +941,13 @@ impl WindowOps for Window {
                 }
             })
             .detach();
+            Ok(())
+        });
+    }
+
+    fn set_min_inner_size(&self, width: usize, height: usize) {
+        Connection::with_window_inner(self.0, move |inner| {
+            inner.min_inner_size = Some((width, height));
             Ok(())
         });
     }
@@ -1559,6 +1568,30 @@ unsafe fn wm_windowposchanged(
 ) -> Option<LRESULT> {
     // let pos = &*(lparam as *const WINDOWPOS);
     wm_size(hwnd, 0, 0, 0)?;
+    Some(0)
+}
+
+unsafe fn wm_get_min_max_info(
+    hwnd: HWND,
+    _msg: UINT,
+    _wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    let inner = rc_from_hwnd(hwnd)?;
+    let inner = inner.borrow();
+    let (logical_width, logical_height) = inner.min_inner_size?;
+    let dpi = GetDpiForWindow(hwnd);
+    let client_width = logical_width * dpi as usize / 96;
+    let client_height = logical_height * dpi as usize / 96;
+    let (width, height) = adjust_client_to_window_dimensions(
+        decorations_to_style(inner.config.window_decorations),
+        client_width,
+        client_height,
+        dpi,
+    );
+    let info = &mut *(lparam as *mut MINMAXINFO);
+    info.ptMinTrackSize.x = width;
+    info.ptMinTrackSize.y = height;
     Some(0)
 }
 
@@ -2951,6 +2984,7 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_NCCALCSIZE => wm_nccalcsize(hwnd, msg, wparam, lparam),
         WM_NCHITTEST => wm_nchittest(hwnd, msg, wparam, lparam),
         WM_PAINT => wm_paint(hwnd, msg, wparam, lparam),
+        WM_GETMINMAXINFO => wm_get_min_max_info(hwnd, msg, wparam, lparam),
         WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE => wm_enter_exit_size_move(hwnd, msg, wparam, lparam),
         WM_WINDOWPOSCHANGED => wm_windowposchanged(hwnd, msg, wparam, lparam),
         WM_SETFOCUS => wm_set_focus(hwnd, msg, wparam, lparam),

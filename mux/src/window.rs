@@ -14,6 +14,7 @@ pub struct Window {
     workspace: String,
     title: String,
     initial_position: Option<GuiPosition>,
+    keep_alive_when_empty: bool,
 }
 
 impl Window {
@@ -27,6 +28,7 @@ impl Window {
             title: String::new(),
             workspace: workspace.unwrap_or_else(|| Mux::get().active_workspace()),
             initial_position,
+            keep_alive_when_empty: false,
         }
     }
 
@@ -102,6 +104,16 @@ impl Window {
     /// Return true if this window contains no tabs.
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
+    }
+
+    /// Retain a GUI window that can display useful content without a terminal.
+    /// Explicit `Mux::kill_window` still closes a retained window.
+    pub fn set_keep_alive_when_empty(&mut self, keep_alive: bool) {
+        self.keep_alive_when_empty = keep_alive;
+    }
+
+    pub fn keep_alive_when_empty(&self) -> bool {
+        self.keep_alive_when_empty
     }
 
     /// Return number of tabs in this window.

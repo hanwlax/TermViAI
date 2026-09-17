@@ -19,6 +19,7 @@ members = [
 ]
 resolver = "2"
 exclude = [
+  "termviai", # Independent broadcast policy package during bootstrap
   "termwiz/codegen",
   "wezterm-char-props/codegen",
 ]

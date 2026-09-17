@@ -78,7 +78,7 @@ pub struct Config {
     #[dynamic(default)]
     pub allow_square_glyphs_to_overflow_width: AllowSquareGlyphOverflow,
 
-    #[dynamic(default)]
+    #[dynamic(default = "default_termviai_decorations")]
     pub window_decorations: WindowDecorations,
 
     #[dynamic(default = "default_integrated_title_buttons")]
@@ -113,7 +113,7 @@ pub struct Config {
     pub dpi_by_screen: HashMap<String, f64>,
 
     /// The baseline font to use
-    #[dynamic(default)]
+    #[dynamic(default = "default_termviai_font")]
     pub font: TextStyle,
 
     /// An optional set of style rules to select the font based
@@ -196,6 +196,7 @@ pub struct Config {
 
     /// Use a named color scheme rather than the palette specified
     /// by the colors setting.
+    #[dynamic(default = "default_termviai_color_scheme")]
     pub color_scheme: Option<String>,
 
     /// Named color schemes
@@ -482,6 +483,10 @@ pub struct Config {
     /// active tab.  Clicking on a tab activates it.
     #[dynamic(default = "default_true")]
     pub enable_tab_bar: bool,
+
+    /// Enable the native TermViAI SSH library and workspace chrome.
+    #[dynamic(default = "default_true")]
+    pub termviai_ui: bool,
     #[dynamic(default = "default_true")]
     pub use_fancy_tab_bar: bool,
 
@@ -1756,6 +1761,18 @@ fn default_font_size() -> f64 {
     12.0
 }
 
+fn default_termviai_font() -> TextStyle {
+    TextStyle {
+        // Windows registers JetBrainsMono Nerd Font Mono with this family name.
+        font: vec![crate::font::FontAttributes::new("JetBrainsMono NFM")],
+        foreground: None,
+    }
+}
+
+fn default_termviai_color_scheme() -> Option<String> {
+    Some("Catppuccin Mocha".into())
+}
+
 pub(crate) fn compute_cache_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::cache_dir() {
         return Ok(runtime.join("wezterm"));
@@ -2211,4 +2228,12 @@ fn default_macos_forward_mods() -> Modifiers {
 
 fn default_colr_rasterizer() -> FontRasterizerSelection {
     FontRasterizerSelection::Harfbuzz
+}
+
+fn default_termviai_decorations() -> WindowDecorations {
+    if cfg!(windows) {
+        WindowDecorations::RESIZE
+    } else {
+        WindowDecorations::default()
+    }
 }

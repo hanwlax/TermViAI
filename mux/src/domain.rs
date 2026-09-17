@@ -115,19 +115,16 @@ pub trait Domain: Downcast + Send + Sync {
                     None => anyhow::bail!("Invalid tab id {}", src_tab),
                 };
 
-                let pane = src_tab.remove_pane(src_pane_id).ok_or_else(|| {
-                    anyhow::anyhow!("pane {} not found in its containing tab!?", src_pane_id)
-                })?;
+                let pane = tab.move_pane_from(&src_tab, src_pane_id, pane_id, split_request)?;
 
                 if src_tab.is_dead() {
                     mux.remove_tab(src_tab.tab_id());
                 }
-
-                pane
+                return Ok(pane);
             }
         };
 
-        // pane_index may have changed if src_pane was also in the same tab
+        // Spawning can yield while another operation changes the tab layout.
         let final_pane_index = match tab
             .iter_panes_ignoring_zoom()
             .iter()
@@ -495,23 +492,31 @@ impl LocalDomain {
 /// awkward at the moment.
 #[derive(Clone)]
 pub(crate) struct WriterWrapper {
+    pane_id: PaneId,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
 }
 
 impl WriterWrapper {
-    pub fn new(writer: Box<dyn Write + Send>) -> Self {
+    pub fn new(pane_id: PaneId, writer: Box<dyn Write + Send>) -> Self {
         Self {
             writer: Arc::new(Mutex::new(writer)),
+            pane_id,
         }
     }
 }
 
 impl std::io::Write for WriterWrapper {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(result) = crate::user_input::write(self.pane_id, buf) {
+            return result;
+        }
         self.writer.lock().write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if crate::user_input::active(self.pane_id) {
+            return Ok(());
+        }
         self.writer.lock().flush()
     }
 }
@@ -616,7 +621,7 @@ impl Domain for LocalDomain {
             self.name
         );
         let child_result = pair.slave.spawn_command(cmd);
-        let mut writer = WriterWrapper::new(pair.master.take_writer()?);
+        let mut writer = WriterWrapper::new(pane_id, pair.master.take_writer()?);
 
         let mut terminal = wezterm_term::Terminal::new(
             size,

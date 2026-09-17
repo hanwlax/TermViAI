@@ -1,0 +1,11 @@
+[package]
+name = "termviai-broadcast"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Transport-independent selective broadcast policy for TermViAI"
+publish = false
+
+# Keep initial policy tests independent of WezTerm's GUI/native dependencies.
+# A later GUI adapter can consume this package as a path dependency.
+[workspace]

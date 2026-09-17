@@ -29,7 +29,7 @@ impl crate::TermWindow {
 
         let palette = self.palette().clone();
         let tab_bar_height = self.tab_bar_pixel_height()?;
-        let tab_bar_y = if self.config.tab_bar_at_bottom {
+        let tab_bar_y = if !self.config.termviai_ui && self.config.tab_bar_at_bottom {
             ((self.dimensions.pixel_height as f32) - (tab_bar_height + border.bottom.get() as f32))
                 .max(0.)
         } else {
@@ -111,6 +111,9 @@ impl crate::TermWindow {
         fontconfig: &wezterm_font::FontConfiguration,
         render_metrics: &RenderMetrics,
     ) -> anyhow::Result<f32> {
+        if config.termviai_ui {
+            return Ok(52. * fontconfig.get_dpi() as f32 / 96.);
+        }
         if config.use_fancy_tab_bar {
             let font = fontconfig.title_font()?;
             Ok((font.metrics().cell_height.get() as f32 * 1.75).ceil())

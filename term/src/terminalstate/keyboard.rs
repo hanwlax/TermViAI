@@ -1,6 +1,5 @@
 use crate::input::*;
 use crate::TerminalState;
-use std::io::Write;
 use termwiz::input::{KeyCodeEncodeModes, KeyboardEncoding};
 
 impl TerminalState {
@@ -51,8 +50,7 @@ impl TerminalState {
         } else {
             log::trace!("{}: sending {:?}, {:?} {:?}", label, to_send, key, mods);
         }
-        self.writer.write_all(to_send.as_bytes())?;
-        self.writer.flush()?;
+        self.send_raw_input(to_send.as_bytes())?;
 
         Ok(())
     }

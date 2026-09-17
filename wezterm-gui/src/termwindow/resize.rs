@@ -195,10 +195,13 @@ impl super::TermWindow {
                 pixel_max: size.pixel_height as f32,
                 pixel_cell: self.render_metrics.cell_size.height as f32,
             };
-            let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
+            let padding_left = (config.window_padding.left.evaluate_as_pixels(h_context)
+                + self.termviai_sidebar_pixel_width(h_context.dpi))
+                as usize;
             let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
-            let padding_bottom =
-                config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
+            let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context)
+                as usize
+                + self.termviai_tray_pixel_height();
             let padding_right = effective_right_padding(&config, h_context);
 
             let pixel_height = (rows * self.render_metrics.cell_size.height as usize)
@@ -241,10 +244,13 @@ impl super::TermWindow {
                 pixel_max: self.terminal_size.pixel_height as f32,
                 pixel_cell: self.render_metrics.cell_size.height as f32,
             };
-            let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
+            let padding_left = (config.window_padding.left.evaluate_as_pixels(h_context)
+                + self.termviai_sidebar_pixel_width(h_context.dpi))
+                as usize;
             let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
-            let padding_bottom =
-                config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
+            let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context)
+                as usize
+                + self.termviai_tray_pixel_height();
             let padding_right = effective_right_padding(&config, h_context);
 
             let avail_width = dimensions.pixel_width.saturating_sub(
@@ -290,17 +296,28 @@ impl super::TermWindow {
 
         log::trace!("apply_dimensions computed size {:?}, dims {:?}", size, dims);
 
+        let terminal_grid_changed = self.terminal_size.rows != size.rows
+            || self.terminal_size.cols != size.cols
+            || self.terminal_size.pixel_width != size.pixel_width
+            || self.terminal_size.pixel_height != size.pixel_height
+            || self.terminal_size.dpi != size.dpi;
         self.terminal_size = size;
 
-        let mux = Mux::get();
-        if let Some(window) = mux.get_window(self.mux_window_id) {
-            for tab in window.iter_tabs() {
-                tab.resize(size);
-            }
-        };
-        self.resize_overlays();
-        self.invalidate_fancy_tab_bar();
-        self.update_title();
+        // Windows reports every pixel during a live resize. TermViAI chrome still
+        // repaints each frame, while Mux and PTYs only need work when the cell
+        // grid changes. Skip duplicate sub-cell resize and title operations.
+        if !self.config.termviai_ui || terminal_grid_changed {
+            let mux = Mux::get();
+            if let Some(window) = mux.get_window(self.mux_window_id) {
+                for tab in window.iter_tabs() {
+                    tab.resize(size);
+                }
+            };
+            self.termviai_sync_pane_font_sizes();
+            self.resize_overlays();
+            self.invalidate_fancy_tab_bar();
+            self.update_title();
+        }
 
         window.set_resize_increments(if self.config.use_resize_increments {
             ri_calc.into()
@@ -488,7 +505,8 @@ impl super::TermWindow {
             dpi: size.dpi,
         };
 
-        let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
+        let show_tab_bar =
+            config.termviai_ui || (config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab);
         let tab_bar_height = if show_tab_bar {
             self.tab_bar_pixel_height()? as usize
         } else {
@@ -505,9 +523,12 @@ impl super::TermWindow {
             pixel_max: self.dimensions.pixel_height as f32,
             pixel_cell: render_metrics.cell_size.height as f32,
         };
-        let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
+        let padding_left = (config.window_padding.left.evaluate_as_pixels(h_context)
+            + self.termviai_sidebar_pixel_width(h_context.dpi))
+            as usize;
         let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
-        let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
+        let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context) as usize
+            + self.termviai_tray_pixel_height();
 
         let dimensions = Dimensions {
             pixel_width: ((terminal_size.cols as usize * render_metrics.cell_size.width as usize)

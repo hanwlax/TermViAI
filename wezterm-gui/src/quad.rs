@@ -27,6 +27,9 @@ const IS_BG_IMAGE: f32 = 2.0;
 const IS_SOLID_COLOR: f32 = 3.0;
 /// Grayscale poly quad for non-aa text render layers
 const IS_GRAY_SCALE: f32 = 4.0;
+/// Analytic rounded rectangle. Values above this base encode an inward
+/// outline width in physical pixels; zero means a filled rectangle.
+const IS_ROUNDED_RECT: f32 = 32.0;
 
 #[repr(C)]
 #[derive(Copy, Clone, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -86,6 +89,21 @@ pub trait QuadTrait {
     /// multipled with those in the texture
     fn set_grayscale(&mut self) {
         self.set_has_color_impl(IS_GRAY_SCALE);
+    }
+
+    /// Use one analytic coverage mask rather than separately blended corners
+    /// and strips. For this primitive tex carries local pixel coordinates and
+    /// hsv carries half-size/radius, so the shader skips the usual HSV transform.
+    fn set_rounded_rectangle(&mut self, width: f32, height: f32, radius: f32, outline: f32) {
+        let half_width = width.max(0.) / 2.;
+        let half_height = height.max(0.) / 2.;
+        self.set_texture_discrete(-half_width, half_width, -half_height, half_height);
+        self.set_hsv(Some(HsbTransform {
+            hue: half_width,
+            saturation: half_height,
+            brightness: radius.max(0.).min(half_width).min(half_height),
+        }));
+        self.set_has_color_impl(IS_ROUNDED_RECT + outline.max(0.));
     }
 
     /// Mark this quad as a background image.
@@ -400,4 +418,57 @@ impl<'a> TripleLayerQuadAllocatorTrait for TripleLayerQuadAllocator<'a> {
 fn size() {
     assert_eq!(std::mem::size_of::<Vertex>() * VERTICES_PER_CELL, 272);
     assert_eq!(std::mem::size_of::<BoxedQuad>(), 84);
+}
+
+#[cfg(test)]
+mod termviai_rounded_rectangle_tests {
+    use super::*;
+
+    #[test]
+    fn mask_parameters_survive_color_updates_and_cached_quad_roundtrip() {
+        let mut vertices = [Vertex::default(); VERTICES_PER_CELL];
+        let mut quad = Quad {
+            vert: &mut vertices,
+        };
+        quad.set_position(13.25, 27.5, 113.25, 67.5);
+        quad.set_rounded_rectangle(100., 40., 12., 1.25);
+        // Background color resolution runs after primitive setup, including
+        // during a fade. It must not overwrite geometry or outline width.
+        quad.set_fg_color(LinearRgba(0.2, 0.3, 0.4, 0.5));
+        quad.set_alt_color_and_mix_value(LinearRgba(0.5, 0.6, 0.7, 0.8), 0.35);
+
+        let cached = BoxedQuad::from_vertices(&vertices);
+        let restored = cached.to_vertices();
+        for vertex in restored {
+            assert_eq!(vertex.has_color, IS_ROUNDED_RECT + 1.25);
+            assert_eq!(vertex.hsv, [50., 20., 12.]);
+            assert_eq!(vertex.fg_color[3], 0.5);
+            assert_eq!(vertex.mix_value, 0.35);
+        }
+        assert_eq!(cached.tex, (-50., 50., -20., 20.));
+        assert_eq!(cached.position, (13.25, 27.5, 113.25, 67.5));
+    }
+
+    #[test]
+    fn small_rounded_rectangles_clamp_radius_without_allocating_a_texture() {
+        let mut vertices = [Vertex::default(); VERTICES_PER_CELL];
+        let mut quad = Quad {
+            vert: &mut vertices,
+        };
+        quad.set_rounded_rectangle(3., 28., 9., 0.);
+        assert_eq!(vertices[0].hsv, [1.5, 14., 1.5]);
+        assert_eq!(vertices[0].has_color, IS_ROUNDED_RECT);
+    }
+
+    #[test]
+    fn rounded_rectangle_shader_validates() {
+        let shader = wgpu::naga::front::wgsl::parse_str(include_str!("shader.wgsl"))
+            .expect("WGSL must parse");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&shader)
+        .expect("WGSL must validate");
+    }
 }

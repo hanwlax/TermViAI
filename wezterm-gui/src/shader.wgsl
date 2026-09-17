@@ -34,6 +34,7 @@ const IS_SOLID_COLOR: f32 = 3.0;
 
 // Grayscale poly quad for non-aa text render layers
 const IS_GRAY_SCALE: f32 = 4.0;
+const IS_ROUNDED_RECT: f32 = 32.0;
 
 struct ShaderUniform {
   foreground_text_hsb: vec3<f32>,
@@ -92,6 +93,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   var color: vec4<f32>;
   var linear_tex: vec4<f32> = textureSample(atlas_linear_tex, atlas_linear_sampler, in.tex);
   var nearest_tex: vec4<f32> = textureSample(atlas_nearest_tex, atlas_nearest_sampler, in.tex);
+
+  if in.has_color >= IS_ROUNDED_RECT {
+    let q = abs(in.tex) - in.hsv.xy + in.hsv.z;
+    let distance = length(max(q, vec2<f32>(0.0)))
+      + min(max(q.x, q.y), 0.0) - in.hsv.z;
+    var coverage = clamp(0.5 - distance, 0.0, 1.0);
+    let outline = in.has_color - IS_ROUNDED_RECT;
+    if outline > 0.0 {
+      coverage -= clamp(0.5 - distance - outline, 0.0, 1.0);
+    }
+    return vec4<f32>(in.fg_color.rgb, in.fg_color.a * coverage);
+  }
 
   var hsv = in.hsv;
 

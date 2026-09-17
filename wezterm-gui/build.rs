@@ -62,10 +62,15 @@ fn main() {
             }
         }
 
-        // If a file named `.tag` is present, we'll take its contents for the
-        // version number that we report in wezterm -h.
+        // TermViAI tracks its product version in VERSION. Keep the upstream
+        // `.tag` fallback for source snapshots that predate the product version.
         let mut ci_tag = String::new();
-        if let Ok(tag) = std::fs::read("../.tag") {
+        if let Ok(version) = std::fs::read("../VERSION") {
+            if let Ok(s) = String::from_utf8(version) {
+                ci_tag = s.trim().to_string();
+                println!("cargo:rerun-if-changed=../VERSION");
+            }
+        } else if let Ok(tag) = std::fs::read("../.tag") {
             if let Ok(s) = String::from_utf8(tag) {
                 ci_tag = s.trim().to_string();
                 println!("cargo:rerun-if-changed=../.tag");
@@ -106,8 +111,8 @@ fn main() {
 1 RT_MANIFEST "{win}\\manifest.manifest"
 IDI_ICON ICON "{win}\\terminal.ico"
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,0,0,0
-PRODUCTVERSION  1,0,0,0
+FILEVERSION     0,1,0,1
+PRODUCTVERSION  0,1,0,1
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS__WINDOWS32
@@ -118,13 +123,13 @@ BEGIN
     BEGIN
         BLOCK "040904E4"
         BEGIN
-            VALUE "CompanyName",      "Wez Furlong\0"
-            VALUE "FileDescription",  "WezTerm - Wez's Terminal Emulator\0"
+            VALUE "CompanyName",      "TermViAI Project\0"
+            VALUE "FileDescription",  "TermViAI - Terminal Via AI\0"
             VALUE "FileVersion",      "{version}\0"
-            VALUE "LegalCopyright",   "Wez Furlong, MIT licensed\0"
-            VALUE "InternalName",     "\0"
-            VALUE "OriginalFilename", "\0"
-            VALUE "ProductName",      "WezTerm\0"
+            VALUE "LegalCopyright",   "TermViAI contributors; based on WezTerm; MIT licensed\0"
+            VALUE "InternalName",     "TermViAI\0"
+            VALUE "OriginalFilename", "TermViAI.exe\0"
+            VALUE "ProductName",      "TermViAI\0"
             VALUE "ProductVersion",   "{version}\0"
         END
     END

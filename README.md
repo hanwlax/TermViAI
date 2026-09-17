@@ -1,40 +1,52 @@
-# Wez's Terminal
+# TermViAI
 
-<img height="128" alt="WezTerm Icon" src="https://raw.githubusercontent.com/wezterm/wezterm/main/assets/icon/wezterm-icon.svg" align="left"> *A GPU-accelerated cross-platform terminal emulator and multiplexer written by <a href="https://github.com/wez">@wez</a> and implemented in <a href="https://www.rust-lang.org/">Rust</a>*
+**Terminal Via AI** — a modern Windows SSH terminal application created through human and AI collaboration.
 
-User facing docs and guide at: https://wezterm.org/
+TermViAI combines WezTerm's terminal, SSH, PTY and GPU rendering foundations with a focused host library, multi-host tab groups and selective input broadcasting. The interface uses Catppuccin Mocha and JetBrainsMono Nerd Font Mono by default.
 
-![Screenshot](docs/screenshots/two.png)
+> Current version: **v0.1.0-beta.1**. This beta targets Windows 10/11 x86_64.
 
-*Screenshot of wezterm on macOS, running vim*
+## Features
 
-## Installation
+- Local Hosts and Keychain management without an account.
+- Multiple SSH hosts in one tab with proportional split layouts.
+- Whole-group and per-terminal broadcast controls.
+- Saved SSH tab groups, recent groups and recent connections.
+- Right-side add/edit drawers, animated sidebar and broadcast toolbar.
+- Per-session `Ctrl` + mouse-wheel font sizing and a persistent global font size.
+- Configurable SSH keepalive interval, defaulting to 30 seconds; `0` disables it.
+- A real empty Hosts start page: no hidden local terminal is created at launch.
 
-https://wezterm.org/installation
+## Download
 
-## Getting help
+Download **TermViAI-v0.1.0-beta.1-windows-x86_64.zip** from the [v0.1.0-beta.1 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.1), extract it, and run `TermViAI.exe`.
 
-This is a spare time project, so please bear with me.  There are a couple of channels for support:
+This is a portable beta build. Keep `OpenConsole.exe`, `conpty.dll`, `libEGL.dll` and `libGLESv2.dll` beside the executable.
 
-* You can use the [GitHub issue tracker](https://github.com/wezterm/wezterm/issues) to see if someone else has a similar issue, or to file a new one.
-* Start or join a thread in our [GitHub Discussions](https://github.com/wezterm/wezterm/discussions); if you have general
-  questions or want to chat with other wezterm users, you're welcome here!
-* There is a [Matrix room via Element.io](https://matrix.to/#/#wezterm:matrix.org)
-  for (potentially!) real time discussions.
+## Basic use
 
-The GitHub Discussions and Element/Gitter rooms are better suited for questions
-than bug reports, but don't be afraid to use whichever you are most comfortable
-using and we'll work it out.
+1. Open **Hosts** and select **Add Host**.
+2. Enter the SSH address, port, username and optional private key.
+3. Open a host, then add more hosts to the same tab from the terminal controls.
+4. Use the tab broadcast control for the whole group, or choose individual terminals from pane headers and the bottom toolbar.
+5. Press `Ctrl+S` to save a multi-host tab group.
 
-## Supporting the Project
+Settings and local host data stay on this device. On Windows the application data directory is normally `%APPDATA%\wezterm\termviai`; `TERMVIAI_DATA_DIR` can override it.
 
-If you use and like WezTerm, please consider sponsoring it: your support helps
-to cover the fees required to maintain the project and to validate the time
-spent working on it!
+## Build
 
-[Read more about sponsoring](https://wezterm.org/sponsor.html).
+The repository is based on WezTerm and uses its Rust workspace. A Windows x64 release build can be produced with:
 
-* [![Sponsor WezTerm](https://img.shields.io/github/sponsors/wez?label=Sponsor%20WezTerm&logo=github&style=for-the-badge)](https://github.com/sponsors/wez)
-* [Patreon](https://patreon.com/WezFurlong)
-* [Ko-Fi](https://ko-fi.com/wezfurlong)
-* [Liberapay](https://liberapay.com/wez)
+```powershell
+cargo build --locked --release -p wezterm-gui
+```
+
+The Cargo output is still named `wezterm-gui.exe` internally; official TermViAI release packages publish it as `TermViAI.exe` with TermViAI Windows product metadata.
+
+Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.1.md](docs/termviai/RELEASE_V0.1.0_BETA.1.md).
+
+## Project origin and license
+
+TermViAI is based on [WezTerm](https://github.com/wezterm/wezterm). The upstream README is preserved as [README.wezterm.md](README.wezterm.md), and the repository retains its Git history and attribution.
+
+The project is distributed under the MIT license; see [LICENSE.md](LICENSE.md).

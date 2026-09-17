@@ -162,6 +162,7 @@ impl crate::TermWindow {
     }
 
     pub fn paint_pass(&mut self) -> anyhow::Result<()> {
+        self.termviai_sync_terminal_layout();
         {
             let gl_state = self.render_state.as_ref().unwrap();
             for layer in gl_state.layers.borrow().iter() {
@@ -172,7 +173,11 @@ impl crate::TermWindow {
         // Clear out UI item positions; we'll rebuild these as we render
         self.ui_items.clear();
 
-        let panes = self.get_panes_to_render();
+        let panes = if self.termviai_library_active() {
+            vec![]
+        } else {
+            self.get_panes_to_render()
+        };
         let focused = self.focused.is_some();
         let window_is_transparent =
             !self.window_background.is_empty() || self.config.window_background_opacity != 1.0;
@@ -268,13 +273,15 @@ impl crate::TermWindow {
             }
         }
 
-        if self.show_tab_bar {
+        if self.show_tab_bar && !self.config.termviai_ui {
             self.paint_tab_bar(&mut layers).context("paint_tab_bar")?;
         }
 
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;
         drop(layers);
+        self.paint_termviai().context("paint_termviai")?;
+        self.termviai_finish_terminal_layout_frame();
         self.paint_modal().context("paint_modal")?;
 
         Ok(())

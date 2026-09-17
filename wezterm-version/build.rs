@@ -1,10 +1,15 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
-    // If a file named `.tag` is present, we'll take its contents for the
-    // version number that we report in wezterm -h.
+    // TermViAI tracks its product version in VERSION. Keep the upstream
+    // `.tag` fallback for source snapshots that predate the product version.
     let mut ci_tag = String::new();
-    if let Ok(tag) = std::fs::read("../.tag") {
+    if let Ok(version) = std::fs::read("../VERSION") {
+        if let Ok(s) = String::from_utf8(version) {
+            ci_tag = s.trim().to_string();
+            println!("cargo:rerun-if-changed=../VERSION");
+        }
+    } else if let Ok(tag) = std::fs::read("../.tag") {
         if let Ok(s) = String::from_utf8(tag) {
             ci_tag = s.trim().to_string();
             println!("cargo:rerun-if-changed=../.tag");

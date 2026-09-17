@@ -20,6 +20,10 @@ use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
 
+fn dim_pane_background(termviai_ui: bool, is_active: bool) -> bool {
+    !termviai_ui && !is_active
+}
+
 impl crate::TermWindow {
     fn paint_pane_box_model(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
         let computed = self.build_pane(pos)?;
@@ -34,7 +38,44 @@ impl crate::TermWindow {
         pos: &PositionedPane,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
-        if self.config.use_box_model_render {
+        let layout_metrics = self.render_metrics;
+        let (padding_left, padding_top) = self.padding_left_top();
+        let (dx, dy) =
+            self.termviai_pane_visual_offset(self.termviai_font_source_pane(pos.pane.pane_id()));
+        let padding = (padding_left + dx, padding_top + dy);
+        let source_pane = self.termviai_font_source_pane(pos.pane.pane_id());
+        let visible_content_height = if self.config.termviai_ui {
+            Some(
+                self.termviai_pane_visual_content_height(source_pane)
+                    .unwrap_or(pos.pane.get_dimensions().pixel_height as f32),
+            )
+        } else {
+            None
+        };
+        let context = self.termviai_pane_font(pos.pane.pane_id())?;
+        let old_fonts = context.as_ref().map(|font| {
+            self.render_metrics = font.metrics;
+            std::mem::replace(&mut self.fonts, font.fonts.clone())
+        });
+        // Always restore the window context, including a failed glyph upload.
+        let result =
+            self.paint_pane_with_font(pos, layers, layout_metrics, padding, visible_content_height);
+        if let Some(fonts) = old_fonts {
+            self.fonts = fonts;
+            self.render_metrics = layout_metrics;
+        }
+        result
+    }
+
+    fn paint_pane_with_font(
+        &mut self,
+        pos: &PositionedPane,
+        layers: &mut TripleLayerQuadAllocator,
+        layout_metrics: crate::utilsprites::RenderMetrics,
+        padding: (f32, f32),
+        visible_content_height: Option<f32>,
+    ) -> anyhow::Result<()> {
+        if self.config.use_box_model_render && !self.config.termviai_ui {
             return self.paint_pane_box_model(pos);
         }
 
@@ -60,7 +101,7 @@ impl crate::TermWindow {
         let config = self.config.clone();
         let palette = pos.pane.palette();
 
-        let (padding_left, padding_top) = self.padding_left_top();
+        let (padding_left, padding_top) = padding;
 
         let tab_bar_height = if self.show_tab_bar {
             self.tab_bar_pixel_height()
@@ -68,11 +109,12 @@ impl crate::TermWindow {
         } else {
             0.
         };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let (top_bar_height, bottom_bar_height) =
+            if !self.config.termviai_ui && self.config.tab_bar_at_bottom {
+                (0.0, tab_bar_height)
+            } else {
+                (tab_bar_height, 0.0)
+            };
 
         let border = self.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
@@ -105,8 +147,8 @@ impl crate::TermWindow {
                 config.text_background_opacity
             });
 
-        let cell_width = self.render_metrics.cell_size.width as f32;
-        let cell_height = self.render_metrics.cell_size.height as f32;
+        let cell_width = layout_metrics.cell_size.width as f32;
+        let cell_height = layout_metrics.cell_size.height as f32;
         let background_rect = {
             // We want to fill out to the edges of the splits
             let (x, width_delta) = if pos.left == 0 {
@@ -142,8 +184,12 @@ impl crate::TermWindow {
                 } else {
                     (pos.width as f32 * cell_width) + width_delta
                 },
-                // Go all the way to the bottom if we're bottom-most
-                if pos.top + pos.height >= self.terminal_size.rows as usize {
+                // The animated visual rectangle may be between grid rows.
+                // Keep backgrounds inside it instead of painting across the
+                // moving divider or over the broadcast tray.
+                if let Some(height) = visible_content_height {
+                    (top_pixel_y + pos.top as f32 * cell_height + height - y).max(0.0)
+                } else if pos.top + pos.height >= self.terminal_size.rows as usize {
                     self.dimensions.pixel_height as f32 - y
                 } else {
                     (pos.height as f32 * cell_height) + height_delta as f32
@@ -165,11 +211,10 @@ impl crate::TermWindow {
                         .mul_alpha(config.window_background_opacity),
                 )
                 .context("filled_rectangle")?;
-            quad.set_hsv(if pos.is_active {
-                None
-            } else {
-                Some(config.inactive_pane_hsb)
-            });
+            quad.set_hsv(
+                dim_pane_background(config.termviai_ui, pos.is_active)
+                    .then_some(config.inactive_pane_hsb),
+            );
         }
 
         {
@@ -213,11 +258,10 @@ impl crate::TermWindow {
                     .filled_rectangle(layers, 0, background_rect, background)
                     .context("filled_rectangle")?;
 
-                quad.set_hsv(if pos.is_active {
-                    None
-                } else {
-                    Some(config.inactive_pane_hsb)
-                });
+                quad.set_hsv(
+                    dim_pane_background(config.termviai_ui, pos.is_active)
+                        .then_some(config.inactive_pane_hsb),
+                );
             }
         }
 
@@ -226,17 +270,33 @@ impl crate::TermWindow {
         // do a per-pane scrollbar.  That will require more extensive
         // changes to ScrollHit, mouse positioning, PositionedPane
         // and tab size calculation.
-        if pos.is_active && self.show_scroll_bar {
-            let thumb_y_offset = top_bar_height as usize + border.top.get();
+        if pos.is_active
+            && self.show_scroll_bar
+            && visible_content_height.map_or(true, |height| height >= 1.0)
+        {
+            let (thumb_y_offset, scrollbar_height) = if config.termviai_ui {
+                (
+                    (top_pixel_y + pos.top as f32 * cell_height) as usize,
+                    visible_content_height
+                        .map(|height| height.max(0.0) as usize)
+                        .unwrap_or(pos.height * cell_height as usize),
+                )
+            } else {
+                let offset = top_bar_height as usize + border.top.get();
+                (
+                    offset,
+                    self.dimensions
+                        .pixel_height
+                        .saturating_sub(offset + border.bottom.get() + bottom_bar_height as usize),
+                )
+            };
 
-            let min_height = self.min_scroll_bar_height();
+            let min_height = self.min_scroll_bar_height().min(scrollbar_height as f32);
 
             let info = ScrollHit::thumb(
                 &*pos.pane,
                 current_viewport,
-                self.dimensions.pixel_height.saturating_sub(
-                    thumb_y_offset + border.bottom.get() + bottom_bar_height as usize,
-                ),
+                scrollbar_height,
                 min_height as usize,
             );
             let abs_thumb_top = thumb_y_offset + info.top;
@@ -268,9 +328,7 @@ impl crate::TermWindow {
                 x: thumb_x,
                 width: padding as usize,
                 y: abs_thumb_top + thumb_size,
-                height: self
-                    .dimensions
-                    .pixel_height
+                height: (thumb_y_offset + scrollbar_height)
                     .saturating_sub(abs_thumb_top + thumb_size),
                 item_type: UIItemType::BelowScrollThumb,
             });
@@ -303,9 +361,14 @@ impl crate::TermWindow {
             palette.cursor_fg == global_cursor_fg && palette.cursor_bg == global_cursor_bg;
 
         {
+            let visible_rows = crate::termwindow::termviai_font::session_visible_rows(
+                dims.viewport_rows,
+                self.render_metrics.cell_size.height,
+                visible_content_height,
+            );
             let stable_range = match current_viewport {
-                Some(top) => top..top + dims.viewport_rows as StableRowIndex,
-                None => dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex,
+                Some(top) => top..top + visible_rows as StableRowIndex,
+                None => dims.physical_top..dims.physical_top + visible_rows as StableRowIndex,
             };
 
             pos.pane
@@ -316,6 +379,7 @@ impl crate::TermWindow {
                 selrange: Option<SelectionRange>,
                 rectangular: bool,
                 dims: RenderableDimensions,
+                visible_rows: usize,
                 top_pixel_y: f32,
                 left_pixel_x: f32,
                 pos: &'a PositionedPane,
@@ -337,16 +401,16 @@ impl crate::TermWindow {
                 error: Option<anyhow::Error>,
             }
 
-            let left_pixel_x = padding_left
-                + border.left.get() as f32
-                + (pos.left as f32 * self.render_metrics.cell_size.width as f32);
+            let left_pixel_x =
+                padding_left + border.left.get() as f32 + (pos.left as f32 * cell_width);
 
             let mut render = LineRender {
                 term_window: self,
                 selrange,
                 rectangular,
                 dims,
-                top_pixel_y,
+                visible_rows,
+                top_pixel_y: top_pixel_y + pos.top as f32 * cell_height,
                 left_pixel_x,
                 pos,
                 pane_id,
@@ -374,6 +438,10 @@ impl crate::TermWindow {
                     line_idx: usize,
                     line: &&mut Line,
                 ) -> anyhow::Result<()> {
+                    let row_span = if line.is_double_height_top() { 2 } else { 1 };
+                    if line_idx + row_span > self.visible_rows {
+                        return Ok(());
+                    }
                     let stable_row = stable_top + line_idx as StableRowIndex;
                     let selrange = self
                         .selrange
@@ -435,7 +503,7 @@ impl crate::TermWindow {
                         cursor,
                         shape_hash,
                         top_pixel_y: NotNan::new(self.top_pixel_y).unwrap()
-                            + (line_idx + self.pos.top) as f32
+                            + line_idx as f32
                                 * self.term_window.render_metrics.cell_size.height as f32,
                         left_pixel_x: NotNan::new(self.left_pixel_x).unwrap(),
                         phys_line_idx: line_idx,
@@ -471,6 +539,7 @@ impl crate::TermWindow {
                     let next_due = self.term_window.has_animation.borrow_mut().take();
 
                     let shape_key = LineToEleShapeCacheKey {
+                        font_id: self.term_window.fonts.default_font()?.id(),
                         shape_hash,
                         shape_generation: quad_key.shape_generation,
                         composing: if self.cursor.y == stable_row && self.pos.is_active {
@@ -593,11 +662,12 @@ impl crate::TermWindow {
         } else {
             0.
         };
-        let (top_bar_height, _bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let (top_bar_height, _bottom_bar_height) =
+            if !self.config.termviai_ui && self.config.tab_bar_at_bottom {
+                (0.0, tab_bar_height)
+            } else {
+                (tab_bar_height, 0.0)
+            };
 
         let border = self.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
@@ -685,5 +755,18 @@ impl crate::TermWindow {
             baseline: 1.0,
             content: ComputedElementContent::Children(vec![]),
         })
+    }
+}
+
+#[cfg(test)]
+mod termviai_background_tests {
+    use super::dim_pane_background;
+
+    #[test]
+    fn termviai_inactive_panes_keep_the_same_base_background() {
+        assert!(!dim_pane_background(true, false));
+        assert!(!dim_pane_background(true, true));
+        assert!(dim_pane_background(false, false));
+        assert!(!dim_pane_background(false, true));
     }
 }

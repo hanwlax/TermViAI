@@ -152,7 +152,11 @@ impl GuiFrontEnd {
                 MuxNotification::Empty => {
                     if config::configuration().quit_when_all_windows_are_closed {
                         promise::spawn::spawn_into_main_thread(async move {
-                            if mux::activity::Activity::count() == 0 {
+                            let mux = Mux::get();
+                            if mux::activity::Activity::count() == 0
+                                && mux.is_empty()
+                                && !mux.has_keep_alive_windows()
+                            {
                                 log::trace!("Mux is now empty, terminate gui");
                                 Connection::get().unwrap().terminate_message_loop();
                             }
@@ -344,7 +348,9 @@ impl GuiFrontEnd {
         let mux = Mux::get();
         let workspace = mux.active_workspace_for_client(&self.client_id);
 
-        if mux.is_workspace_empty(&workspace) {
+        if mux.is_workspace_empty(&workspace)
+            && mux.iter_windows_in_workspace(&workspace).is_empty()
+        {
             // We don't want to silently kill off things that might
             // be running in other workspaces, so let's pick one
             // and activate it

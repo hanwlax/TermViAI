@@ -240,6 +240,14 @@ pub trait Pane: Downcast + Send + Sync {
     fn get_progress(&self) -> Progress {
         Progress::None
     }
+    /// Already encoded user bytes; local/SSH panes enqueue them without
+    /// encoding again or blocking the GUI on a full PTY input buffer.
+    fn send_raw_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let mut writer = self.writer();
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        Ok(())
+    }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
     fn send_composed_text(&self, text: &str) -> anyhow::Result<()> {
         self.writer().write_all(text.as_bytes())?;

@@ -40,6 +40,7 @@ mod customglyph;
 mod download;
 mod frontend;
 mod glyphcache;
+mod hosts;
 mod inputmap;
 mod overlay;
 mod quad;
@@ -57,6 +58,7 @@ mod unicode_names;
 mod uniforms;
 mod update;
 mod utilsprites;
+mod workspaces;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -67,8 +69,9 @@ pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DAT
 
 #[derive(Debug, Parser)]
 #[command(
-    about = "Wez's Terminal Emulator\nhttp://github.com/wezterm/wezterm",
-    version = config::wezterm_version()
+    name = "TermViAI",
+    about = "TermViAI — Terminal Via AI\nhttps://github.com/hanwlax/TermViAI",
+    version = wezterm_version::wezterm_version()
 )]
 struct Opt {
     /// Skip loading wezterm.lua
@@ -175,7 +178,7 @@ async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     mux.set_default_domain(&domain);
 
     let should_publish = false;
-    async_run_terminal_gui(cmd, start_command, should_publish).await
+    async_run_terminal_gui(cmd, start_command, should_publish, false).await
 }
 
 fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
@@ -226,7 +229,7 @@ async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
     mux.add_domain(&domain);
 
     let should_publish = false;
-    async_run_terminal_gui(cmd, start_command, should_publish).await
+    async_run_terminal_gui(cmd, start_command, should_publish, false).await
 }
 
 fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Result<()> {
@@ -409,6 +412,7 @@ async fn async_run_terminal_gui(
     cmd: Option<CommandBuilder>,
     opts: StartCommand,
     should_publish: bool,
+    start_at_hosts: bool,
 ) -> anyhow::Result<()> {
     let unix_socket_path =
         config::RUNTIME_DIR.join(format!("gui-sock-{}", unsafe { libc::getpid() }));
@@ -420,8 +424,22 @@ async fn async_run_terminal_gui(
         log::warn!("{:#}", err);
     }
 
-    if !opts.no_auto_connect {
+    if !opts.no_auto_connect && !start_at_hosts {
         connect_to_auto_connect_domains().await?;
+    }
+
+    if start_at_hosts {
+        let config = config::configuration();
+        config.update_ulimit()?;
+        let mux = Mux::get();
+        let builder = mux.new_empty_window(opts.workspace, None);
+        if let Some(mut window) = mux.get_window_mut(*builder) {
+            window.set_keep_alive_when_empty(true);
+        }
+        // Dropping the builder announces the pane-free window to the frontend.
+        // Startup hooks and domain attachment belong to explicit terminal starts.
+        drop(builder);
+        return Ok(());
     }
 
     let spawn_command = match &cmd {
@@ -727,6 +745,11 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
 
     let config = config::configuration();
     let need_builder = !opts.prog.is_empty() || opts.cwd.is_some();
+    let start_at_hosts = config.termviai_ui
+        && !need_builder
+        && opts.domain.is_none()
+        && !opts.attach
+        && default_domain_name.is_none();
 
     let cmd = if need_builder {
         let prog = opts.prog.iter().map(|s| s.as_os_str()).collect::<Vec<_>>();
@@ -759,7 +782,9 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     let mut publish = Publish::resolve(
         &mux,
         &config,
-        opts.always_new_process || opts.position.is_some(),
+        // The existing GUI RPC creates terminal panes. A Hosts launch owns a
+        // pane-free GUI window and must not turn into a remote shell spawn.
+        start_at_hosts || opts.always_new_process || opts.position.is_some(),
     );
     log::trace!("{:?}", publish);
     if publish.try_spawn(
@@ -779,7 +804,9 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     let activity = Activity::new();
 
     promise::spawn::spawn(async move {
-        if let Err(err) = async_run_terminal_gui(cmd, opts, publish.should_publish()).await {
+        if let Err(err) =
+            async_run_terminal_gui(cmd, opts, publish.should_publish(), start_at_hosts).await
+        {
             terminate_with_error(err);
         }
         drop(activity);
@@ -1172,7 +1199,7 @@ fn run() -> anyhow::Result<()> {
     {
         unsafe {
             ::windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
-                ::windows::core::PCWSTR(wide_string("org.wezfurlong.wezterm").as_ptr()),
+                ::windows::core::PCWSTR(wide_string("com.hanwlax.termviai").as_ptr()),
             )
             .unwrap();
         }

@@ -56,7 +56,6 @@ use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
-use std::ops::Add;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -83,6 +82,16 @@ pub mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
+mod termviai_broadcast;
+mod termviai_confirm;
+mod termviai_dock;
+mod termviai_font;
+mod termviai_icons;
+mod termviai_layout;
+mod termviai_motion;
+mod termviai_tab_drag;
+mod termviai_ui;
+mod termviai_workspace;
 pub mod webgpu;
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
@@ -364,6 +373,11 @@ enum EventState {
 }
 
 pub struct TermWindow {
+    termviai_ui: termviai_ui::TermviaiUi,
+    termviai_broadcast: termviai_broadcast::TabBroadcasts,
+    termviai_confirm: termviai_confirm::ConfirmState,
+    termviai_layout: termviai_layout::TermviaiLayout,
+    termviai_fonts: termviai_font::TermviaiFonts,
     pub window: Option<Window>,
     pub config: ConfigHandle,
     pub config_overrides: wezterm_dynamic::Value,
@@ -483,6 +497,28 @@ impl TermWindow {
     }
 
     fn close_requested(&mut self, window: &Window) {
+        if self.config.termviai_ui {
+            if self.termviai_confirm.is_active() {
+                return;
+            }
+            let can_close = Mux::get()
+                .get_window(self.mux_window_id)
+                .map_or(true, |w| w.can_close_without_prompting());
+            if matches!(
+                self.config.window_close_confirmation,
+                WindowCloseConfirmation::NeverPrompt
+            ) || can_close
+            {
+                if let Err(error) =
+                    self.termviai_close_target(termviai_confirm::CloseTarget::Window, self.mux_window_id)
+                {
+                    log::error!("closing TermViAI window: {error:#}");
+                }
+            } else {
+                self.termviai_request_close(termviai_confirm::CloseTarget::Window);
+            }
+            return;
+        }
         let mux = Mux::get();
         match self.config.window_close_confirmation {
             WindowCloseConfirmation::NeverPrompt => {
@@ -533,6 +569,7 @@ impl TermWindow {
         self.load_os_parameters();
 
         if self.focused.is_none() {
+            self.reset_termviai_interaction();
             self.last_mouse_click = None;
             self.current_mouse_buttons.clear();
             self.current_mouse_capture = None;
@@ -590,13 +627,30 @@ impl TermWindow {
         let config = configuration();
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
+        let termviai_fonts = if config.termviai_ui {
+            termviai_font::TermviaiFonts::load()
+        } else {
+            Default::default()
+        };
+        if config.termviai_ui {
+            fontconfig.change_scaling(
+                termviai_fonts.global_size(config.font_size) / config.font_size,
+                dpi,
+            );
+        }
 
         let mux = Mux::get();
+        if config.termviai_ui {
+            if let Some(mut window) = mux.get_window_mut(mux_window_id) {
+                window.set_keep_alive_when_empty(true);
+            }
+        }
         let size = match mux.get_active_tab_for_window(mux_window_id) {
             Some(tab) => tab.get_size(),
             None => {
-                log::debug!("new_window has no tabs... yet?");
-                Default::default()
+                // TermViAI starts on Hosts without creating a shell or a PTY.
+                // Keep the configured geometry available for the first SSH tab.
+                config.initial_size(dpi as u32, None)
             }
         };
         let physical_rows = size.rows as usize;
@@ -607,7 +661,8 @@ impl TermWindow {
 
         // Initially we have only a single tab, so take that into account
         // for the tab bar state.
-        let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
+        let show_tab_bar =
+            config.termviai_ui || (config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab);
         let tab_bar_height = if show_tab_bar {
             Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)? as usize
         } else {
@@ -644,7 +699,9 @@ impl TermWindow {
             pixel_max: terminal_size.pixel_width as f32,
             pixel_cell: render_metrics.cell_size.width as f32,
         };
-        let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
+        let padding_left = (config.window_padding.left.evaluate_as_pixels(h_context)
+            + crate::termwindow::termviai_ui::sidebar_width(&config, h_context.dpi))
+            as usize;
         let padding_right = resize::effective_right_padding(&config, h_context) as usize;
         let v_context = DimensionContext {
             dpi: dpi as f32,
@@ -682,6 +739,11 @@ impl TermWindow {
         let connection_name = Connection::get().unwrap().name();
 
         let myself = Self {
+            termviai_ui: termviai_ui::TermviaiUi::new(),
+            termviai_broadcast: Default::default(),
+            termviai_confirm: Default::default(),
+            termviai_layout: Default::default(),
+            termviai_fonts,
             created: Instant::now(),
             connection_name,
             last_fps_check_time: Instant::now(),
@@ -837,6 +899,11 @@ impl TermWindow {
         .await?;
         tw.borrow_mut().window.replace(window.clone());
 
+        if config.termviai_ui {
+            let (width, height) = termviai_ui::minimum_window_size();
+            window.set_min_inner_size(width, height);
+        }
+
         Self::apply_icon(&window)?;
 
         let config_subscription = config::subscribe_to_config_reload({
@@ -937,7 +1004,12 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::PerformKeyAssignment(action) => {
-                if let Some(pane) = self.get_active_pane_or_overlay() {
+                if self.config.termviai_ui && matches!(action, KeyAssignment::QuitApplication) {
+                    // Hosts and New Tab can have no active pane. Application
+                    // actions must remain available in those empty windows.
+                    self.termviai_request_quit()?;
+                    window.invalidate();
+                } else if let Some(pane) = self.get_active_pane_or_overlay() {
                     self.perform_key_assignment(&pane, &action)?;
                     window.invalidate();
                 }
@@ -991,6 +1063,11 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::AdviseDeadKeyStatus(status) => {
+                if self.config.termviai_ui && self.termviai_confirm.is_active() {
+                    self.dead_key_status = DeadKeyStatus::None;
+                    window.invalidate();
+                    return Ok(true);
+                }
                 if self.config.debug_key_events {
                     log::info!("DeadKeyStatus now: {:?}", status);
                 } else {
@@ -1025,7 +1102,7 @@ impl TermWindow {
                     Some(pane) => pane,
                     None => return Ok(true),
                 };
-                pane.send_paste(text.as_str())?;
+                self.termviai_send_input(&pane, || pane.send_paste(text.as_str()))?;
                 Ok(true)
             }
             WindowEvent::DroppedUrl(urls) => {
@@ -1039,7 +1116,7 @@ impl TermWindow {
                     .collect::<Vec<_>>()
                     .join(" ")
                     + " ";
-                pane.send_paste(urls.as_str())?;
+                self.termviai_send_input(&pane, || pane.send_paste(urls.as_str()))?;
                 Ok(true)
             }
             WindowEvent::DroppedFile(paths) => {
@@ -1057,7 +1134,7 @@ impl TermWindow {
                     .collect::<Vec<_>>()
                     .join(" ")
                     + " ";
-                pane.send_paste(&paths)?;
+                self.termviai_send_input(&pane, || pane.send_paste(&paths))?;
                 Ok(true)
             }
             WindowEvent::DraggedFile(_) => Ok(true),
@@ -1751,9 +1828,10 @@ impl TermWindow {
             _ => return,
         };
         if window.count_tabs() == 1 {
-            self.show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
+            self.show_tab_bar =
+                config.termviai_ui || (config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab);
         } else {
-            self.show_tab_bar = config.enable_tab_bar;
+            self.show_tab_bar = config.termviai_ui || config.enable_tab_bar;
         }
         *self.cursor_blink_state.borrow_mut() = ColorEase::new(
             config.cursor_blink_rate,
@@ -1823,7 +1901,12 @@ impl TermWindow {
 
         if let Some(window) = self.window.as_ref().map(|w| w.clone()) {
             self.load_os_parameters();
-            self.apply_scale_change(&dimensions, self.fonts.get_font_scale());
+            let scale = if self.config.termviai_ui {
+                self.termviai_global_font_size() / self.config.font_size
+            } else {
+                self.fonts.get_font_scale()
+            };
+            self.apply_scale_change(&dimensions, scale);
             self.apply_dimensions(&dimensions, None, &window);
             window.config_did_change(&config);
             window.invalidate();
@@ -1972,7 +2055,7 @@ impl TermWindow {
 
         let border = self.get_os_border();
         let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
-        let tab_bar_y = if self.config.tab_bar_at_bottom {
+        let tab_bar_y = if !self.config.termviai_ui && self.config.tab_bar_at_bottom {
             ((self.dimensions.pixel_height as f32) - (tab_bar_height + border.bottom.get() as f32))
                 .max(0.)
         } else {
@@ -2014,6 +2097,21 @@ impl TermWindow {
 
         let tabs_count = window.count_tabs();
         if tabs_count == 0 {
+            drop(window);
+            if self.config.termviai_ui {
+                if self.termviai_ui.page == termviai_ui::Page::Terminal && !self.termviai_ui.connecting {
+                    self.termviai_ui.page = termviai_ui::Page::Hosts;
+                }
+                if let Some(window) = self.window.as_ref() {
+                    window.set_title(match self.termviai_ui.page {
+                        termviai_ui::Page::Hosts => "TermViAI — Hosts",
+                        termviai_ui::Page::Keys => "TermViAI — Keychain",
+                        termviai_ui::Page::NewTab => "TermViAI — New Tab",
+                        termviai_ui::Page::Terminal => "TermViAI",
+                    });
+                    window.invalidate();
+                }
+            }
             return;
         }
         drop(window);
@@ -2073,12 +2171,29 @@ impl TermWindow {
         };
 
         if let Some(window) = self.window.as_ref() {
+            let title = if self.config.termviai_ui {
+                match self.termviai_ui.page {
+                    termviai_ui::Page::Hosts => "TermViAI — Hosts".to_string(),
+                    termviai_ui::Page::Keys => "TermViAI — Keychain".to_string(),
+                    termviai_ui::Page::NewTab => "TermViAI — New Tab".to_string(),
+                    termviai_ui::Page::Terminal => format!(
+                        "TermViAI — {}",
+                        Mux::get()
+                            .get_active_tab_for_window(self.mux_window_id)
+                            .map(|t| self.termviai_tab_label(&t))
+                            .unwrap_or_else(|| "Hosts".into())
+                    ),
+                }
+            } else {
+                title
+            };
             window.set_title(&title);
 
             let show_tab_bar = if tabs_count == 1 {
-                self.config.enable_tab_bar && !self.config.hide_tab_bar_if_only_one_tab
+                self.config.termviai_ui
+                    || (self.config.enable_tab_bar && !self.config.hide_tab_bar_if_only_one_tab)
             } else {
-                self.config.enable_tab_bar
+                self.config.termviai_ui || self.config.enable_tab_bar
             };
 
             // If the number of tabs changed and caused the tab bar to
@@ -2114,23 +2229,28 @@ impl TermWindow {
         if let Some(win) = self.window.as_ref() {
             let cursor = pos.pane.get_cursor_position();
             let top = pos.pane.get_dimensions().physical_top;
-            let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-                self.tab_bar_pixel_height().unwrap()
-            } else {
-                0.0
-            };
+            let tab_bar_height =
+                if self.show_tab_bar && (self.config.termviai_ui || !self.config.tab_bar_at_bottom) {
+                    self.tab_bar_pixel_height().unwrap()
+                } else {
+                    0.0
+                };
             let (padding_left, padding_top) = self.padding_left_top();
 
+            let metrics = self.termviai_pane_metrics(pos.pane.pane_id());
+            let (dx, dy) =
+                self.termviai_pane_visual_offset(self.termviai_font_source_pane(pos.pane.pane_id()));
             let r = Rect::new(
                 Point::new(
-                    (((cursor.x + pos.left) as isize).max(0) * self.render_metrics.cell_size.width)
-                        .add(padding_left as isize),
-                    ((cursor.y + pos.top as isize - top).max(0)
-                        * self.render_metrics.cell_size.height)
-                        .add(tab_bar_height as isize)
-                        .add(padding_top as isize),
+                    (pos.left as isize * self.render_metrics.cell_size.width)
+                        + cursor.x as isize * metrics.cell_size.width
+                        + (padding_left + dx).round() as isize,
+                    (pos.top as isize * self.render_metrics.cell_size.height)
+                        + (cursor.y - top).max(0) * metrics.cell_size.height
+                        + tab_bar_height as isize
+                        + (padding_top + dy).round() as isize,
                 ),
-                self.render_metrics.cell_size,
+                metrics.cell_size,
             );
             win.set_text_cursor_position(r);
         }
@@ -2588,6 +2708,10 @@ impl TermWindow {
     ) -> anyhow::Result<PerformAssignmentResult> {
         use KeyAssignment::*;
 
+        if self.config.termviai_ui && self.termviai_confirm.is_active() {
+            return Ok(PerformAssignmentResult::Handled);
+        }
+
         if let Some(modal) = self.get_modal() {
             if modal.perform_assignment(assignment, self) {
                 return Ok(PerformAssignmentResult::Handled);
@@ -2744,14 +2868,17 @@ impl TermWindow {
             ActivateWindowRelativeNoWrap(n) => {
                 self.activate_window_relative(*n, false)?;
             }
-            SendString(s) => pane.writer().write_all(s.as_bytes())?,
+            SendString(s) => self.termviai_send_input(pane, || {
+                pane.writer().write_all(s.as_bytes())?;
+                Ok(())
+            })?,
             SendKey(key) => {
                 use keyevent::Key;
                 let mods = key.mods;
                 if let Key::Code(key) = self.win_key_code_to_termwiz_key_code(
                     &key.key.resolve(self.config.key_map_preference),
                 ) {
-                    pane.key_down(key, mods)?;
+                    self.termviai_send_input(pane, || pane.key_down(key, mods))?;
                 }
             }
             Hide => {
@@ -2794,6 +2921,7 @@ impl TermWindow {
                 let con = Connection::get().expect("call on gui thread");
                 con.hide_application();
             }
+            QuitApplication if self.config.termviai_ui => self.termviai_request_quit()?,
             QuitApplication => {
                 let mux = Mux::get();
                 let config = &self.config;
@@ -3222,7 +3350,33 @@ impl TermWindow {
             None => return,
         };
 
-        let pane_id = pane.pane_id();
+        self.close_specific_pane(pane.pane_id(), confirm);
+    }
+
+    fn close_specific_pane(&mut self, pane_id: PaneId, confirm: bool) {
+        let mux_window_id = self.mux_window_id;
+        let mux = Mux::get();
+        let tab = match mux.get_active_tab_for_window(mux_window_id) {
+            Some(tab) if tab.contains_pane(pane_id) => tab,
+            _ => return,
+        };
+        let pane = match mux.get_pane(pane_id) {
+            Some(pane) => pane,
+            None => return,
+        };
+
+        if self.config.termviai_ui {
+            let target = termviai_confirm::CloseTarget::Pane {
+                tab_id: tab.tab_id(),
+                pane_id,
+            };
+            if confirm && !pane.can_close_without_prompting(CloseReason::Pane) {
+                self.termviai_request_close(target);
+            } else if let Err(error) = self.termviai_close_target(target, mux_window_id) {
+                log::error!("closing TermViAI pane: {error:#}");
+            }
+            return;
+        }
         if confirm && !pane.can_close_without_prompting(CloseReason::Pane) {
             let window = self.window.clone().unwrap();
             let (overlay, future) = start_overlay_pane(self, &pane, move |pane_id, term| {
@@ -3250,6 +3404,15 @@ impl TermWindow {
         drop(mux_window);
 
         let tab_id = tab.tab_id();
+        if self.config.termviai_ui {
+            let target = termviai_confirm::CloseTarget::Tab(tab_id);
+            if confirm && !tab.can_close_without_prompting(CloseReason::Tab) {
+                self.termviai_request_close(target);
+            } else if let Err(error) = self.termviai_close_target(target, mux_window_id) {
+                log::error!("closing TermViAI tab: {error:#}");
+            }
+            return;
+        }
         if confirm && !tab.can_close_without_prompting(CloseReason::Tab) {
             if self.activate_tab(tab_idx as isize).is_err() {
                 return;
@@ -3274,6 +3437,15 @@ impl TermWindow {
         };
         let tab_id = tab.tab_id();
         let mux_window_id = self.mux_window_id;
+        if self.config.termviai_ui {
+            let target = termviai_confirm::CloseTarget::Tab(tab_id);
+            if confirm && !tab.can_close_without_prompting(CloseReason::Tab) {
+                self.termviai_request_close(target);
+            } else if let Err(error) = self.termviai_close_target(target, mux_window_id) {
+                log::error!("closing TermViAI tab: {error:#}");
+            }
+            return;
+        }
         if confirm && !tab.can_close_without_prompting(CloseReason::Tab) {
             let window = self.window.clone().unwrap();
             let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
@@ -3315,11 +3487,18 @@ impl TermWindow {
                             cols: dims.cols,
                             rows: dims.viewport_rows,
                             dpi: self.terminal_size.dpi,
-                            pixel_height: (self.terminal_size.pixel_height
-                                / self.terminal_size.rows)
-                                * dims.viewport_rows,
-                            pixel_width: (self.terminal_size.pixel_width / self.terminal_size.cols)
-                                * dims.cols,
+                            pixel_height: if self.config.termviai_ui {
+                                dims.pixel_height
+                            } else {
+                                (self.terminal_size.pixel_height / self.terminal_size.rows)
+                                    * dims.viewport_rows
+                            },
+                            pixel_width: if self.config.termviai_ui {
+                                dims.pixel_width
+                            } else {
+                                (self.terminal_size.pixel_width / self.terminal_size.cols)
+                                    * dims.cols
+                            },
                         })
                         .ok();
                 }
@@ -3524,7 +3703,7 @@ impl TermWindow {
                     p.pane = Arc::clone(&overlay.pane);
                 }
             }
-            panes
+            self.termviai_content_panes(tab, panes)
         }
     }
 
