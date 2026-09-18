@@ -29,8 +29,8 @@ fn three_windows_shells_broadcast_and_fourth_is_independent() {
     state.set_member(3, false).unwrap();
     state.set_enabled(true);
     for (source, bytes) in [
-        (0, b"echo TERmX_BROADCAST_ONLY\r\n".as_slice()),
-        (3, b"echo TERmX_INDEPENDENT_ONLY\r\n".as_slice()),
+        (0, b"echo TERMVIAI_BROADCAST_ONLY\r\n".as_slice()),
+        (3, b"echo TERMVIAI_INDEPENDENT_ONLY\r\n".as_slice()),
     ] {
         let report = route_input(
             &state,
@@ -46,7 +46,7 @@ fn three_windows_shells_broadcast_and_fourth_is_independent() {
     let report = route_input(
         &state,
         1,
-        b"echo TERmX_OFF_ONLY\r\n",
+        b"echo TERMVIAI_OFF_ONLY\r\n",
         |_| true,
         |id, data| children[id].stdin.as_mut().unwrap().write_all(data),
     )
@@ -60,17 +60,17 @@ fn three_windows_shells_broadcast_and_fourth_is_independent() {
         assert!(output.status.success());
         let text = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
-            text.contains("TERmX_BROADCAST_ONLY"),
+            text.contains("TERMVIAI_BROADCAST_ONLY"),
             id != 3,
             "shell {id}: {text}"
         );
         assert_eq!(
-            text.contains("TERmX_INDEPENDENT_ONLY"),
+            text.contains("TERMVIAI_INDEPENDENT_ONLY"),
             id == 3,
             "shell {id}: {text}"
         );
         assert_eq!(
-            text.contains("TERmX_OFF_ONLY"),
+            text.contains("TERMVIAI_OFF_ONLY"),
             id == 1,
             "shell {id}: {text}"
         );

@@ -4,14 +4,15 @@
 
 TermViAI combines WezTerm's terminal, SSH, PTY and GPU rendering foundations with a focused host library, multi-host tab groups and selective input broadcasting. The interface uses Catppuccin Mocha and JetBrainsMono Nerd Font Mono by default.
 
-> Current version: **v0.1.0-beta.1**. This beta targets Windows 10/11 x86_64.
+> Current version: **v0.1.0-beta.2**. This beta targets Windows 10/11 x86_64.
 
 ## Features
 
 - Local Hosts and Keychain management without an account.
 - Multiple SSH hosts in one tab with proportional split layouts.
 - Whole-group and per-terminal broadcast controls.
-- Saved SSH tab groups, recent groups and recent connections.
+- Saved SSH tab groups and recent connections.
+- In-place SSH reconnect with scrollback preserved, including whole-group reconnect.
 - Right-side add/edit drawers, animated sidebar and broadcast toolbar.
 - Per-session `Ctrl` + mouse-wheel font sizing and a persistent global font size.
 - Configurable SSH keepalive interval, defaulting to 30 seconds; `0` disables it.
@@ -19,7 +20,7 @@ TermViAI combines WezTerm's terminal, SSH, PTY and GPU rendering foundations wit
 
 ## Download
 
-Download **TermViAI-v0.1.0-beta.1-windows-x86_64.zip** from the [v0.1.0-beta.1 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.1), extract it, and run `TermViAI.exe`.
+Download **TermViAI-v0.1.0-beta.2-windows-x86_64.zip** from the [v0.1.0-beta.2 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.2), extract it, and run `TermViAI.exe`.
 
 This is a portable beta build. Keep `OpenConsole.exe`, `conpty.dll`, `libEGL.dll` and `libGLESv2.dll` beside the executable.
 
@@ -43,7 +44,7 @@ cargo build --locked --release -p wezterm-gui
 
 The Cargo output is still named `wezterm-gui.exe` internally; official TermViAI release packages publish it as `TermViAI.exe` with TermViAI Windows product metadata.
 
-Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.1.md](docs/termviai/RELEASE_V0.1.0_BETA.1.md).
+Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.2.md](docs/termviai/RELEASE_V0.1.0_BETA.2.md).
 
 ## Project origin and license
 

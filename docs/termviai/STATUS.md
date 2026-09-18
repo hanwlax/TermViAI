@@ -1,5 +1,9 @@
 # TermViAI 状态
 
+## 2026-09-18 v0.1.0-beta.2 发布
+
+第二个 Beta 汇总 SSH 重连与输入修复、历史保留及 New Tab 精简，保留既有修复提交并追加版本与发布说明提交。源码、命令行和 Windows 产品版本统一为 `0.1.0-beta.2`。说明见 [RELEASE_V0.1.0_BETA.2.md](RELEASE_V0.1.0_BETA.2.md)，验证证据见 [RELEASE_V0.1.0_BETA.2_VALIDATION.md](RELEASE_V0.1.0_BETA.2_VALIDATION.md)。
+
 ## 2026-09-18 重连后广播输入恢复
 
 修复 SSH 重连只换连接而未重建已退出输入线程的问题。重连后源终端、广播目标、粘贴和协议回复使用新的后台输入通道；旧连接队列及缓冲不重放，终端历史保留。广播再次成功后清除旧错误提示。当前说明见 [SSH_RECONNECT.md](SSH_RECONNECT.md)。

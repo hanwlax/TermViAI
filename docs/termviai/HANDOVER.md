@@ -2,6 +2,10 @@
 
 > 最新、精简且可执行的项目上下文见 [MEMORY.md](MEMORY.md)。后续工作应先读取该文件；下文保留完整历史记录。
 
+## 2026-09-18 TermViAI v0.1.0-beta.2
+
+本轮 SSH 原位/整组重连、失效缓存恢复、历史重叠修复、重连广播输入通道重建，以及 New Tab 自动历史移除汇总为第二个 Beta。源码 `VERSION`、Cargo 版本与 Windows 资源版本同步到 `0.1.0-beta.2`（数值资源版本 `0.1.0.2`）。发布说明见 [RELEASE_V0.1.0_BETA.2.md](RELEASE_V0.1.0_BETA.2.md)，发布验证记录见 [RELEASE_V0.1.0_BETA.2_VALIDATION.md](RELEASE_V0.1.0_BETA.2_VALIDATION.md)。
+
 ## 2026-09-18 断网重连后广播源终端写入失败
 
 用户截图显示 `3 sent, 0 disconnected, 1 failed`。断网时 Terminal 内的后台输入线程遇到 write/flush 错误后退出，先前只替换 SSH writer，无法复活该线程。重连现重建异步输入队列和线程，替换 Pane 直接 writer，并让新旧连接各自持有独立 wrapper。旧 BufWriter 缓冲不刷新，排队输入取消，不重放到新 shell；历史、pane ID 和输入捕获 ID 不变。具体广播失败写入日志，随后成功广播清除旧提示。验证见 [SSH_RECONNECT.md](SSH_RECONNECT.md)。

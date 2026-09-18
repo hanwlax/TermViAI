@@ -11,11 +11,11 @@
 - GitHub 仓库：<https://github.com/hanwlax/TermViAI>。
 - 当前分支：`main`，远端为 `origin/main`。
 - 首个公开版本：`v0.1.0-beta.1`。
-- 发布提交：`1fdc7418c52b16879c46456df7816a38d2de8cbd`。
-- Release：<https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.1>。
-- Windows 便携包：`TermViAI-v0.1.0-beta.1-windows-x86_64.zip`。
-- 发布包 SHA-256：`c11ee24cca9a0a4180a843d31cccd85747ea230540f4cb774212c774f7ac245a`。
-- 发布包已从 GitHub 重新下载并通过 SHA-256 校验。
+- 当前版本：`v0.1.0-beta.2`；发布提交以该 Git 标签指向的提交为准。
+- Release：<https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.2>，标记为 prerelease。
+- Windows 便携包：`TermViAI-v0.1.0-beta.2-windows-x86_64.zip`。
+- 发布包 SHA-256：`2dbbaf31f10acbfa2bfbe07b94765ae22ea8b8cb24f6f0c29490365c36ec97e8`。
+- 本地构建、版本与归档验证见 [RELEASE_V0.1.0_BETA.2_VALIDATION.md](RELEASE_V0.1.0_BETA.2_VALIDATION.md)；发布操作最后需从 GitHub 回传附件并核对上述校验值。
 
 这是第一个发布版本，**不保留任何旧品牌兼容层**。源码、模块、配置、环境变量和数据路径不得重新引入先前品牌标识。当前配置项为 `termviai_ui`，数据目录覆盖变量为 `TERMVIAI_DATA_DIR`，Windows 默认数据目录为 `%APPDATA%\wezterm\termviai`；不迁移更早的实验数据目录。
 
@@ -64,10 +64,11 @@
 - SSH 重连修正版覆盖通用 Socket 错误和整组重连，共 97 项测试通过，Windows x64 Release 构建成功，最新细节见 [SSH_RECONNECT.md](SSH_RECONNECT.md)。
 - SSH 历史重叠修正版增加连续失败后成功、残留光标模式及满屏折行覆盖，共 99 项测试通过，Windows x64 Release 构建成功；验证包目录为 `ssh-reconnect-history-20260918`。
 - New Tab 精简版通过工作区存储 7 项（含旧历史清理和保存数据保留）、GUI 61 项测试及 Windows x64 Release 构建；验证包目录为 `new-tab-simplified-20260918`。
-- 重连广播输入修正版通过 84 项不同测试（Mux 重连/输入 11、广播 12、GUI 61）及 Windows x64 Release 构建；最新本地验证包目录为 `ssh-reconnect-input-20260918`，包含 New Tab 精简，尚未替换 GitHub Beta Release 附件。
-- 最终二进制的 CLI 版本与 Windows FileVersion/ProductVersion 均为 `0.1.0-beta.1`。
+- 重连广播输入修正版通过 84 项不同测试（Mux 重连/输入 11、广播 12、GUI 61）及 Windows x64 Release 构建，已合入 beta.2。
+- beta.2 发布前通过 116 项测试：Mux 36、广播 12、GUI TermViAI 61、工作区存储 7。Windows x64 Release 构建和 ZIP 完整性校验通过。
+- 最终二进制的 CLI 版本与 Windows FileVersion/ProductVersion 均为 `0.1.0-beta.2`，Windows 数值资源版本为 `0.1.0.2`。
 - Windows 构建快照是一次性构建输入，不是源码真源；具体位置以构建脚本的工作目录为准。
-- 最终本地发布目录包含 `TermViAI-v0.1.0-beta.1`，GitHub Release 是对外发布真源。
+- 最终本地发布目录为 `TermViAI-v0.1.0-beta.2`，GitHub Release 是对外发布真源。beta.1 及其附件保留。
 - 构建过程中可见的上游弃用、dead code 和 OpenSSL PDB 警告没有阻止构建；后续修改不应把这些历史警告误判为本次功能回归。
 
 发布前最低检查：
