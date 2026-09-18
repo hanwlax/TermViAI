@@ -1,7 +1,7 @@
 //! Native close confirmations. The target is captured when the card opens so
 //! a later tab switch or pane move cannot change what the user is confirming.
 use super::termviai_motion::Tween;
-use super::{TermWindow, TermWindowNotif};
+use super::TermWindow;
 use crate::frontend::front_end;
 use config::WindowCloseConfirmation;
 use mux::Mux;
@@ -80,8 +80,7 @@ impl ConfirmState {
         let prompt = self.prompt.as_ref()?;
         let target = (prompt.target, prompt.window_id);
         if target.0 == CloseTarget::Application {
-            // Waiting for other windows to flush history is still part of
-            // quitting. Keep the card visible and input modal until the
+            // Keep the card visible and input modal until the
             // message loop ends, instead of briefly reopening the terminal.
             self.quitting = true;
             self.closing = true;
@@ -310,16 +309,13 @@ impl TermWindow {
         }
         let mux = Mux::get();
         match target {
-            CloseTarget::Pane { tab_id, pane_id } => {
-                self.termviai_remember_group(tab_id);
+            CloseTarget::Pane { pane_id, .. } => {
                 mux.remove_pane(pane_id);
             }
             CloseTarget::Tab(tab_id) => {
-                self.termviai_remember_group(tab_id);
                 mux.remove_tab(tab_id);
             }
             CloseTarget::Window => {
-                self.termviai_remember_window_groups();
                 mux.kill_window(expected_window);
                 if let Some(window) = &self.window {
                     window.close();
@@ -328,8 +324,9 @@ impl TermWindow {
                 return Ok(());
             }
             CloseTarget::Application => {
-                self.termviai_remember_window_groups();
-                self.termviai_quit_after_history();
+                Connection::get()
+                    .expect("call on gui thread")
+                    .terminate_message_loop();
                 return Ok(());
             }
         }
@@ -339,46 +336,6 @@ impl TermWindow {
             window.invalidate();
         }
         Ok(())
-    }
-
-    fn termviai_quit_after_history(&self) {
-        // Each window owns the host metadata for its groups. Ask the other GUI
-        // windows to flush history before ending the process message loop.
-        let other_windows = front_end()
-            .gui_windows()
-            .into_iter()
-            .filter(|w| w.mux_window_id != self.mux_window_id)
-            .collect::<Vec<_>>();
-        if other_windows.is_empty() {
-            Connection::get()
-                .expect("call on gui thread")
-                .terminate_message_loop();
-            return;
-        }
-        let (tx, rx) = smol::channel::bounded(other_windows.len());
-        for gui in other_windows {
-            let tx = tx.clone();
-            gui.window
-                .notify(TermWindowNotif::Apply(Box::new(move |tw| {
-                    tw.termviai_remember_window_groups();
-                    let _ = tx.try_send(());
-                })));
-        }
-        drop(tx);
-        promise::spawn::spawn_into_main_thread(async move {
-            // A window may disappear after the notification is queued. A
-            // bounded wait keeps quitting reliable in that race as well.
-            let flush = async move { while rx.recv().await.is_ok() {} };
-            let _ = futures::future::select(
-                Box::pin(flush),
-                Box::pin(smol::Timer::after(Duration::from_secs(2))),
-            )
-            .await;
-            Connection::get()
-                .expect("call on gui thread")
-                .terminate_message_loop();
-        })
-        .detach();
     }
 }
 

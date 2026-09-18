@@ -273,22 +273,6 @@ impl TermWindow {
         }
     }
 
-    pub(super) fn termviai_remember_window_groups(&mut self) {
-        // Release the mux window guard before snapshotting individual pane trees.
-        let tabs = Mux::get()
-            .get_window(self.mux_window_id)
-            .map(|window| {
-                window
-                    .iter_tabs()
-                    .map(|tab| tab.tab_id())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        for tab_id in tabs {
-            self.termviai_remember_group(tab_id);
-        }
-    }
-
     fn termviai_workspace_changed_for(&mut self, tab_id: usize) {
         if let Some(tab) = Mux::get().get_tab(tab_id) {
             if !self.termviai_ui.workspace.renamed_tabs.contains(&tab_id) {
@@ -298,30 +282,6 @@ impl TermWindow {
                     .map(|p| self.termviai_pane_label(p.pane.pane_id()))
                     .collect::<Vec<_>>();
                 tab.set_title(&default_tab_label(&labels));
-            }
-            self.termviai_remember_group(tab_id);
-        }
-    }
-
-    pub(super) fn termviai_remember_group(&mut self, tab_id: usize) {
-        if let Some(tab) = Mux::get().get_tab(tab_id) {
-            if tab.iter_panes_ignoring_zoom().len() < 2 {
-                return;
-            }
-            if let Ok(layout) = snapshot(
-                tab.codec_pane_tree(),
-                &self.termviai_ui.workspace.hosts,
-                &Mux::get(),
-            ) {
-                let name = self.termviai_tab_label(&tab);
-                if let Err(error) = self
-                    .termviai_ui
-                    .workspace
-                    .data
-                    .record_group_history(&name, layout)
-                {
-                    self.termviai_ui.error = format!("Could not save workspace history: {error:#}");
-                }
             }
         }
     }
@@ -368,7 +328,6 @@ impl TermWindow {
         }
         tab.set_title(name);
         self.termviai_ui.workspace.renamed_tabs.insert(tab_id);
-        self.termviai_remember_group(tab_id);
         self.update_title();
         Ok(())
     }

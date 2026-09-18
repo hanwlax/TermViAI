@@ -23,7 +23,7 @@
 
 - 原生 Windows Hosts 与 Keychain 页面；无需账号登录，只提供本地 Add/Edit Host，不支持 Telnet。
 - 默认启动到 Hosts 页面，不自动创建本地终端；关闭最后一个终端后返回 Hosts，不退出应用。
-- 顶栏 `+` 打开 New Tab 页面，显示已保存工作区、历史成组 Tab 和最近连接。
+- 顶栏 `+` 打开 New Tab 页面，只显示已保存工作区和最近连接。用户认为 Recent tab groups 占用空间且价值有限，已移除该区域与自动记录流程；需要复用的终端组通过 `Ctrl+S` 手动保存。旧 `history` 数据读取时忽略，下次正常写入库时清理，手动保存和最近连接保留。
 - 多个 SSH 连接可组合到同一 Tab，使用响应式比例分屏、圆角边框和统一四边间距。
 - 支持整组广播开关、逐终端广播成员选择、独立输入和底部可折叠广播工具栏。
 - 组内终端可单独移除；单会话与组合 Tab 可右键重命名。
@@ -45,7 +45,7 @@
 - `wezterm-gui/src/termwindow/termviai_ui.rs`：主界面、Hosts/New Tab/Settings 与交互布局。
 - `wezterm-gui/src/termwindow/termviai_layout.rs`：TermViAI 布局和响应式几何。
 - `wezterm-gui/src/termwindow/termviai_broadcast.rs`：广播状态及 GUI 行为。
-- `wezterm-gui/src/termwindow/termviai_workspace.rs`、`wezterm-gui/src/workspaces.rs`：工作区保存、历史和恢复。
+- `wezterm-gui/src/termwindow/termviai_workspace.rs`、`wezterm-gui/src/workspaces.rs`：工作区手动保存、最近连接和恢复。
 - `wezterm-gui/src/termwindow/termviai_font.rs`：全局与会话字体大小。
 - `wezterm-gui/src/termwindow/termviai_confirm.rs`：关闭确认界面。
 - `wezterm-gui/src/hosts.rs`：Host/Keychain 数据模型和存储。
@@ -61,7 +61,8 @@
 - 最终发布前共通过 92 项相关测试：`termviai-broadcast` 12 项、Mux 20 项、GUI TermViAI 60 项。
 - 发布后 SSH 原位重连开发版通过 94 项相关测试：重连专项 2 项、`termviai-broadcast` 12 项、Mux 20 项、GUI TermViAI 60 项，并完成 Windows x64 Release 构建。
 - SSH 重连修正版覆盖通用 Socket 错误和整组重连，共 97 项测试通过，Windows x64 Release 构建成功，最新细节见 [SSH_RECONNECT.md](SSH_RECONNECT.md)。
-- SSH 历史重叠修正版增加连续失败后成功、残留光标模式及满屏折行覆盖，共 99 项测试通过，Windows x64 Release 构建成功；最新本地验证包目录为 `ssh-reconnect-history-20260918`，尚未替换 GitHub Beta Release 附件。
+- SSH 历史重叠修正版增加连续失败后成功、残留光标模式及满屏折行覆盖，共 99 项测试通过，Windows x64 Release 构建成功；验证包目录为 `ssh-reconnect-history-20260918`。
+- New Tab 精简版通过工作区存储 7 项（含旧历史清理和保存数据保留）、GUI 61 项测试及 Windows x64 Release 构建；最新本地验证包目录为 `new-tab-simplified-20260918`，尚未替换 GitHub Beta Release 附件。
 - 最终二进制的 CLI 版本与 Windows FileVersion/ProductVersion 均为 `0.1.0-beta.1`。
 - Windows 构建快照是一次性构建输入，不是源码真源；具体位置以构建脚本的工作目录为准。
 - 最终本地发布目录包含 `TermViAI-v0.1.0-beta.1`，GitHub Release 是对外发布真源。

@@ -10,7 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_RECENT: usize = 30;
-const MAX_HISTORY: usize = 20;
 const MAX_SAVED: usize = 100;
 const MAX_PANES: usize = 64;
 const MAX_DEPTH: usize = 16;
@@ -93,32 +92,6 @@ impl SavedLayout {
             }
         }
     }
-
-    fn same_connections(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Pane { host: a }, Self::Pane { host: b }) => same_host(a, b),
-            (
-                Self::Split {
-                    axis: a_axis,
-                    first_percent: a_percent,
-                    first: a_first,
-                    second: a_second,
-                },
-                Self::Split {
-                    axis: b_axis,
-                    first_percent: b_percent,
-                    first: b_first,
-                    second: b_second,
-                },
-            ) => {
-                a_axis == b_axis
-                    && a_percent == b_percent
-                    && a_first.same_connections(b_first)
-                    && a_second.same_connections(b_second)
-            }
-            _ => false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,7 +112,6 @@ pub struct SavedWorkspace {
 #[serde(default)]
 pub struct WorkspaceStore {
     pub recent: Vec<RecentConnection>,
-    pub history: Vec<SavedWorkspace>,
     pub saved: Vec<SavedWorkspace>,
     version: u32,
     // Retain unrelated metadata written by a compatible newer application.
@@ -153,7 +125,6 @@ impl Default for WorkspaceStore {
     fn default() -> Self {
         Self {
             recent: Vec::new(),
-            history: Vec::new(),
             saved: Vec::new(),
             version: SCHEMA_VERSION,
             extra: BTreeMap::new(),
@@ -183,6 +154,9 @@ impl WorkspaceStore {
             Err(error) => return Err(error).context("Could not open saved workspaces."),
         };
         store.source = Some(path.to_owned());
+        // Automatic group history was retired. Ignore legacy entries on load
+        // and omit them on the next normal write; keep saved groups intact.
+        store.extra.remove("history");
         store.validate()?;
         store.sort_and_trim();
         Ok(store)
@@ -198,33 +172,6 @@ impl WorkspaceStore {
             latest.recent.push(RecentConnection {
                 host: host.clone(),
                 last_connected_ms: stamp,
-            });
-            Ok(())
-        })
-    }
-
-    /// History records groups only; a single host belongs in recent connections.
-    pub fn record_group_history(&mut self, name: &str, layout: SavedLayout) -> anyhow::Result<()> {
-        layout.validate(0, &mut 0)?;
-        if layout.pane_count() < 2 {
-            return Ok(());
-        }
-        let name = workspace_name(name)?;
-        self.mutate(|latest| {
-            let stamp = latest.next_stamp();
-            let previous = latest
-                .history
-                .iter()
-                .find(|entry| entry.layout.same_connections(&layout))
-                .map(|entry| entry.id.clone());
-            latest
-                .history
-                .retain(|entry| !entry.layout.same_connections(&layout));
-            latest.history.push(SavedWorkspace {
-                id: previous.unwrap_or_else(new_id),
-                name,
-                layout,
-                updated_at_ms: stamp,
             });
             Ok(())
         })
@@ -300,8 +247,7 @@ impl WorkspaceStore {
                     _ => {}
                 }
             }
-            merge_groups(&mut latest.saved, cache.saved, false);
-            merge_groups(&mut latest.history, cache.history, true);
+            merge_groups(&mut latest.saved, cache.saved);
             for (key, value) in cache.extra {
                 latest.extra.entry(key).or_insert(value);
             }
@@ -353,7 +299,7 @@ impl WorkspaceStore {
         for entry in &self.recent {
             validate_host(&entry.host)?;
         }
-        for entry in self.saved.iter().chain(&self.history) {
+        for entry in &self.saved {
             if entry.id.is_empty() || entry.id.chars().any(char::is_control) {
                 bail!("The workspace library contains an invalid ID.");
             }
@@ -367,9 +313,6 @@ impl WorkspaceStore {
         self.recent
             .sort_by_key(|entry| std::cmp::Reverse(entry.last_connected_ms));
         self.recent.truncate(MAX_RECENT);
-        self.history
-            .sort_by_key(|entry| std::cmp::Reverse(entry.updated_at_ms));
-        self.history.truncate(MAX_HISTORY);
         self.saved
             .sort_by_key(|entry| std::cmp::Reverse(entry.updated_at_ms));
     }
@@ -379,7 +322,6 @@ impl WorkspaceStore {
             .recent
             .iter()
             .map(|entry| entry.last_connected_ms)
-            .chain(self.history.iter().map(|entry| entry.updated_at_ms))
             .chain(self.saved.iter().map(|entry| entry.updated_at_ms))
             .max()
             .unwrap_or(0);
@@ -392,11 +334,9 @@ impl WorkspaceStore {
     }
 }
 
-fn merge_groups(current: &mut Vec<SavedWorkspace>, incoming: Vec<SavedWorkspace>, history: bool) {
+fn merge_groups(current: &mut Vec<SavedWorkspace>, incoming: Vec<SavedWorkspace>) {
     for entry in incoming {
-        let existing = current.iter_mut().find(|existing| {
-            existing.id == entry.id || (history && existing.layout.same_connections(&entry.layout))
-        });
+        let existing = current.iter_mut().find(|existing| existing.id == entry.id);
         match existing {
             Some(existing) if entry.updated_at_ms > existing.updated_at_ms => *existing = entry,
             None => current.push(entry),
@@ -483,7 +423,6 @@ mod tests {
         let path = temporary.path().join("workspaces.json");
         let mut store = WorkspaceStore::load_from(&path).unwrap();
         let id = store.save_group(None, "开发环境", group()).unwrap();
-        store.record_group_history("开发环境", group()).unwrap();
         let updated = store.save_group(Some(&id), "生产环境", group()).unwrap();
         assert_eq!(id, updated);
         let loaded = WorkspaceStore::load_from(&path).unwrap();
@@ -492,7 +431,6 @@ mod tests {
         assert_eq!(loaded.saved[0].layout, group());
         assert_eq!(loaded.saved[0].layout.pane_count(), 3);
         assert_eq!(loaded.saved[0].layout.hosts()[1].username, "alice");
-        assert_eq!(loaded.history.len(), 1);
     }
 
     #[test]
@@ -548,33 +486,41 @@ mod tests {
     }
 
     #[test]
-    fn workspace_history_deduplicates_layouts_but_keeps_ssh_credentials_distinct() {
+    fn workspace_legacy_history_is_retired_without_losing_saved_groups_or_recents() {
         let temporary = tempfile::tempdir().unwrap();
-        let mut store =
-            WorkspaceStore::load_from(&temporary.path().join("workspaces.json")).unwrap();
-        store.record_group_history("Original", group()).unwrap();
-        let id = store.history[0].id.clone();
-        let mut updated = group();
-        if let SavedLayout::Split { first, .. } = &mut updated {
-            if let SavedLayout::Pane { host } = first.as_mut() {
-                host.label = "A new label".into();
-            }
-        }
-        store
-            .record_group_history("Renamed", updated.clone())
-            .unwrap();
-        assert_eq!(store.history.len(), 1);
-        assert_eq!(store.history[0].id, id);
-        assert_eq!(store.history[0].name, "Renamed");
-        if let SavedLayout::Split { first, .. } = &mut updated {
-            if let SavedLayout::Pane { host } = first.as_mut() {
-                host.identity_file = "not-currently-mounted/id_ed25519".into();
-            }
-        }
-        store
-            .record_group_history("Different key", updated)
-            .unwrap();
-        assert_eq!(store.history.len(), 2);
+        let path = temporary.path().join("workspaces.json");
+        let mut store = WorkspaceStore::load_from(&path).unwrap();
+        store.save_group(None, "Saved group", group()).unwrap();
+        store.record_recent(&host("one")).unwrap();
+        let saved = store.saved.clone();
+        let recent = store.recent.clone();
+        let mut legacy = serde_json::to_value(&store).unwrap();
+        legacy["history"] = serde_json::to_value(&saved).unwrap();
+        legacy["future_metadata"] = serde_json::json!({"keep": true});
+        let old_bytes = serde_json::to_vec(&legacy).unwrap();
+        std::fs::write(&path, &old_bytes).unwrap();
+
+        let mut loaded = WorkspaceStore::load_from(&path).unwrap();
+        assert_eq!(loaded.saved, saved);
+        assert_eq!(loaded.recent, recent);
+        assert!(!loaded.extra.contains_key("history"));
+        // Loading alone never rewrites the user's file.
+        assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+        loaded.rename_saved(&saved[0].id, "Renamed").unwrap();
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(disk.get("history").is_none());
+        assert_eq!(disk["future_metadata"]["keep"], true);
+        assert_eq!(loaded.saved[0].id, saved[0].id);
+        assert_eq!(loaded.saved[0].layout, saved[0].layout);
+        assert_eq!(loaded.recent, recent);
+
+        // A stale window cannot restore retired history when merging its cache.
+        store.save().unwrap();
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(disk.get("history").is_none());
+        assert_eq!(store.saved[0].name, "Renamed");
     }
 
     #[test]

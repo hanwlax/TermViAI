@@ -68,7 +68,6 @@ enum Action {
     RenameTab(usize),
     SaveWorkspace(usize),
     OpenSaved(String),
-    OpenHistory(String),
     ConnectRecent(usize),
     DismissMenu,
     ConfirmDismiss,
@@ -633,7 +632,7 @@ fn button(
         Action::ToggleTray => Some(Icon::ChevronDown),
         Action::RenameTab(_) => Some(Icon::Edit),
         Action::SaveWorkspace(_) => Some(Icon::Check),
-        Action::OpenSaved(_) | Action::OpenHistory(_) => Some(Icon::Grid),
+        Action::OpenSaved(_) => Some(Icon::Grid),
         Action::ConnectRecent(_) => Some(Icon::Hosts),
         Action::PrevMember => Some(Icon::ChevronLeft),
         Action::NextMember => Some(Icon::ChevronRight),
@@ -1324,7 +1323,6 @@ impl TermWindow {
 
     fn termviai_action(&mut self, action: Action) -> anyhow::Result<()> {
         self.termviai_ui.generation += 1;
-        let opening_saved = matches!(&action, Action::OpenSaved(_));
         match action {
             Action::ToggleSidebar => {
                 let now = Instant::now();
@@ -1380,23 +1378,17 @@ impl TermWindow {
                 self.termviai_save_workspace(id)?;
             }
             Action::DismissMenu => self.termviai_ui.tab_menu = None,
-            Action::OpenSaved(id) | Action::OpenHistory(id) => {
-                let saved = opening_saved;
-                let group = if saved {
-                    &self.termviai_ui.workspace.data.saved
-                } else {
-                    &self.termviai_ui.workspace.data.history
-                }
-                .iter()
-                .find(|g| g.id == id)
-                .context("This workspace changed. Reopen New Tab.")?
-                .clone();
-                self.termviai_open_workspace(
-                    group.layout,
-                    Some(group.name),
-                    saved.then_some(id),
-                    None,
-                )?;
+            Action::OpenSaved(id) => {
+                let group = self
+                    .termviai_ui
+                    .workspace
+                    .data
+                    .saved
+                    .iter()
+                    .find(|g| g.id == id)
+                    .context("This workspace changed. Reopen New Tab.")?
+                    .clone();
+                self.termviai_open_workspace(group.layout, Some(group.name), Some(id), None)?;
                 self.termviai_ui.new_tab_open = false;
             }
             Action::ConnectRecent(index) => {
@@ -1944,9 +1936,7 @@ impl TermWindow {
                         .find(|h| {
                             matches!(
                                 h.action,
-                                Action::OpenSaved(_)
-                                    | Action::OpenHistory(_)
-                                    | Action::ConnectRecent(_)
+                                Action::OpenSaved(_) | Action::ConnectRecent(_)
                             )
                         })
                         .map(|h| h.action.clone())
@@ -3061,28 +3051,22 @@ impl TermWindow {
                             .contains(&q)
                     })
             };
-            for (title, groups, saved) in [
-                ("Saved workspaces", &ui.workspace.data.saved, true),
-                ("Recent tab groups", &ui.workspace.data.history, false),
-            ] {
-                let rows: Vec<_> = groups
-                    .iter()
-                    .filter(|g| matches(&g.name, &g.layout))
-                    .collect();
-                if !rows.is_empty() {
-                    entries.push((title.into(), String::new(), None));
-                }
-                for g in rows {
-                    entries.push((
-                        g.name.clone(),
-                        format!("{} connections", g.layout.pane_count()),
-                        Some(if saved {
-                            Action::OpenSaved(g.id.clone())
-                        } else {
-                            Action::OpenHistory(g.id.clone())
-                        }),
-                    ));
-                }
+            let groups: Vec<_> = ui
+                .workspace
+                .data
+                .saved
+                .iter()
+                .filter(|g| matches(&g.name, &g.layout))
+                .collect();
+            if !groups.is_empty() {
+                entries.push(("Saved workspaces".into(), String::new(), None));
+            }
+            for g in groups {
+                entries.push((
+                    g.name.clone(),
+                    format!("{} connections", g.layout.pane_count()),
+                    Some(Action::OpenSaved(g.id.clone())),
+                ));
             }
             let recents: Vec<_> = ui
                 .workspace
