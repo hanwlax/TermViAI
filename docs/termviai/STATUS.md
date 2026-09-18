@@ -1,5 +1,9 @@
 # TermViAI 状态
 
+## 2026-09-18 发布后项目记忆
+
+`v0.1.0-beta.1` 已推送至 GitHub 并作为 prerelease 发布，远端 `main`、标签和发布提交一致，Windows 附件已回传下载并通过 SHA-256 校验。当前真实状态、关键路径、开发约束和按优先级排列的后续工作统一记录在 [MEMORY.md](MEMORY.md)。
+
 ## 2026-09-17 v0.1.0-beta.1 品牌与发布
 
 产品名已统一为 TermViAI（Terminal Via AI），用户可见界面、Windows 产品元数据和便携包入口均使用该名称。作为首个发布版本，内部模块、配置项、环境变量和数据目录也统一为 `termviai`/`TERMVIAI`，不保留旧品牌兼容层。版本固定为 `0.1.0-beta.1`，目标公开仓库和 Release 为 [hanwlax/TermViAI](https://github.com/hanwlax/TermViAI)。
