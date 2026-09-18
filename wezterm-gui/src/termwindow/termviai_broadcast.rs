@@ -167,6 +167,9 @@ impl TermWindow {
                     target.send_raw_input(data)
                 },
             )?;
+            for (id, error) in &report.failures {
+                log::error!("Broadcast input failed for pane {id}: {error:#}");
+            }
             anyhow::ensure!(
                 report.failures.is_empty() && report.disconnected.is_empty(),
                 "Broadcast: {} sent, {} disconnected, {} failed. Input was not replayed.",
@@ -174,6 +177,12 @@ impl TermWindow {
                 report.disconnected.len(),
                 report.failures.len()
             );
+            if !bytes.is_empty() && !self.termviai_broadcast.error.is_empty() {
+                self.termviai_broadcast.error.clear();
+                if let Some(window) = &self.window {
+                    window.invalidate();
+                }
+            }
             Ok(())
         })();
         if let Err(error) = &result {

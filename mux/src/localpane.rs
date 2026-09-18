@@ -156,7 +156,6 @@ pub struct LocalPane {
     process: Mutex<ProcessState>,
     pty: Mutex<Box<dyn MasterPty>>,
     writer: Mutex<Box<dyn Write + Send>>,
-    input_writer: WriterWrapper,
     domain_id: DomainId,
     tmux_domain: Mutex<Option<Arc<TmuxDomainState>>>,
     proc_list: Mutex<Option<CachedProcInfo>>,
@@ -1092,7 +1091,6 @@ impl LocalPane {
             }),
             pty: Mutex::new(pty),
             writer: Mutex::new(Box::new(writer.clone())),
-            input_writer: writer,
             domain_id,
             tmux_domain: Mutex::new(None),
             proc_list: Mutex::new(None),
@@ -1127,7 +1125,12 @@ impl LocalPane {
         );
 
         let (process, signaller, pid) = split_child(process);
-        self.input_writer.replace(writer);
+        // Bind each generation to its own wrapper. An old background write
+        // still in flight must never pick up the replacement SSH transport.
+        let writer = WriterWrapper::new(self.pane_id, writer);
+        let mut terminal = self.terminal.lock();
+        terminal.replace_writer(Box::new(writer.clone()));
+        *self.writer.lock() = Box::new(writer);
         *self.pty.lock() = pty;
         let mut state = self.process.lock();
         if let ProcessState::Running { signaller, .. } = &mut *state {
@@ -1145,7 +1148,8 @@ impl LocalPane {
         #[cfg(unix)]
         self.leader.lock().take();
 
-        prepare_terminal_for_reconnect(&mut self.terminal.lock());
+        prepare_terminal_for_reconnect(&mut terminal);
+        drop(terminal);
         Mux::get().notify(MuxNotification::PaneOutput(self.pane_id));
         Ok(())
     }

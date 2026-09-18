@@ -503,10 +503,6 @@ impl WriterWrapper {
             pane_id,
         }
     }
-
-    pub(crate) fn replace(&self, writer: Box<dyn Write + Send>) {
-        *self.writer.lock() = writer;
-    }
 }
 
 impl std::io::Write for WriterWrapper {
@@ -763,17 +759,18 @@ mod writer_wrapper_tests {
     }
 
     #[test]
-    fn cloned_writer_switches_to_reconnected_transport() {
+    fn cloned_writer_stays_on_old_transport_when_reconnect_creates_a_new_wrapper() {
         let first = Arc::new(Mutex::new(Vec::new()));
         let second = Arc::new(Mutex::new(Vec::new()));
         let wrapper = WriterWrapper::new(7, Box::new(CaptureWriter(Arc::clone(&first))));
         let mut terminal_writer = wrapper.clone();
 
         terminal_writer.write_all(b"before").unwrap();
-        wrapper.replace(Box::new(CaptureWriter(Arc::clone(&second))));
-        terminal_writer.write_all(b"after").unwrap();
+        let mut replacement = WriterWrapper::new(7, Box::new(CaptureWriter(Arc::clone(&second))));
+        replacement.write_all(b"after").unwrap();
+        terminal_writer.write_all(b"old in-flight write").unwrap();
 
-        assert_eq!(&*first.lock(), b"before");
+        assert_eq!(&*first.lock(), b"beforeold in-flight write");
         assert_eq!(&*second.lock(), b"after");
     }
 }

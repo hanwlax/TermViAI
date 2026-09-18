@@ -10,6 +10,7 @@ use num_traits::ToPrimitive;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use terminfo::{Database, Value};
@@ -447,6 +448,7 @@ fn default_color_map() -> HashMap<u16, RgbColor> {
 /// input from the interactive user, or pastes.
 struct ThreadedWriter {
     sender: Sender<WriterMessage>,
+    stopped: Arc<AtomicBool>,
 }
 
 enum WriterMessage {
@@ -457,9 +459,14 @@ enum WriterMessage {
 impl ThreadedWriter {
     fn new(mut writer: Box<dyn std::io::Write + Send>) -> Self {
         let (sender, receiver) = channel::<WriterMessage>();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = Arc::clone(&stopped);
 
         std::thread::spawn(move || {
             while let Ok(msg) = receiver.recv() {
+                if worker_stopped.load(Ordering::Acquire) {
+                    break;
+                }
                 match msg {
                     WriterMessage::Data(buf) => {
                         if writer.write_all(&buf).is_err() {
@@ -475,7 +482,7 @@ impl ThreadedWriter {
             }
         });
 
-        Self { sender }
+        Self { sender, stopped }
     }
 }
 
@@ -822,6 +829,19 @@ impl TerminalState {
     /// continue to use the ordinary writer and never enter this input method.
     pub fn set_input_capture_id(&mut self, id: usize) {
         self.input_capture_id = Some(id);
+    }
+
+    /// Start a fresh input queue for a replacement transport. A failed writer
+    /// thread cannot be revived by changing its underlying socket. Discard both
+    /// buffered and queued input; it must never be replayed into the new shell.
+    pub fn replace_writer(&mut self, writer: Box<dyn std::io::Write + Send>) {
+        self.writer.get_ref().stopped.store(true, Ordering::Release);
+        let old = std::mem::replace(
+            &mut self.writer,
+            BufWriter::new(ThreadedWriter::new(writer)),
+        );
+        // BufWriter::drop would flush pending bytes. into_parts does not write.
+        let _ = old.into_parts();
     }
 
     /// Submit already encoded user input through the existing asynchronous

@@ -35,6 +35,7 @@
 - SSH 断线后保留 pane、组合布局和主屏滚动历史；名称右侧提供小号单箭头重连图标，整组均断线时 Tab 提供一键重连。重连直接衔接输出，不画分隔线；用户参考图的蓝线只是位置标记。断线期间不接受输入或参与实际广播，原广播成员关系保留。
 - 显式重连建立新 SSH 传输；新 Tab 在缓存会话申请 PTY 失败时新建传输重试一次，旧断线组无需关闭。重连错误仅显示在对应 pane，不使用 Hosts/New Tab 的全局错误栏。
 - 重连不重放启动更新横幅（其中绝对光标定位会覆盖历史）；旧输出解析完成后才允许换连接，重置残留滚动区域和光标模式并从历史末尾追加。保留真实 SSH 错误，省略底层进程退出/Hold 提示，连续失败后成功也应保留全部历史。
+- 重连同时重建 Terminal 的后台输入线程与缓冲队列；只替换底层 SSH writer 无法恢复因 BrokenPipe 退出的输入线程，会导致“其他 pane 收到、源 pane 失败”。每代 writer 隔离，旧缓冲及排队输入丢弃而不重放，保留广播成员关系与历史。
 - Windows 原生最小客户区为 720×480 逻辑像素；缩放时仅在终端网格变化后重排 Mux/PTY。
 - 关闭窗口、Tab、pane 和退出应用使用统一的现代确认卡片。
 
@@ -62,7 +63,8 @@
 - 发布后 SSH 原位重连开发版通过 94 项相关测试：重连专项 2 项、`termviai-broadcast` 12 项、Mux 20 项、GUI TermViAI 60 项，并完成 Windows x64 Release 构建。
 - SSH 重连修正版覆盖通用 Socket 错误和整组重连，共 97 项测试通过，Windows x64 Release 构建成功，最新细节见 [SSH_RECONNECT.md](SSH_RECONNECT.md)。
 - SSH 历史重叠修正版增加连续失败后成功、残留光标模式及满屏折行覆盖，共 99 项测试通过，Windows x64 Release 构建成功；验证包目录为 `ssh-reconnect-history-20260918`。
-- New Tab 精简版通过工作区存储 7 项（含旧历史清理和保存数据保留）、GUI 61 项测试及 Windows x64 Release 构建；最新本地验证包目录为 `new-tab-simplified-20260918`，尚未替换 GitHub Beta Release 附件。
+- New Tab 精简版通过工作区存储 7 项（含旧历史清理和保存数据保留）、GUI 61 项测试及 Windows x64 Release 构建；验证包目录为 `new-tab-simplified-20260918`。
+- 重连广播输入修正版通过 84 项不同测试（Mux 重连/输入 11、广播 12、GUI 61）及 Windows x64 Release 构建；最新本地验证包目录为 `ssh-reconnect-input-20260918`，包含 New Tab 精简，尚未替换 GitHub Beta Release 附件。
 - 最终二进制的 CLI 版本与 Windows FileVersion/ProductVersion 均为 `0.1.0-beta.1`。
 - Windows 构建快照是一次性构建输入，不是源码真源；具体位置以构建脚本的工作目录为准。
 - 最终本地发布目录包含 `TermViAI-v0.1.0-beta.1`，GitHub Release 是对外发布真源。

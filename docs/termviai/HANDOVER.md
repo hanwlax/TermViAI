@@ -2,6 +2,10 @@
 
 > 最新、精简且可执行的项目上下文见 [MEMORY.md](MEMORY.md)。后续工作应先读取该文件；下文保留完整历史记录。
 
+## 2026-09-18 断网重连后广播源终端写入失败
+
+用户截图显示 `3 sent, 0 disconnected, 1 failed`。断网时 Terminal 内的后台输入线程遇到 write/flush 错误后退出，先前只替换 SSH writer，无法复活该线程。重连现重建异步输入队列和线程，替换 Pane 直接 writer，并让新旧连接各自持有独立 wrapper。旧 BufWriter 缓冲不刷新，排队输入取消，不重放到新 shell；历史、pane ID 和输入捕获 ID 不变。具体广播失败写入日志，随后成功广播清除旧提示。验证见 [SSH_RECONNECT.md](SSH_RECONNECT.md)。
+
 ## 2026-09-18 New Tab 移除自动历史组
 
 按用户反馈移除 Recent tab groups，保留 Saved workspaces 和 Recent connections。组合变化、重命名、关闭 pane/Tab/窗口和退出应用不再写自动历史，也移除退出时等待其他窗口刷新历史的流程；手动 `Ctrl+S` 保存及重命名持久化不变。旧 `history` 字段读取时丢弃，下次正常写入库时清理，其他数据保留。
