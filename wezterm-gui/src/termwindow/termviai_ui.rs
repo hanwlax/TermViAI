@@ -104,6 +104,7 @@ enum Action {
     BroadcastNone,
     Member(usize),
     ReconnectPane(usize),
+    ReconnectGroup(usize),
     RemovePane(usize),
     FocusPane(usize),
 }
@@ -628,7 +629,7 @@ fn button(
         Action::AddSsh(false) => Some(Icon::SplitRight),
         Action::AddSsh(true) => Some(Icon::SplitDown),
         Action::Broadcast | Action::TabBroadcast(_) => Some(Icon::Broadcast),
-        Action::ReconnectPane(_) => Some(Icon::Refresh),
+        Action::ReconnectPane(_) | Action::ReconnectGroup(_) => Some(Icon::Refresh),
         Action::ToggleTray => Some(Icon::ChevronDown),
         Action::RenameTab(_) => Some(Icon::Edit),
         Action::SaveWorkspace(_) => Some(Icon::Check),
@@ -684,6 +685,7 @@ fn action_hint(
             _ => "Start broadcast to selected hosts",
         },
         Action::ReconnectPane(_) => "Reconnect this SSH session",
+        Action::ReconnectGroup(_) => "Reconnect all SSH sessions in this tab",
         _ => return None,
     })
 }
@@ -1578,7 +1580,8 @@ impl TermWindow {
                     }
                 }
             }
-            Action::ReconnectPane(id) => self.termviai_reconnect_pane(id)?,
+            Action::ReconnectPane(id) => self.termviai_reconnect_pane(id),
+            Action::ReconnectGroup(id) => self.termviai_reconnect_group(id),
             Action::RemovePane(id) => self.close_specific_pane(id, true),
             Action::Drag | Action::Drawer => {}
         }
@@ -1700,8 +1703,12 @@ impl TermWindow {
                 ));
             }
             MouseEventKind::Press(MousePress::Right) => {
-                if let Some(Action::Tab(id) | Action::CloseTab(id) | Action::TabBroadcast(id)) =
-                    over
+                if let Some(
+                    Action::Tab(id)
+                    | Action::CloseTab(id)
+                    | Action::TabBroadcast(id)
+                    | Action::ReconnectGroup(id),
+                ) = over
                 {
                     self.termviai_ui.tab_menu = Some((id, x, y));
                     self.termviai_ui.pressed = None;
@@ -2078,6 +2085,23 @@ impl TermWindow {
             .map(|win| win.iter_tabs().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         let active_id = active_tab.as_ref().map(|t| t.tab_id());
+        let disconnected_groups: HashSet<usize> = current_tabs
+            .iter()
+            .filter_map(|tab| {
+                super::termviai_workspace::group_needs_reconnect(
+                    tab.iter_panes_ignoring_zoom().iter().map(|p| {
+                        p.pane
+                            .downcast_ref::<LocalPane>()
+                            .is_some_and(LocalPane::is_reconnectable_ssh)
+                    }),
+                )
+                .then_some(tab.tab_id())
+            })
+            .collect();
+        self.termviai_ui
+            .workspace
+            .reconnect_errors
+            .retain(|id, _| mux.get_pane(*id).is_some());
         let mut tabs: Vec<(usize, String, bool, usize)> = current_tabs
             .iter()
             .map(|t| {
@@ -2179,6 +2203,7 @@ impl TermWindow {
                 &hover,
             );
             if *pane_count > 1 {
+                let reconnect = disconnected_groups.contains(id);
                 tiles.last_mut().unwrap().right_inset = 62.;
                 let t = tiles.last_mut().unwrap();
                 t.icon = (tw >= 120.).then_some(Icon::Grid);
@@ -2193,18 +2218,31 @@ impl TermWindow {
                     26.,
                     28.,
                     "",
-                    if group_states.get(id) == Some(&true) {
+                    if !reconnect && group_states.get(id) == Some(&true) {
                         "#625bcc"
                     } else {
                         TOP
                     },
-                    Action::TabBroadcast(*id),
+                    if reconnect {
+                        Action::ReconnectGroup(*id)
+                    } else {
+                        Action::TabBroadcast(*id)
+                    },
                     &hover,
                 );
                 let t = tiles.last_mut().unwrap();
-                let broadcasting = group_states.get(id) == Some(&true);
+                let broadcasting = !reconnect && group_states.get(id) == Some(&true);
                 t.transparent = !broadcasting;
-                t.fg = if broadcasting { INK } else { MUTED };
+                t.fg = if reconnect {
+                    RECONNECT
+                } else if broadcasting {
+                    INK
+                } else {
+                    MUTED
+                };
+                if reconnect {
+                    t.icon_size = 16.;
+                }
             }
             button(
                 &mut tiles,
@@ -2513,6 +2551,7 @@ impl TermWindow {
                         );
                         let t = tiles.last_mut().unwrap();
                         t.icon = Some(Icon::Refresh);
+                        t.icon_size = 16.;
                         t.transparent = true;
                         t.fg = RECONNECT;
                         if ui.workspace.reconnecting.contains(&header.pane_id) {
@@ -2551,6 +2590,23 @@ impl TermWindow {
                         );
                         let t = tiles.last_mut().unwrap();
                         t.fg = MUTED;
+                    }
+                }
+                if let Some(error) = ui.workspace.reconnect_errors.get(&header.pane_id) {
+                    let error_height = 28_f32.min((frame.h - rect.h - 12.).max(0.));
+                    tile(
+                        &mut tiles,
+                        frame.x + 8.,
+                        rect.y + rect.h + 4.,
+                        (frame.w - 16.).max(0.),
+                        error_height,
+                        error.clone(),
+                        "#59333f",
+                        INK,
+                        true,
+                    );
+                    if let Some(tile) = tiles.last_mut() {
+                        tile.zindex = 34;
                     }
                 }
             }

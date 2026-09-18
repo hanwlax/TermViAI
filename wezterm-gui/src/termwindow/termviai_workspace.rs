@@ -23,6 +23,18 @@ pub(super) struct WorkspaceUi {
     pub saved_ids: HashMap<usize, String>,
     pub renamed_tabs: HashSet<usize>,
     pub reconnecting: HashSet<usize>,
+    pub reconnect_errors: HashMap<usize, String>,
+}
+
+pub(super) fn group_needs_reconnect(states: impl IntoIterator<Item = bool>) -> bool {
+    let mut count = 0;
+    for disconnected in states {
+        if !disconnected {
+            return false;
+        }
+        count += 1;
+    }
+    count > 1
 }
 
 fn domain_name(host: &Host, ssh_keepalive_interval: u64) -> String {
@@ -118,7 +130,44 @@ fn restored_name_is_custom(name: Option<&str>, layout: &SavedLayout) -> bool {
 }
 
 impl TermWindow {
-    pub(super) fn termviai_reconnect_pane(&mut self, pane_id: usize) -> anyhow::Result<()> {
+    pub(super) fn termviai_reconnect_group(&mut self, tab_id: usize) {
+        let mux = Mux::get();
+        let ids = mux
+            .get_tab(tab_id)
+            .map(|tab| {
+                tab.iter_panes_ignoring_zoom()
+                    .iter()
+                    .filter_map(|positioned| {
+                        let pane = &positioned.pane;
+                        (pane.downcast_ref::<LocalPane>()
+                            .is_some_and(LocalPane::is_reconnectable_ssh)
+                            && mux.resolve_pane_id(pane.pane_id()).is_some_and(
+                                |(_, window, _)| window == self.mux_window_id,
+                            ))
+                        .then_some(pane.pane_id())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for pane_id in ids {
+            self.termviai_reconnect_pane(pane_id);
+        }
+    }
+
+    pub(super) fn termviai_reconnect_pane(&mut self, pane_id: usize) {
+        if self.termviai_ui.workspace.reconnecting.contains(&pane_id) {
+            return;
+        }
+        self.termviai_ui.workspace.reconnect_errors.remove(&pane_id);
+        if let Err(error) = self.termviai_start_reconnect(pane_id) {
+            self.termviai_ui
+                .workspace
+                .reconnect_errors
+                .insert(pane_id, format!("Reconnect failed: {error:#}"));
+        }
+    }
+
+    fn termviai_start_reconnect(&mut self, pane_id: usize) -> anyhow::Result<()> {
         let mux = Mux::get();
         let pane = match mux.get_pane(pane_id) {
             Some(pane) => pane,
@@ -151,7 +200,6 @@ impl TermWindow {
             pixel_height: dimensions.pixel_height,
             dpi: dimensions.dpi,
         };
-        let label = self.termviai_pane_label(pane_id);
         promise::spawn::spawn(async move {
             let result = async {
                 let local = pane
@@ -166,14 +214,15 @@ impl TermWindow {
 
             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                 tw.termviai_ui.workspace.reconnecting.remove(&pane_id);
-                match result {
-                    Ok(()) => {
-                        tw.termviai_ui.error.clear();
-                        tw.termviai_broadcast.error.clear();
-                        tw.termviai_ui.show_notice(format!("Reconnected {label}"));
-                    }
-                    Err(error) => {
-                        tw.termviai_ui.error = format!("Reconnect {label}: {error:#}");
+                // Backend installation starts inline authentication; it does
+                // not mean that the remote shell has connected successfully.
+                // Scope failures to the pane, never to the Hosts/New Tab UI.
+                if let Err(error) = result {
+                    if Mux::get().get_pane(pane_id).is_some() {
+                        tw.termviai_ui.workspace.reconnect_errors.insert(
+                            pane_id,
+                            format!("Reconnect failed: {error:#}"),
+                        );
                     }
                 }
                 tw.termviai_sync_broadcast();
@@ -550,6 +599,15 @@ mod keepalive_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn group_reconnect_requires_every_session_to_be_disconnected() {
+        assert!(!group_needs_reconnect([]));
+        assert!(!group_needs_reconnect([true]));
+        assert!(!group_needs_reconnect([false, false]));
+        assert!(!group_needs_reconnect([true, false]));
+        assert!(group_needs_reconnect([true, true]));
+        assert!(group_needs_reconnect([true, true, true, true]));
+    }
     #[test]
     fn labels_describe_hosts_without_shell_titles() {
         assert_eq!(default_tab_label(&["209".into()]), "209");

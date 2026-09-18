@@ -38,17 +38,16 @@ use wezterm_term::{
 
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 
-fn reconnect_divider(cols: usize) -> String {
-    let cols = cols.max(1);
-    let label = " Reconnected ";
-    let label_width = label.chars().count();
-    if cols < label_width {
-        return "─".repeat(cols);
+fn prepare_terminal_for_reconnect(terminal: &mut Terminal) {
+    // Resume the main-screen cursor after a full-screen program, retaining the
+    // same terminal and scrollback. Do not print a marker or clear the screen.
+    if terminal.is_alt_screen_active() {
+        terminal.advance_bytes(b"\x1b[?1049l");
     }
-    let available = cols - label_width;
-    let left = available / 2;
-    let right = available - left;
-    format!("{}{}{}", "─".repeat(left), label, "─".repeat(right))
+    terminal.advance_bytes(concat!(
+        "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?2004l",
+        "\x1b[0m\r\n"
+    ));
 }
 
 #[derive(Debug)]
@@ -1132,27 +1131,9 @@ impl LocalPane {
         #[cfg(unix)]
         self.leader.lock().take();
 
-        self.append_reconnect_separator();
-        Ok(())
-    }
-
-    fn append_reconnect_separator(&self) {
-        let cols = terminal_get_dimensions(&mut self.terminal.lock())
-            .cols
-            .max(1);
-        let message = format!(
-            concat!(
-                "\x1b[?1049l", // Return from a stale alternate screen.
-                "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?2004l",
-                "\r\n\x1b[38;2;137;180;250m{}\x1b[0m\r\n"
-            ),
-            reconnect_divider(cols),
-        );
-        let mut parser = termwiz::escape::parser::Parser::new();
-        let mut actions = vec![];
-        parser.parse(message.as_bytes(), |action| actions.push(action));
-        self.terminal.lock().perform_actions(actions);
+        prepare_terminal_for_reconnect(&mut self.terminal.lock());
         Mux::get().notify(MuxNotification::PaneOutput(self.pane_id));
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1279,16 +1260,45 @@ impl Drop for LocalPane {
 
 #[cfg(test)]
 mod reconnect_tests {
-    use super::reconnect_divider;
+    use super::*;
 
     #[test]
-    fn reconnect_divider_fills_the_terminal_width() {
-        for cols in [1, 8, 13, 40, 80, 127] {
-            let divider = reconnect_divider(cols);
-            assert_eq!(divider.chars().count(), cols);
-            if cols >= " Reconnected ".chars().count() {
-                assert!(divider.contains(" Reconnected "));
+    fn reconnect_preserves_scrollback_without_a_separator_or_cursor_rewind() {
+        for alternate_screen in [false, true] {
+            let mut terminal = Terminal::new(
+                TerminalSize {
+                    rows: 4,
+                    cols: 40,
+                    pixel_width: 320,
+                    pixel_height: 64,
+                    dpi: 96,
+                },
+                Arc::new(config::TermConfig::new()),
+                "TermViAI",
+                "test",
+                Box::new(Vec::<u8>::new()),
+            );
+            terminal.advance_bytes("saved\x1b7\r\nhistory one\r\nhistory two\r\nhistory three\r\nold prompt");
+            if alternate_screen {
+                terminal.advance_bytes("\x1b[?1049hfull screen program");
             }
+            prepare_terminal_for_reconnect(&mut terminal);
+            terminal.advance_bytes("new prompt");
+            let text = terminal
+                .screen()
+                .lines_in_phys_range(0..terminal.screen().scrollback_rows())
+                .iter()
+                .map(|line| line.as_str().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!terminal.is_alt_screen_active());
+            for expected in [
+                "history one", "history two", "history three", "old prompt", "new prompt",
+            ] {
+                assert!(text.contains(expected), "missing {expected}: {text}");
+            }
+            assert!(!text.contains("Reconnected"));
+            assert!(!text.contains('─'));
         }
     }
 }

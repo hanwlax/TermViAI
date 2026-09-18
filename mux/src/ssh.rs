@@ -184,6 +184,22 @@ pub struct RemoteSshDomain {
     name: String,
 }
 
+async fn cached_pty_or_fresh<T, F, Fut>(cached: anyhow::Result<T>, fresh: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    match cached {
+        Ok(backend) => Ok(backend),
+        Err(err) => {
+            // libssh can report a generic Socket error instead of DeadSession.
+            // Retry once, preserving the fresh attempt's authentication errors.
+            log::warn!("Cached SSH PTY failed; opening a fresh session: {err:#}");
+            fresh().await
+        }
+    }
+}
+
 pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap> {
     let mut ssh_config = wezterm_ssh::Config::new();
     ssh_config.add_default_config_files();
@@ -424,7 +440,7 @@ impl RemoteSshDomain {
         // Release the session lock before awaiting a PTY request.
         let mut session: Option<Session> = self.session.lock().unwrap().as_ref().cloned();
         if let Some(session) = session.take() {
-            match session
+            let cached = session
                 .request_pty(
                     &config::configuration().term,
                     crate::terminal_size_to_pty_size(size)
@@ -434,26 +450,13 @@ impl RemoteSshDomain {
                 )
                 .await
                 .context("request ssh pty")
-            {
-                Ok((concrete_pty, concrete_child)) => {
+                .and_then(|(concrete_pty, concrete_child)| {
                     let pty = Box::new(concrete_pty);
                     let child = Box::new(concrete_child);
                     let writer = Box::new(pty.take_writer().context("take writer from pty")?);
                     Ok(StartNewSessionResult { pty, child, writer })
-                }
-                Err(err)
-                    if err
-                        .root_cause()
-                        .downcast_ref::<wezterm_ssh::DeadSession>()
-                        .is_some() =>
-                {
-                    self.start_new_session(command_line, env, size).await
-                }
-                Err(err) => {
-                    log::error!("{err:#?}");
-                    Err(err)
-                }
-            }
+                });
+            cached_pty_or_fresh(cached, || self.start_new_session(command_line, env, size)).await
         } else {
             self.start_new_session(command_line, env, size).await
         }
@@ -467,9 +470,11 @@ impl RemoteSshDomain {
             pane.is_reconnectable_ssh(),
             "SSH session is still connected"
         );
-        let backend = self
-            .start_pane_backend(pane.pane_id(), size, None, None)
-            .await?;
+        // A libssh transport may fail with a generic socket error rather than
+        // DeadSession. Explicit reconnect must never request a PTY from that
+        // cached transport; open a fresh connection and authenticate inline.
+        let (command_line, env) = self.build_command(pane.pane_id(), None, None)?;
+        let backend = self.start_new_session(command_line, env, size).await?;
         pane.reconnect(backend.child, backend.pty, backend.writer)?;
 
         let mux = Mux::get();
@@ -1173,5 +1178,46 @@ impl std::io::Read for PtyReader {
                 _ => res,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::cached_pty_or_fresh;
+    use std::cell::Cell;
+
+    #[test]
+    fn reconnect_new_tab_recovers_from_generic_socket_error_once() {
+        let attempts = Cell::new(0);
+        let result = smol::block_on(cached_pty_or_fresh(
+            Err(anyhow::anyhow!("request ssh pty: Fatal: Socket error: No error")),
+            || async {
+                attempts.set(attempts.get() + 1);
+                Ok("new transport")
+            },
+        ));
+        assert_eq!(result.unwrap(), "new transport");
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn reconnect_keeps_healthy_cached_session_and_reports_fresh_failure() {
+        let attempts = Cell::new(0);
+        let result = smol::block_on(cached_pty_or_fresh(Ok("cached"), || async {
+            attempts.set(attempts.get() + 1);
+            Ok("fresh")
+        }));
+        assert_eq!(result.unwrap(), "cached");
+        assert_eq!(attempts.get(), 0);
+
+        let result = smol::block_on(cached_pty_or_fresh::<(), _, _>(
+            Err(anyhow::anyhow!("old socket failed")),
+            || async {
+                attempts.set(attempts.get() + 1);
+                Err(anyhow::anyhow!("fresh authentication failed"))
+            },
+        ));
+        assert_eq!(result.unwrap_err().to_string(), "fresh authentication failed");
+        assert_eq!(attempts.get(), 1);
     }
 }
