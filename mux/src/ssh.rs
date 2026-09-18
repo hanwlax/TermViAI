@@ -417,7 +417,7 @@ impl RemoteSshDomain {
                 command_line,
                 env,
             ) {
-                let _ = write!(stdout_write, "{:#}", err);
+                let _ = write!(stdout_write, "\r\n{:#}\r\n", err);
                 log::error!("Failed to connect ssh: {:#}", err);
             }
             let _ = stdout_write.flush();

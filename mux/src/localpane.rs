@@ -45,8 +45,24 @@ fn prepare_terminal_for_reconnect(terminal: &mut Terminal) {
         terminal.advance_bytes(b"\x1b[?1049l");
     }
     terminal.advance_bytes(concat!(
+        "\x1b[!p", // Reset margins, origin and input modes without erasing history.
         "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?2004l",
-        "\x1b[0m\r\n"
+        "\x1b[0m"
+    ));
+    let screen = terminal.screen();
+    let rows = screen.physical_rows;
+    let visible_start = screen.scrollback_rows().saturating_sub(rows);
+    let last_output_row = screen
+        .lines_in_phys_range(visible_start..screen.scrollback_rows())
+        .iter()
+        .rposition(|line| !line.is_whitespace())
+        .unwrap_or(0);
+    let row = last_output_row.max(terminal.cursor_pos().y.max(0) as usize);
+    // The old shell or a failed prompt may have left the cursor above the last
+    // output. Append below the entire visible transcript, scrolling if needed.
+    terminal.advance_bytes(format!(
+        "\x1b[{};1H\r\n",
+        row.min(rows.saturating_sub(1)) + 1
     ));
 }
 
@@ -359,7 +375,10 @@ impl Pane for LocalPane {
         }
 
         let mut notify = None;
-        if !terse.is_empty() {
+        if !terse.is_empty() && !(self.reconnectable_ssh && configuration().termviai_ui) {
+            // TermViAI SSH errors already arrive in the PTY output stream.
+            // A second asynchronous process-exit message can interleave with
+            // authentication output and describes the wrapper, not the host.
             match configuration().exit_behavior_messaging {
                 ExitBehaviorMessaging::Verbose => {
                     if terse == "done" {
@@ -468,7 +487,7 @@ impl Pane for LocalPane {
     fn reader_finished(&self, generation: u64) {
         if self.reader_generation.load(Ordering::Acquire) == generation {
             self.reader_ended.store(true, Ordering::Release);
-            Mux::get().notify(MuxNotification::PaneOutput(self.pane_id));
+            Mux::notify_from_any_thread(MuxNotification::PaneOutput(self.pane_id));
         }
     }
 
@@ -1086,19 +1105,14 @@ impl LocalPane {
         }
     }
 
-    /// True after a TermViAI SSH child has ended and its pane is being held
-    /// for an in-place reconnect. Polling `is_dead` advances the child state;
-    /// the TermViAI SSH exit policy keeps it at `DeadPendingClose`.
+    /// True once all output from the ended SSH transport has been parsed.
+    /// Child exit alone is insufficient: its final error may still be buffered.
     pub fn is_reconnectable_ssh(&self) -> bool {
         if !self.reconnectable_ssh {
             return false;
         }
         let _ = <Self as Pane>::is_dead(self);
         self.reader_ended.load(Ordering::Acquire)
-            || matches!(
-                &*self.process.lock(),
-                ProcessState::DeadPendingClose { .. } | ProcessState::Dead
-            )
     }
 
     pub(crate) fn reconnect(
@@ -1261,6 +1275,86 @@ impl Drop for LocalPane {
 #[cfg(test)]
 mod reconnect_tests {
     use super::*;
+
+    fn transcript(terminal: &Terminal) -> Vec<String> {
+        terminal
+            .screen()
+            .lines_in_phys_range(0..terminal.screen().scrollback_rows())
+            .iter()
+            .map(|line| line.as_str().trim_end().to_string())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn reconnect_appends_failures_and_success_below_history_with_stale_cursor_modes() {
+        let mut terminal = Terminal::new(
+            TerminalSize {
+                rows: 8,
+                cols: 40,
+                pixel_width: 320,
+                pixel_height: 128,
+                dpi: 96,
+            },
+            Arc::new(config::TermConfig::new()),
+            "TermViAI",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes("history one\r\nhistory two\r\nold prompt");
+        for output in ["Network unreachable", "Connection refused", "Welcome back"] {
+            // A TUI can leave a restricted scrolling region, origin mode,
+            // insert mode and a cursor above the final historical line.
+            terminal.advance_bytes("\x1b[2;3r\x1b[?6h\x1b[4h\x1b[1;1H");
+            prepare_terminal_for_reconnect(&mut terminal);
+            terminal.advance_bytes(output);
+        }
+        assert_eq!(
+            transcript(&terminal),
+            [
+                "history one",
+                "history two",
+                "old prompt",
+                "Network unreachable",
+                "Connection refused",
+                "Welcome back",
+            ]
+        );
+    }
+
+    #[test]
+    fn reconnect_scrolls_full_viewport_and_preserves_wrapped_failure() {
+        let mut terminal = Terminal::new(
+            TerminalSize {
+                rows: 3,
+                cols: 12,
+                pixel_width: 96,
+                pixel_height: 48,
+                dpi: 96,
+            },
+            Arc::new(config::TermConfig::new()),
+            "TermViAI",
+            "test",
+            Box::new(Vec::<u8>::new()),
+        );
+        terminal.advance_bytes("history one\r\nhistory two\r\nold prompt");
+        prepare_terminal_for_reconnect(&mut terminal);
+        terminal.advance_bytes("Network unreachable");
+        terminal.advance_bytes("\x1b[1;1H");
+        prepare_terminal_for_reconnect(&mut terminal);
+        terminal.advance_bytes("new prompt");
+        assert_eq!(
+            transcript(&terminal),
+            [
+                "history one",
+                "history two",
+                "old prompt",
+                "Network unre",
+                "achable",
+                "new prompt",
+            ]
+        );
+    }
 
     #[test]
     fn reconnect_preserves_scrollback_without_a_separator_or_cursor_rewind() {

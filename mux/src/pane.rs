@@ -260,9 +260,8 @@ pub trait Pane: Downcast + Send + Sync {
     fn reader_started(&self) -> u64 {
         0
     }
-    /// Called when the mux PTY reader reaches EOF or a read error. Most panes
-    /// rely on child status; reconnectable panes can surface the transport loss
-    /// immediately while retaining their terminal state.
+    /// Called after the mux PTY reader ends and its parser drains all buffered
+    /// output. Reconnectable panes may now safely replace their transport.
     fn reader_finished(&self, _generation: u64) {}
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write>;
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()>;

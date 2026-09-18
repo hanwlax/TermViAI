@@ -34,6 +34,7 @@
 - SSH keepalive 默认 30 秒，可在 Settings 设置 `0`–`86400` 秒；`0` 表示关闭，新值对新连接生效。
 - SSH 断线后保留 pane、组合布局和主屏滚动历史；名称右侧提供小号单箭头重连图标，整组均断线时 Tab 提供一键重连。重连直接衔接输出，不画分隔线；用户参考图的蓝线只是位置标记。断线期间不接受输入或参与实际广播，原广播成员关系保留。
 - 显式重连建立新 SSH 传输；新 Tab 在缓存会话申请 PTY 失败时新建传输重试一次，旧断线组无需关闭。重连错误仅显示在对应 pane，不使用 Hosts/New Tab 的全局错误栏。
+- 重连不重放启动更新横幅（其中绝对光标定位会覆盖历史）；旧输出解析完成后才允许换连接，重置残留滚动区域和光标模式并从历史末尾追加。保留真实 SSH 错误，省略底层进程退出/Hold 提示，连续失败后成功也应保留全部历史。
 - Windows 原生最小客户区为 720×480 逻辑像素；缩放时仅在终端网格变化后重排 Mux/PTY。
 - 关闭窗口、Tab、pane 和退出应用使用统一的现代确认卡片。
 
@@ -60,6 +61,7 @@
 - 最终发布前共通过 92 项相关测试：`termviai-broadcast` 12 项、Mux 20 项、GUI TermViAI 60 项。
 - 发布后 SSH 原位重连开发版通过 94 项相关测试：重连专项 2 项、`termviai-broadcast` 12 项、Mux 20 项、GUI TermViAI 60 项，并完成 Windows x64 Release 构建。
 - SSH 重连修正版覆盖通用 Socket 错误和整组重连，共 97 项测试通过，Windows x64 Release 构建成功，最新细节见 [SSH_RECONNECT.md](SSH_RECONNECT.md)。
+- SSH 历史重叠修正版增加连续失败后成功、残留光标模式及满屏折行覆盖，共 99 项测试通过，Windows x64 Release 构建成功；最新本地验证包目录为 `ssh-reconnect-history-20260918`，尚未替换 GitHub Beta Release 附件。
 - 最终二进制的 CLI 版本与 Windows FileVersion/ProductVersion 均为 `0.1.0-beta.1`。
 - Windows 构建快照是一次性构建输入，不是源码真源；具体位置以构建脚本的工作目录为准。
 - 最终本地发布目录包含 `TermViAI-v0.1.0-beta.1`，GitHub Release 是对外发布真源。
@@ -78,7 +80,7 @@
 ### P0：真实 Windows 人工验收
 
 - 在不同 DPI 和窗口尺寸下检查 Hosts、New Tab、Settings、右侧抽屉、侧栏动画、广播面板动画和关闭确认卡片。
-- 使用真实 SSH 主机验证密码、私钥、Host label、断线组保留时新建连接、整组重连、无分隔线的历史衔接、30 秒 keepalive 及修改后重新连接生效。
+- 使用真实 SSH 主机验证密码、私钥、Host label、断线组保留时新建连接、整组重连、连续离线重连失败后恢复网络的历史衔接、30 秒 keepalive 及修改后重新连接生效。
 - 验证 2、4、8 个 pane 的组合、拖放、比例缩放、组内移除、关闭最后一个 pane 和关闭最后一个 Tab。
 - 验证整组广播、逐终端选择和独立输入，覆盖 `Ctrl+C`、Tab、方向键、粘贴、中文 IME、vim 与 tmux；确认协议回复和鼠标事件不会被广播。
 - 检查持续拖动窗口时的帧率、GPU 渲染、鼠标命中区、输入法候选框位置和圆角裁剪。

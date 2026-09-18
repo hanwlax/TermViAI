@@ -140,7 +140,12 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: V
 
 /// This is the parsing loop for the given pane.
 /// It reads all data sent to `rx` (from pane PTY) and handles all terminal events for this pane.
-fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: FileDescriptor) {
+fn parse_buffered_data(
+    pane: Weak<dyn Pane>,
+    dead: &Arc<AtomicBool>,
+    mut rx: FileDescriptor,
+    reader_generation: u64,
+) {
     let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
     let mut parser = termwiz::escape::parser::Parser::new();
     let mut actions = vec![];
@@ -245,6 +250,12 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
     if !actions.is_empty() {
         send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
     }
+    // Publish reconnect readiness only after the final buffered output has
+    // reached the terminal. Otherwise the old parser can move the cursor or
+    // append errors after the replacement connection has already started.
+    if let Some(pane) = pane.upgrade() {
+        pane.reader_finished(reader_generation);
+    }
 }
 
 fn set_socket_buffer(fd: &mut FileDescriptor, option: i32, size: usize) -> anyhow::Result<()> {
@@ -309,6 +320,9 @@ fn read_from_pane_pty(
                     Unable to allocate a socketpair: {err:#}"
                 ),
             );
+            if let Some(pane) = pane.upgrade() {
+                pane.reader_finished(reader_generation);
+            }
             return;
         }
     };
@@ -317,7 +331,7 @@ fn read_from_pane_pty(
     std::thread::spawn({
         let dead = Arc::clone(&dead);
         let parser_pane = pane.clone();
-        move || parse_buffered_data(parser_pane, &dead, rx)
+        move || parse_buffered_data(parser_pane, &dead, rx, reader_generation)
     });
 
     if let Some(banner) = banner {
@@ -349,10 +363,6 @@ fn read_from_pane_pty(
                 }
             }
         }
-    }
-
-    if let Some(pane) = pane.upgrade() {
-        pane.reader_finished(reader_generation);
     }
 
     match exit_behavior.unwrap_or_else(|| configuration().exit_behavior) {
@@ -825,10 +835,11 @@ impl Mux {
             pane.pane_id()
         );
         if let Some(reader) = pane.reader()? {
-            let banner = self.banner.read().clone();
             let reader_generation = pane.reader_started();
             let pane = Arc::downgrade(pane);
-            thread::spawn(move || read_from_pane_pty(pane, banner, reader, reader_generation));
+            // Startup banners may contain absolute cursor positioning and
+            // inline images. They belong only to a newly created terminal.
+            thread::spawn(move || read_from_pane_pty(pane, None, reader, reader_generation));
         }
         self.notify(MuxNotification::PaneOutput(pane.pane_id()));
         Ok(())
