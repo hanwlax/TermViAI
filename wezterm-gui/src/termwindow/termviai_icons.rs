@@ -39,6 +39,7 @@ pub enum Icon {
     More,
     Link,
     Power,
+    Refresh,
 }
 
 impl Icon {
@@ -88,6 +89,7 @@ impl Icon {
             Self::More => MORE,
             Self::Link => LINK,
             Self::Power => POWER,
+            Self::Refresh => REFRESH,
         }
     }
 }
@@ -234,6 +236,22 @@ const POWER: &[Poly] = &[outline(&[
     q(3, 21, 12, 21),
     q(21, 21, 21, 12),
     q(21, 8, 18, 5),
+])];
+const REFRESH: &[Poly] = &[outline(&[
+    m(20, 7),
+    l(20, 3),
+    l(16, 3),
+    m(20, 4),
+    q(17, 2, 13, 2),
+    q(7, 2, 4, 7),
+    q(1, 12, 4, 17),
+    m(4, 17),
+    l(4, 21),
+    l(8, 21),
+    m(4, 20),
+    q(7, 22, 11, 22),
+    q(17, 22, 20, 17),
+    q(23, 12, 20, 7),
 ])];
 const MINIMIZE: &[Poly] = &[outline(&[m(5, 12), l(19, 12)])];
 const MAXIMIZE: &[Poly] = &[FRAME];
@@ -417,6 +435,7 @@ mod tests {
         Icon::More,
         Icon::Link,
         Icon::Power,
+        Icon::Refresh,
     ];
 
     fn value(coord: BlockCoord) -> f32 {

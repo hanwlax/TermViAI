@@ -503,6 +503,10 @@ impl WriterWrapper {
             pane_id,
         }
     }
+
+    pub(crate) fn replace(&self, writer: Box<dyn Write + Send>) {
+        *self.writer.lock() = writer;
+    }
 }
 
 impl std::io::Write for WriterWrapper {
@@ -640,9 +644,10 @@ impl Domain for LocalDomain {
                 terminal,
                 child,
                 pair.master,
-                Box::new(writer),
+                writer,
                 self.id,
                 command_description,
+                false,
             )),
             Err(err) => {
                 // Show the error to the user in the new pane
@@ -656,9 +661,10 @@ impl Domain for LocalDomain {
                     Box::new(FailedSpawnPty {
                         inner: Mutex::new(pair.master),
                     }),
-                    Box::new(writer),
+                    writer,
                     self.id,
                     command_description,
+                    false,
                 ))
             }
         };
@@ -733,5 +739,41 @@ impl Domain for LocalDomain {
 
     fn state(&self) -> DomainState {
         DomainState::Attached
+    }
+}
+
+#[cfg(test)]
+mod writer_wrapper_tests {
+    use super::WriterWrapper;
+    use parking_lot::Mutex;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cloned_writer_switches_to_reconnected_transport() {
+        let first = Arc::new(Mutex::new(Vec::new()));
+        let second = Arc::new(Mutex::new(Vec::new()));
+        let wrapper = WriterWrapper::new(7, Box::new(CaptureWriter(Arc::clone(&first))));
+        let mut terminal_writer = wrapper.clone();
+
+        terminal_writer.write_all(b"before").unwrap();
+        wrapper.replace(Box::new(CaptureWriter(Arc::clone(&second))));
+        terminal_writer.write_all(b"after").unwrap();
+
+        assert_eq!(&*first.lock(), b"before");
+        assert_eq!(&*second.lock(), b"after");
     }
 }

@@ -224,9 +224,10 @@ impl TmuxDomainState {
             terminal,
             Box::new(child),
             Box::new(pane_pty),
-            Box::new(writer),
+            writer,
             self.domain_id,
             "tmux pane".to_string(),
+            false,
         )))
     }
 

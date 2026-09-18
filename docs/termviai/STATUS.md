@@ -1,5 +1,9 @@
 # TermViAI 状态
 
+## 2026-09-18 SSH 原位重连
+
+SSH 断线、远端 shell 结束或 PTY 读取失败后，原 pane 与组合布局会保留，并在名称右侧提供蓝色刷新按钮。重连复用同一 Terminal，在蓝色分隔线下继续输出；主屏滚动历史、焦点、临时字号与广播成员关系不丢失。断线 pane 不接受输入且暂不参与实际广播。Windows x64 已通过 94 项测试及 Release 构建，详情见 [SSH_RECONNECT.md](SSH_RECONNECT.md)。
+
 ## 2026-09-18 发布后项目记忆
 
 `v0.1.0-beta.1` 已推送至 GitHub 并作为 prerelease 发布，远端 `main`、标签和发布提交一致，Windows 附件已回传下载并通过 SHA-256 校验。当前真实状态、关键路径、开发约束和按优先级排列的后续工作统一记录在 [MEMORY.md](MEMORY.md)。

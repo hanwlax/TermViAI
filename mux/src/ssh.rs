@@ -409,6 +409,76 @@ impl RemoteSshDomain {
 
         Ok(StartNewSessionResult { pty, child, writer })
     }
+
+    async fn start_pane_backend(
+        &self,
+        pane_id: PaneId,
+        size: TerminalSize,
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    ) -> anyhow::Result<StartNewSessionResult> {
+        let (command_line, env) = self
+            .build_command(pane_id, command, command_dir)
+            .context("build_command")?;
+
+        // Release the session lock before awaiting a PTY request.
+        let mut session: Option<Session> = self.session.lock().unwrap().as_ref().cloned();
+        if let Some(session) = session.take() {
+            match session
+                .request_pty(
+                    &config::configuration().term,
+                    crate::terminal_size_to_pty_size(size)
+                        .context("compute pty size from terminal size")?,
+                    command_line.as_deref(),
+                    Some(env.clone()),
+                )
+                .await
+                .context("request ssh pty")
+            {
+                Ok((concrete_pty, concrete_child)) => {
+                    let pty = Box::new(concrete_pty);
+                    let child = Box::new(concrete_child);
+                    let writer = Box::new(pty.take_writer().context("take writer from pty")?);
+                    Ok(StartNewSessionResult { pty, child, writer })
+                }
+                Err(err)
+                    if err
+                        .root_cause()
+                        .downcast_ref::<wezterm_ssh::DeadSession>()
+                        .is_some() =>
+                {
+                    self.start_new_session(command_line, env, size).await
+                }
+                Err(err) => {
+                    log::error!("{err:#?}");
+                    Err(err)
+                }
+            }
+        } else {
+            self.start_new_session(command_line, env, size).await
+        }
+    }
+
+    /// Replace the transport beneath an existing held SSH pane. Its terminal,
+    /// pane id and split position survive, so scrollback remains available.
+    pub async fn reconnect_pane(&self, pane: &LocalPane, size: TerminalSize) -> anyhow::Result<()> {
+        anyhow::ensure!(pane.domain_id() == self.id, "SSH domain changed");
+        anyhow::ensure!(
+            pane.is_reconnectable_ssh(),
+            "SSH session is still connected"
+        );
+        let backend = self
+            .start_pane_backend(pane.pane_id(), size, None, None)
+            .await?;
+        pane.reconnect(backend.child, backend.pty, backend.writer)?;
+
+        let mux = Mux::get();
+        let pane = mux
+            .get_pane(pane.pane_id())
+            .context("pane closed while reconnecting")?;
+        mux.restart_pane_reader(&pane)?;
+        Ok(())
+    }
 }
 
 struct StartNewSessionResult {
@@ -707,51 +777,9 @@ impl Domain for RemoteSshDomain {
     ) -> anyhow::Result<Arc<dyn Pane>> {
         let pane_id = alloc_pane_id();
 
-        let (command_line, env) = self
-            .build_command(pane_id, command, command_dir)
-            .context("build_command")?;
-
-        // This needs to be separate from the if let block below in order
-        // for the lock to be released at the appropriate time
-        let mut session: Option<Session> = self.session.lock().unwrap().as_ref().cloned();
-
-        let StartNewSessionResult { pty, child, writer } = if let Some(session) = session.take() {
-            match session
-                .request_pty(
-                    &config::configuration().term,
-                    crate::terminal_size_to_pty_size(size)
-                        .context("compute pty size from terminal size")?,
-                    command_line.as_ref().map(|s| s.as_str()),
-                    Some(env.clone()),
-                )
-                .await
-                .context("request ssh pty")
-            {
-                Ok((concrete_pty, concrete_child)) => {
-                    let pty = Box::new(concrete_pty);
-                    let child = Box::new(concrete_child);
-                    let writer = Box::new(pty.take_writer().context("take writer from pty")?);
-
-                    StartNewSessionResult { pty, child, writer }
-                }
-                Err(err) => {
-                    if err
-                        .root_cause()
-                        .downcast_ref::<wezterm_ssh::DeadSession>()
-                        .is_some()
-                    {
-                        // Session died (perhaps they closed the initial tab?)
-                        // So we'll try making a new one
-                        self.start_new_session(command_line, env, size).await?
-                    } else {
-                        log::error!("{err:#?}");
-                        return Err(err);
-                    }
-                }
-            }
-        } else {
-            self.start_new_session(command_line, env, size).await?
-        };
+        let StartNewSessionResult { pty, child, writer } = self
+            .start_pane_backend(pane_id, size, command, command_dir)
+            .await?;
 
         // Wrap up the pty etc. in a LocalPane.  That allows for
         // eg: tmux integration to be tunnelled via the remote
@@ -772,9 +800,10 @@ impl Domain for RemoteSshDomain {
             terminal,
             child,
             pty,
-            Box::new(writer),
+            writer,
             self.id,
             "RemoteSshDomain".to_string(),
+            true,
         ));
         let mux = Mux::get();
         mux.add_pane(&pane)?;

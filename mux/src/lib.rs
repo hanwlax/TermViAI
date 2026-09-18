@@ -285,6 +285,7 @@ fn read_from_pane_pty(
     pane: Weak<dyn Pane>,
     banner: Option<String>,
     mut reader: Box<dyn std::io::Read>,
+    reader_generation: u64,
 ) {
     let mut buf = vec![0; BUFSIZE];
 
@@ -315,7 +316,8 @@ fn read_from_pane_pty(
     // Spawn parser thread for this pane
     std::thread::spawn({
         let dead = Arc::clone(&dead);
-        move || parse_buffered_data(pane, &dead, rx)
+        let parser_pane = pane.clone();
+        move || parse_buffered_data(parser_pane, &dead, rx)
     });
 
     if let Some(banner) = banner {
@@ -347,6 +349,10 @@ fn read_from_pane_pty(
                 }
             }
         }
+    }
+
+    if let Some(pane) = pane.upgrade() {
+        pane.reader_finished(reader_generation);
     }
 
     match exit_behavior.unwrap_or_else(|| configuration().exit_behavior) {
@@ -797,11 +803,34 @@ impl Mux {
         let pane_id = pane.pane_id();
         if let Some(reader) = pane.reader()? {
             let banner = self.banner.read().clone();
+            let reader_generation = pane.reader_started();
             let pane = Arc::downgrade(pane);
-            thread::spawn(move || read_from_pane_pty(pane, banner, reader));
+            thread::spawn(move || read_from_pane_pty(pane, banner, reader, reader_generation));
         }
         self.recompute_pane_count();
         self.notify(MuxNotification::PaneAdded(pane_id));
+        Ok(())
+    }
+
+    /// Start a fresh PTY reader for an existing pane after its backend was
+    /// replaced. The pane id and terminal state remain unchanged, preserving
+    /// split ownership, scrollback and GUI state across an SSH reconnect.
+    pub fn restart_pane_reader(&self, pane: &Arc<dyn Pane>) -> Result<(), Error> {
+        anyhow::ensure!(
+            self.panes
+                .read()
+                .get(&pane.pane_id())
+                .is_some_and(|current| Arc::ptr_eq(current, pane)),
+            "pane {} is no longer registered",
+            pane.pane_id()
+        );
+        if let Some(reader) = pane.reader()? {
+            let banner = self.banner.read().clone();
+            let reader_generation = pane.reader_started();
+            let pane = Arc::downgrade(pane);
+            thread::spawn(move || read_from_pane_pty(pane, banner, reader, reader_generation));
+        }
+        self.notify(MuxNotification::PaneOutput(pane.pane_id()));
         Ok(())
     }
 

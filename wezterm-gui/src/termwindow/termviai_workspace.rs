@@ -7,10 +7,13 @@ use anyhow::Context;
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, SshMultiplexing};
 use mux::domain::{Domain, SplitSource};
+use mux::localpane::LocalPane;
+use mux::ssh::RemoteSshDomain;
 use mux::tab::{PaneNode, SplitDirection, SplitRequest, SplitSize, Tab};
 use mux::Mux;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use wezterm_term::TerminalSize;
 use window::WindowOps;
 
 #[derive(Default)]
@@ -19,6 +22,7 @@ pub(super) struct WorkspaceUi {
     pub hosts: HashMap<usize, Host>,
     pub saved_ids: HashMap<usize, String>,
     pub renamed_tabs: HashSet<usize>,
+    pub reconnecting: HashSet<usize>,
 }
 
 fn domain_name(host: &Host, ssh_keepalive_interval: u64) -> String {
@@ -114,6 +118,75 @@ fn restored_name_is_custom(name: Option<&str>, layout: &SavedLayout) -> bool {
 }
 
 impl TermWindow {
+    pub(super) fn termviai_reconnect_pane(&mut self, pane_id: usize) -> anyhow::Result<()> {
+        let mux = Mux::get();
+        let pane = match mux.get_pane(pane_id) {
+            Some(pane) => pane,
+            None => anyhow::bail!("This session was closed."),
+        };
+        let domain = match mux.get_domain(pane.domain_id()) {
+            Some(domain) => domain,
+            None => anyhow::bail!("The SSH connection profile is no longer available."),
+        };
+        anyhow::ensure!(
+            pane.downcast_ref::<LocalPane>()
+                .is_some_and(LocalPane::is_reconnectable_ssh),
+            "This SSH session is still connected."
+        );
+        anyhow::ensure!(
+            domain.downcast_ref::<RemoteSshDomain>().is_some(),
+            "This pane is not a reconnectable SSH session."
+        );
+        let window = self.window.clone().context("The window closed.")?;
+        anyhow::ensure!(
+            self.termviai_ui.workspace.reconnecting.insert(pane_id),
+            "This session is already reconnecting."
+        );
+
+        let dimensions = pane.get_dimensions();
+        let size = TerminalSize {
+            rows: dimensions.viewport_rows,
+            cols: dimensions.cols,
+            pixel_width: dimensions.pixel_width,
+            pixel_height: dimensions.pixel_height,
+            dpi: dimensions.dpi,
+        };
+        let label = self.termviai_pane_label(pane_id);
+        promise::spawn::spawn(async move {
+            let result = async {
+                let local = pane
+                    .downcast_ref::<LocalPane>()
+                    .context("The SSH pane changed while reconnecting.")?;
+                let remote = domain
+                    .downcast_ref::<RemoteSshDomain>()
+                    .context("The SSH domain changed while reconnecting.")?;
+                remote.reconnect_pane(local, size).await
+            }
+            .await;
+
+            window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                tw.termviai_ui.workspace.reconnecting.remove(&pane_id);
+                match result {
+                    Ok(()) => {
+                        tw.termviai_ui.error.clear();
+                        tw.termviai_broadcast.error.clear();
+                        tw.termviai_ui.show_notice(format!("Reconnected {label}"));
+                    }
+                    Err(error) => {
+                        tw.termviai_ui.error = format!("Reconnect {label}: {error:#}");
+                    }
+                }
+                tw.termviai_sync_broadcast();
+                tw.update_title();
+                if let Some(window) = &tw.window {
+                    window.invalidate();
+                }
+            })))
+        })
+        .detach();
+        Ok(())
+    }
+
     pub(super) fn termviai_pane_label(&self, pane_id: usize) -> String {
         Mux::get()
             .get_pane(pane_id)

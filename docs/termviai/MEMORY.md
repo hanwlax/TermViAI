@@ -32,6 +32,7 @@
 - Catppuccin Mocha 终端配色，JetBrainsMono Nerd Font Mono 字体，统一矢量图标和现代过渡动画。
 - 选中终端支持 `Ctrl` + 鼠标滚轮临时调整字号；Settings 支持持久化全局终端字号。
 - SSH keepalive 默认 30 秒，可在 Settings 设置 `0`–`86400` 秒；`0` 表示关闭，新值对新连接生效。
+- SSH 断线后保留 pane、组合布局和主屏滚动历史；名称右侧出现蓝色刷新按钮，可在原 pane 内重连并用蓝色分隔线衔接新输出。断线期间不接受输入或参与实际广播，原广播成员关系保留。
 - Windows 原生最小客户区为 720×480 逻辑像素；缩放时仅在终端网格变化后重排 Mux/PTY。
 - 关闭窗口、Tab、pane 和退出应用使用统一的现代确认卡片。
 
@@ -56,6 +57,7 @@
 
 - Windows x64 Release 构建已成功。
 - 最终发布前共通过 92 项相关测试：`termviai-broadcast` 12 项、Mux 20 项、GUI TermViAI 60 项。
+- 发布后 SSH 原位重连开发版通过 94 项相关测试：重连专项 2 项、`termviai-broadcast` 12 项、Mux 20 项、GUI TermViAI 60 项，并完成 Windows x64 Release 构建。
 - 最终二进制的 CLI 版本与 Windows FileVersion/ProductVersion 均为 `0.1.0-beta.1`。
 - Windows 构建快照是一次性构建输入，不是源码真源；具体位置以构建脚本的工作目录为准。
 - 最终本地发布目录包含 `TermViAI-v0.1.0-beta.1`，GitHub Release 是对外发布真源。
@@ -74,7 +76,7 @@
 ### P0：真实 Windows 人工验收
 
 - 在不同 DPI 和窗口尺寸下检查 Hosts、New Tab、Settings、右侧抽屉、侧栏动画、广播面板动画和关闭确认卡片。
-- 使用真实 SSH 主机验证密码、私钥、Host label、重连、30 秒 keepalive 及修改后重新连接生效。
+- 使用真实 SSH 主机验证密码、私钥、Host label、断网/服务端断开后的原位重连、历史分隔线、30 秒 keepalive 及修改后重新连接生效。
 - 验证 2、4、8 个 pane 的组合、拖放、比例缩放、组内移除、关闭最后一个 pane 和关闭最后一个 Tab。
 - 验证整组广播、逐终端选择和独立输入，覆盖 `Ctrl+C`、Tab、方向键、粘贴、中文 IME、vim 与 tmux；确认协议回复和鼠标事件不会被广播。
 - 检查持续拖动窗口时的帧率、GPU 渲染、鼠标命中区、输入法候选框位置和圆角裁剪。
@@ -84,7 +86,7 @@
 - 收集崩溃、断线、慢连接和复杂布局恢复问题，为 `v0.1.0-beta.2` 修复。
 - 为广播写入增加慢目标与背压压力测试，测试 16/32 pane 的延迟、CPU 和内存。
 - 检查 settings、hosts、keys 和 workspace JSON 损坏时的恢复路径及错误提示。
-- 补充真实 SSH 断线重连后广播成员映射和 Host 重命名后的历史项一致性。
+- 补充真实 SSH 断线重连压力测试，以及 Host 重命名后的历史项一致性。
 
 ### P2：发布工程
 

@@ -254,6 +254,16 @@ pub trait Pane: Downcast + Send + Sync {
         Ok(())
     }
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;
+    /// Called immediately before a mux PTY reader starts. The returned token is
+    /// passed back to `reader_finished`, allowing panes to ignore completion of
+    /// a superseded reader after an in-place reconnect.
+    fn reader_started(&self) -> u64 {
+        0
+    }
+    /// Called when the mux PTY reader reaches EOF or a read error. Most panes
+    /// rely on child status; reconnectable panes can surface the transport loss
+    /// immediately while retaining their terminal state.
+    fn reader_finished(&self, _generation: u64) {}
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write>;
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()>;
     /// Called as a hint that the pane is being resized as part of

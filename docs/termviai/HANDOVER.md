@@ -2,6 +2,12 @@
 
 > 最新、精简且可执行的项目上下文见 [MEMORY.md](MEMORY.md)。后续工作应先读取该文件；下文保留完整历史记录。
 
+## 2026-09-18 SSH 原位重连与历史保留
+
+SSH 断线后不再移除 pane 或终端组。断线 pane 名称右侧显示蓝色刷新图标；点击后在同一 pane、同一分屏位置重新建立 SSH，会先退出残留备用屏幕，再用蓝色 `Reconnected` 分隔线衔接新输出。Terminal 对象、主屏滚动历史、临时字号和广播成员关系保留；断线期间输入被消费且不参与广播。
+
+Windows x64 已通过 94 项测试（重连专项 2、广播 12、Mux 20、GUI 60）及 Release 构建。行为、实现位置、校验值和人工验收边界见 [SSH_RECONNECT.md](SSH_RECONNECT.md)。
+
 ## 2026-09-17 TermViAI v0.1.0-beta.1
 
 应用正式命名为 **TermViAI（Terminal Via AI）**。顶栏、窗口标题、退出确认、命令行说明、Windows AppUserModelID 和 PE 产品信息使用该名称；版本由根目录 `VERSION` 固定为 `0.1.0-beta.1`。官方便携包中的入口为 `TermViAI.exe`。

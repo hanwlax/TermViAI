@@ -14,6 +14,13 @@ pub(super) fn pane_broadcasting(state: &BroadcastState<usize>, pane: usize) -> b
     state.enabled() && state.is_member(pane)
 }
 
+fn pane_accepts_input(pane: &Arc<dyn Pane>) -> bool {
+    !pane.is_dead()
+        && !pane
+            .downcast_ref::<LocalPane>()
+            .is_some_and(LocalPane::is_reconnectable_ssh)
+}
+
 #[derive(Default)]
 pub(super) struct TabBroadcasts {
     pub tabs: HashMap<usize, BroadcastState<usize>>,
@@ -100,9 +107,15 @@ impl TermWindow {
             || self.termviai_library_active()
             || self.get_modal().is_some()
             || pane.downcast_ref::<LocalPane>().is_none()
-            || pane.is_dead()
         {
             return encode();
+        }
+        // A held SSH pane intentionally remains in the mux so its scrollback
+        // survives. Consume input while it is disconnected; writing Return to
+        // the ended transport must not remove the pane or duplicate the key on
+        // a later reconnect.
+        if !pane_accepts_input(pane) {
+            return Ok(());
         }
         let mux = Mux::get();
         let source = pane.pane_id();
@@ -134,7 +147,11 @@ impl TermWindow {
                 &state,
                 source,
                 &bytes,
-                |id| mux.get_pane(id).map(|p| !p.is_dead()).unwrap_or(false),
+                |id| {
+                    mux.get_pane(id)
+                        .map(|p| pane_accepts_input(&p))
+                        .unwrap_or(false)
+                },
                 |id, data| -> anyhow::Result<()> {
                     // Recheck ownership at dispatch; never send into another tab.
                     anyhow::ensure!(

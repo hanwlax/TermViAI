@@ -12,8 +12,9 @@ use crate::utilsprites::RenderMetrics;
 use crate::workspaces::{SavedLayout, WorkspaceStore};
 use anyhow::Context;
 use config::{Dimension, DimensionContext};
+use mux::localpane::LocalPane;
 use mux::Mux;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use window::{
     Clipboard, CursorIcon, KeyCode, KeyEvent, Modifiers, MouseEvent, MouseEventKind, MousePress,
@@ -28,6 +29,7 @@ const FIELD: &str = "#37394f";
 const INK: &str = "#f1f2fa";
 const MUTED: &str = "#9ca2ba";
 const ACCENT: &str = "#8d86f7";
+const RECONNECT: &str = "#89b4fa";
 const SIDEBAR_WIDTH: f32 = 220.;
 const MIN_WINDOW_WIDTH: usize = 720;
 const MIN_WINDOW_HEIGHT: usize = 480;
@@ -101,6 +103,7 @@ enum Action {
     BroadcastAll,
     BroadcastNone,
     Member(usize),
+    ReconnectPane(usize),
     RemovePane(usize),
     FocusPane(usize),
 }
@@ -609,10 +612,9 @@ fn button(
         Action::NewTab if text.is_empty() => Some(Icon::Plus),
         Action::NewTab | Action::Tab(_) | Action::FocusPane(_) => Some(Icon::Terminal),
         Action::AddHost | Action::AddKey => Some(Icon::Plus),
-        Action::CloseTab(_)
-        | Action::CloseNewTab
-        | Action::Close
-        | Action::RemovePane(_) => Some(Icon::Close),
+        Action::CloseTab(_) | Action::CloseNewTab | Action::Close | Action::RemovePane(_) => {
+            Some(Icon::Close)
+        }
         Action::PrevTab | Action::PrevGroup => Some(Icon::ChevronLeft),
         Action::NextTab | Action::NextGroup => Some(Icon::ChevronRight),
         Action::Minimize => Some(Icon::Minimize),
@@ -626,6 +628,7 @@ fn button(
         Action::AddSsh(false) => Some(Icon::SplitRight),
         Action::AddSsh(true) => Some(Icon::SplitDown),
         Action::Broadcast | Action::TabBroadcast(_) => Some(Icon::Broadcast),
+        Action::ReconnectPane(_) => Some(Icon::Refresh),
         Action::ToggleTray => Some(Icon::ChevronDown),
         Action::RenameTab(_) => Some(Icon::Edit),
         Action::SaveWorkspace(_) => Some(Icon::Check),
@@ -680,6 +683,7 @@ fn action_hint(
             Some(state) if state.member_count() == 0 => "Select hosts to enable broadcast",
             _ => "Start broadcast to selected hosts",
         },
+        Action::ReconnectPane(_) => "Reconnect this SSH session",
         _ => return None,
     })
 }
@@ -1574,6 +1578,7 @@ impl TermWindow {
                     }
                 }
             }
+            Action::ReconnectPane(id) => self.termviai_reconnect_pane(id)?,
             Action::RemovePane(id) => self.close_specific_pane(id, true),
             Action::Drag | Action::Drawer => {}
         }
@@ -2048,6 +2053,16 @@ impl TermWindow {
             .as_ref()
             .map(|tab| tab.iter_panes_ignoring_zoom())
             .unwrap_or_default();
+        let disconnected_panes: HashSet<usize> = pane_list
+            .iter()
+            .filter_map(|positioned| {
+                positioned
+                    .pane
+                    .downcast_ref::<LocalPane>()
+                    .is_some_and(LocalPane::is_reconnectable_ssh)
+                    .then_some(positioned.pane.pane_id())
+            })
+            .collect();
         if active_tab.is_none() && self.termviai_ui.page == Page::Terminal && !self.termviai_ui.connecting
         {
             self.termviai_ui.page = Page::Hosts;
@@ -2473,30 +2488,54 @@ impl TermWindow {
                     t.icon = None;
                 }
                 if rect.h >= 20. && rect.w >= 76. {
+                    let disconnected = disconnected_panes.contains(&header.pane_id);
                     let member = broadcast
                         .as_ref()
                         .map(|s| s.is_member(header.pane_id))
                         .unwrap_or(false);
-                    let broadcasting = broadcast
-                        .as_ref()
-                        .map(|s| pane_broadcasting(s, header.pane_id))
-                        .unwrap_or(false);
-                    button(
-                        &mut tiles,
-                        &mut hits,
-                        controls.broadcast_x,
-                        rect.y + (rect.h - 28.).max(0.) / 2.,
-                        28.,
-                        rect.h.min(28.),
-                        if member { "member" } else { "solo" },
-                        if broadcasting { "#383453" } else { BG },
-                        Action::Member(header.pane_id),
-                        &hover,
-                    );
-                    let t = tiles.last_mut().unwrap();
-                    t.icon = Some(Icon::Broadcast);
-                    t.transparent = !broadcasting;
-                    t.fg = if broadcasting { ACCENT } else { MUTED };
+                    let broadcasting = !disconnected
+                        && broadcast
+                            .as_ref()
+                            .map(|s| pane_broadcasting(s, header.pane_id))
+                            .unwrap_or(false);
+                    if disconnected {
+                        button(
+                            &mut tiles,
+                            &mut hits,
+                            controls.broadcast_x,
+                            rect.y + (rect.h - 28.).max(0.) / 2.,
+                            28.,
+                            rect.h.min(28.),
+                            "",
+                            BG,
+                            Action::ReconnectPane(header.pane_id),
+                            &hover,
+                        );
+                        let t = tiles.last_mut().unwrap();
+                        t.icon = Some(Icon::Refresh);
+                        t.transparent = true;
+                        t.fg = RECONNECT;
+                        if ui.workspace.reconnecting.contains(&header.pane_id) {
+                            t.opacity = 0.55;
+                        }
+                    } else {
+                        button(
+                            &mut tiles,
+                            &mut hits,
+                            controls.broadcast_x,
+                            rect.y + (rect.h - 28.).max(0.) / 2.,
+                            28.,
+                            rect.h.min(28.),
+                            if member { "member" } else { "solo" },
+                            if broadcasting { "#383453" } else { BG },
+                            Action::Member(header.pane_id),
+                            &hover,
+                        );
+                        let t = tiles.last_mut().unwrap();
+                        t.icon = Some(Icon::Broadcast);
+                        t.transparent = !broadcasting;
+                        t.fg = if broadcasting { ACCENT } else { MUTED };
+                    }
                     if let Some(remove_x) = controls.remove_x {
                         button(
                             &mut tiles,
@@ -2682,7 +2721,8 @@ impl TermWindow {
                     for (index, x, width) in &members.chips {
                         let id = pane_list[*index].pane.pane_id();
                         let member = state.is_member(id);
-                        let broadcasting = pane_broadcasting(state, id);
+                        let broadcasting =
+                            !disconnected_panes.contains(&id) && pane_broadcasting(state, id);
                         tile(
                             &mut tiles,
                             *x,

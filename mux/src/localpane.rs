@@ -1,4 +1,4 @@
-use crate::domain::DomainId;
+use crate::domain::{DomainId, WriterWrapper};
 use crate::pane::{
     CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
     SearchResult, WithPaneLines,
@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::{Result as IoResult, Write};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::escape::csi::{Sgr, CSI};
@@ -36,6 +37,19 @@ use wezterm_term::{
 };
 
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
+
+fn reconnect_divider(cols: usize) -> String {
+    let cols = cols.max(1);
+    let label = " Reconnected ";
+    let label_width = label.chars().count();
+    if cols < label_width {
+        return "─".repeat(cols);
+    }
+    let available = cols - label_width;
+    let left = available / 2;
+    let right = available - left;
+    format!("{}{}{}", "─".repeat(left), label, "─".repeat(right))
+}
 
 #[derive(Debug)]
 enum ProcessState {
@@ -127,12 +141,16 @@ pub struct LocalPane {
     process: Mutex<ProcessState>,
     pty: Mutex<Box<dyn MasterPty>>,
     writer: Mutex<Box<dyn Write + Send>>,
+    input_writer: WriterWrapper,
     domain_id: DomainId,
     tmux_domain: Mutex<Option<Arc<TmuxDomainState>>>,
     proc_list: Mutex<Option<CachedProcInfo>>,
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
+    reconnectable_ssh: bool,
+    reader_generation: AtomicU64,
+    reader_ended: AtomicBool,
 }
 
 #[async_trait(?Send)]
@@ -234,7 +252,12 @@ impl Pane for LocalPane {
             .unwrap_or(false);
         let is_failed_spawn = pty.is::<crate::domain::FailedSpawnPty>();
 
-        if is_ssh_connecting || is_failed_spawn {
+        if configuration().termviai_ui && self.reconnectable_ssh {
+            // TermViAI keeps an ended SSH pane in its split so the user can
+            // review scrollback and reconnect in place. Explicit close still
+            // removes the pane through the ordinary mux close path.
+            Some(ExitBehavior::Hold)
+        } else if is_ssh_connecting || is_failed_spawn {
             Some(ExitBehavior::CloseOnCleanExit)
         } else {
             None
@@ -435,6 +458,19 @@ impl Pane for LocalPane {
 
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
         Ok(Some(self.pty.lock().try_clone_reader()?))
+    }
+
+    fn reader_started(&self) -> u64 {
+        let generation = self.reader_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.reader_ended.store(false, Ordering::Release);
+        generation
+    }
+
+    fn reader_finished(&self, generation: u64) {
+        if self.reader_generation.load(Ordering::Acquire) == generation {
+            self.reader_ended.store(true, Ordering::Release);
+            Mux::get().notify(MuxNotification::PaneOutput(self.pane_id));
+        }
     }
 
     fn send_raw_input(&self, bytes: &[u8]) -> Result<(), Error> {
@@ -1008,14 +1044,15 @@ fn split_child(
 }
 
 impl LocalPane {
-    pub fn new(
+    pub(crate) fn new(
         pane_id: PaneId,
         mut terminal: Terminal,
         process: Box<dyn Child + Send>,
         pty: Box<dyn MasterPty>,
-        writer: Box<dyn Write + Send>,
+        writer: WriterWrapper,
         domain_id: DomainId,
         command_description: String,
+        reconnectable_ssh: bool,
     ) -> Self {
         let (process, signaller, pid) = split_child(process);
 
@@ -1036,14 +1073,86 @@ impl LocalPane {
                 killed: false,
             }),
             pty: Mutex::new(pty),
-            writer: Mutex::new(writer),
+            writer: Mutex::new(Box::new(writer.clone())),
+            input_writer: writer,
             domain_id,
             tmux_domain: Mutex::new(None),
             proc_list: Mutex::new(None),
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
+            reconnectable_ssh,
+            reader_generation: AtomicU64::new(0),
+            reader_ended: AtomicBool::new(false),
         }
+    }
+
+    /// True after a TermViAI SSH child has ended and its pane is being held
+    /// for an in-place reconnect. Polling `is_dead` advances the child state;
+    /// the TermViAI SSH exit policy keeps it at `DeadPendingClose`.
+    pub fn is_reconnectable_ssh(&self) -> bool {
+        if !self.reconnectable_ssh {
+            return false;
+        }
+        let _ = <Self as Pane>::is_dead(self);
+        self.reader_ended.load(Ordering::Acquire)
+            || matches!(
+                &*self.process.lock(),
+                ProcessState::DeadPendingClose { .. } | ProcessState::Dead
+            )
+    }
+
+    pub(crate) fn reconnect(
+        &self,
+        process: Box<dyn Child + Send>,
+        pty: Box<dyn MasterPty>,
+        writer: Box<dyn Write + Send>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.is_reconnectable_ssh(),
+            "SSH session is still connected"
+        );
+
+        let (process, signaller, pid) = split_child(process);
+        self.input_writer.replace(writer);
+        *self.pty.lock() = pty;
+        let mut state = self.process.lock();
+        if let ProcessState::Running { signaller, .. } = &mut *state {
+            let _ = signaller.kill();
+        }
+        *state = ProcessState::Running {
+            child_waiter: process,
+            pid,
+            signaller,
+            killed: false,
+        };
+        drop(state);
+        self.reader_ended.store(false, Ordering::Release);
+        self.proc_list.lock().take();
+        #[cfg(unix)]
+        self.leader.lock().take();
+
+        self.append_reconnect_separator();
+        Ok(())
+    }
+
+    fn append_reconnect_separator(&self) {
+        let cols = terminal_get_dimensions(&mut self.terminal.lock())
+            .cols
+            .max(1);
+        let message = format!(
+            concat!(
+                "\x1b[?1049l", // Return from a stale alternate screen.
+                "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?2004l",
+                "\r\n\x1b[38;2;137;180;250m{}\x1b[0m\r\n"
+            ),
+            reconnect_divider(cols),
+        );
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let mut actions = vec![];
+        parser.parse(message.as_bytes(), |action| actions.push(action));
+        self.terminal.lock().perform_actions(actions);
+        Mux::get().notify(MuxNotification::PaneOutput(self.pane_id));
     }
 
     #[cfg(unix)]
@@ -1164,6 +1273,22 @@ impl Drop for LocalPane {
         // <https://github.com/wezterm/wezterm/issues/558>
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
             let _ = signaller.kill();
+        }
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::reconnect_divider;
+
+    #[test]
+    fn reconnect_divider_fills_the_terminal_width() {
+        for cols in [1, 8, 13, 40, 80, 127] {
+            let divider = reconnect_divider(cols);
+            assert_eq!(divider.chars().count(), cols);
+            if cols >= " Reconnected ".chars().count() {
+                assert!(divider.contains(" Reconnected "));
+            }
         }
     }
 }
