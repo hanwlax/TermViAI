@@ -5,6 +5,8 @@ use core_foundation::runloop::*;
 use promise::spawn::{Runnable, SpawnFunc};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
+use std::time::Duration;
 use std::time::Instant;
 #[cfg(all(unix, not(target_os = "macos")))]
 use {
@@ -97,6 +99,37 @@ impl SpawnQueue {
     }
 }
 
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::SpawnQueue;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn live_resize_budget_preserves_queued_work() {
+        let queue = SpawnQueue::new().unwrap();
+        let completed = Arc::new(AtomicUsize::new(0));
+        for index in 0..2 {
+            let completed = Arc::clone(&completed);
+            queue.spawn_impl(
+                Box::new(move || {
+                    if index == 0 {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }),
+                true,
+            );
+        }
+
+        assert!(queue.run_for_size_move());
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert!(!queue.run());
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+    }
+}
+
 #[cfg(windows)]
 impl SpawnQueue {
     fn new_impl() -> anyhow::Result<Self> {
@@ -121,6 +154,25 @@ impl SpawnQueue {
             func();
         }
         self.has_any_queued()
+    }
+
+    /// Keep the Windows size/move modal loop responsive to pointer messages.
+    /// Work left in the queue is signalled for the normal event loop or the
+    /// next sizing message.
+    pub fn run_for_size_move(&self) -> bool {
+        self.event_handle.reset_event();
+        let start = Instant::now();
+        while let Some(func) = self.pop_func() {
+            func();
+            if start.elapsed() >= Duration::from_millis(2) {
+                break;
+            }
+        }
+        let pending = self.has_any_queued();
+        if pending {
+            self.event_handle.set_event();
+        }
+        pending
     }
 }
 

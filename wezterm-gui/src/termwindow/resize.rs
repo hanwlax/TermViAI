@@ -42,6 +42,13 @@ impl super::TermWindow {
             return;
         }
         if self.dimensions == dimensions && self.window_state == window_state {
+            if cfg!(windows)
+                && self.config.termviai_ui
+                && !live_resizing
+                && self.termviai_deferred_tab_resize
+            {
+                self.apply_dimensions(&dimensions, None, window, false);
+            }
             // It didn't really change
             log::trace!("dimensions didn't change NOP!");
             return;
@@ -60,7 +67,7 @@ impl super::TermWindow {
         // For simple, user-interactive resizes where the dpi doesn't change,
         // skip our scaling recalculation
         if live_resizing && self.dimensions.dpi == dimensions.dpi {
-            self.apply_dimensions(&dimensions, None, window);
+            self.apply_dimensions(&dimensions, None, window, live_resizing);
         } else {
             self.scaling_changed(dimensions, self.fonts.get_font_scale(), window);
         }
@@ -133,6 +140,7 @@ impl super::TermWindow {
         dimensions: &Dimensions,
         mut scale_changed_cells: Option<RowsAndCols>,
         window: &Window,
+        live_resizing: bool,
     ) {
         log::trace!(
             "apply_dimensions {:?} scale_changed_cells {:?}. window_state {:?}",
@@ -306,17 +314,36 @@ impl super::TermWindow {
         // Windows reports every pixel during a live resize. TermViAI chrome still
         // repaints each frame, while Mux and PTYs only need work when the cell
         // grid changes. Skip duplicate sub-cell resize and title operations.
-        if !self.config.termviai_ui || terminal_grid_changed {
+        let defer_inactive_tabs = cfg!(windows) && self.config.termviai_ui && live_resizing;
+        if !self.config.termviai_ui
+            || terminal_grid_changed
+            || (self.termviai_deferred_tab_resize && !live_resizing)
+        {
             let mux = Mux::get();
+            let active_tab_id = if defer_inactive_tabs {
+                mux.get_active_tab_for_window(self.mux_window_id)
+                    .map(|tab| tab.tab_id())
+            } else {
+                None
+            };
             if let Some(window) = mux.get_window(self.mux_window_id) {
                 for tab in window.iter_tabs() {
-                    tab.resize(size);
+                    if defer_inactive_tabs && Some(tab.tab_id()) != active_tab_id {
+                        self.termviai_deferred_tab_resize = true;
+                    } else {
+                        tab.resize(size);
+                    }
                 }
             };
-            self.termviai_sync_pane_font_sizes();
+            if !defer_inactive_tabs {
+                self.termviai_deferred_tab_resize = false;
+                self.termviai_sync_pane_font_sizes();
+            }
             self.resize_overlays();
             self.invalidate_fancy_tab_bar();
-            self.update_title();
+            if !defer_inactive_tabs {
+                self.update_title();
+            }
         }
 
         window.set_resize_increments(if self.config.use_resize_increments {
@@ -440,7 +467,7 @@ impl super::TermWindow {
             "scaling_changed, follow with applying dimensions. scale_changed_cells={:?}",
             scale_changed_cells
         );
-        self.apply_dimensions(&dimensions, scale_changed_cells, window);
+        self.apply_dimensions(&dimensions, scale_changed_cells, window, false);
     }
 
     /// Used for applying font size changes only; this takes into account
@@ -467,7 +494,7 @@ impl super::TermWindow {
             // Compute new font metrics
             self.apply_scale_change(&dimensions, font_scale);
             // Now revise the pty size to fit the window
-            self.apply_dimensions(&dimensions, None, window);
+            self.apply_dimensions(&dimensions, None, window, false);
         }
     }
 
@@ -549,6 +576,7 @@ impl super::TermWindow {
                 cols: size.cols as usize,
             }),
             window,
+            false,
         );
         Ok(())
     }

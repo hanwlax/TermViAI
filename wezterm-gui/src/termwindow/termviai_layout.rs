@@ -241,7 +241,7 @@ impl TermWindow {
         if self.termviai_layout.reserved_tray_pixels != tray_pixels {
             self.termviai_layout.reserved_tray_pixels = tray_pixels;
             if let Some(window) = self.window.clone() {
-                self.apply_dimensions(&self.dimensions.clone(), None, &window);
+                self.apply_dimensions(&self.dimensions.clone(), None, &window, false);
             }
         }
         self.termviai_sync_pane_font_sizes();

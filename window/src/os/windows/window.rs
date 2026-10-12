@@ -1552,6 +1552,19 @@ unsafe fn wm_enter_exit_size_move(
 
     if should_size {
         wm_size(hwnd, 0, 0, 0)?;
+        // WM_WINDOWPOSCHANGED may already have reported the final dimensions
+        // while the modal size/move loop was active. Deliver the transition out
+        // of live resizing even when the pixel size itself did not change.
+        if let Some(inner) = rc_from_hwnd(hwnd) {
+            let mut inner = inner.borrow_mut();
+            if let Some(dimensions) = inner.last_size {
+                inner.events.dispatch(WindowEvent::Resized {
+                    dimensions,
+                    window_state: get_window_state(hwnd),
+                    live_resizing: false,
+                });
+            }
+        }
     }
 
     Some(0)
@@ -1608,7 +1621,7 @@ unsafe fn wm_size(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> O
     if should_paint {
         wm_paint(hwnd, 0, 0, 0)?;
         if should_pump {
-            crate::spawn::SPAWN_QUEUE.run();
+            crate::spawn::SPAWN_QUEUE.run_for_size_move();
         }
     }
 
@@ -2992,8 +3005,8 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_DEADCHAR | WM_KEYDOWN | WM_KEYUP | WM_SYSCHAR | WM_CHAR | WM_IME_CHAR | WM_SYSKEYUP
         | WM_SYSKEYDOWN => key(hwnd, msg, wparam, lparam),
         WM_SIZING => {
-            // Allow events to be processed during live resize
-            crate::spawn::SPAWN_QUEUE.run();
+            // Process a bounded amount of work before the next pointer update.
+            crate::spawn::SPAWN_QUEUE.run_for_size_move();
             None
         }
         WM_SETTINGCHANGE | WM_DWMCOMPOSITIONCHANGED => apply_theme(hwnd),

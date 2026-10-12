@@ -1233,7 +1233,7 @@ impl TermWindow {
         if self.termviai_ui.sidebar_layout_pixels != pixels {
             self.termviai_ui.sidebar_layout_pixels = pixels;
             if let Some(window) = self.window.clone() {
-                self.apply_dimensions(&self.dimensions.clone(), None, &window);
+                self.apply_dimensions(&self.dimensions.clone(), None, &window, false);
             }
         }
     }

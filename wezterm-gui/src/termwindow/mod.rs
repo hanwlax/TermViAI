@@ -389,6 +389,7 @@ pub struct TermWindow {
     pub dimensions: Dimensions,
     pub window_state: WindowState,
     pub resizes_pending: usize,
+    termviai_deferred_tab_resize: bool,
     is_repaint_pending: bool,
     pending_scale_changes: LinkedList<resize::ScaleChange>,
     /// Terminal dimensions
@@ -768,6 +769,7 @@ impl TermWindow {
             dimensions,
             window_state: WindowState::default(),
             resizes_pending: 0,
+            termviai_deferred_tab_resize: false,
             is_repaint_pending: false,
             pending_scale_changes: LinkedList::new(),
             terminal_size,
@@ -1339,6 +1341,16 @@ impl TermWindow {
                     let mux = Mux::get();
                     let mut size = self.terminal_size;
                     if let Some(tab) = mux.get_tab(tab_id) {
+                        if self.config.termviai_ui {
+                            // Opening a connection can switch from Hosts/New Tab to
+                            // Terminal while the broadcast tray is being reserved.
+                            // A tab spawned with the earlier, larger content grid
+                            // must fit the window, not grow it by the tray height.
+                            if tab.get_size() != size {
+                                tab.resize(size);
+                            }
+                            return Ok(());
+                        }
                         // If we attached to a remote domain and loaded in
                         // a tab async, we need to fixup its size, either
                         // by resizing it or resizes ourselves.
@@ -1907,7 +1919,7 @@ impl TermWindow {
                 self.fonts.get_font_scale()
             };
             self.apply_scale_change(&dimensions, scale);
-            self.apply_dimensions(&dimensions, None, &window);
+            self.apply_dimensions(&dimensions, None, &window, false);
             window.config_did_change(&config);
             window.invalidate();
         }

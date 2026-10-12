@@ -212,7 +212,7 @@ impl TermWindow {
         let dimensions = self.dimensions;
         self.apply_scale_change(&dimensions, size / self.config.font_size);
         if let Some(window) = self.window.clone() {
-            self.apply_dimensions(&dimensions, None, &window);
+            self.apply_dimensions(&dimensions, None, &window, false);
             self.termviai_sync_terminal_layout();
             window.invalidate();
         }
