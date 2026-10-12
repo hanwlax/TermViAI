@@ -2,9 +2,11 @@
 
 更新时间：2026-10-12（Asia/Shanghai）
 
-最新修复：SSH 认证后的 PTY 请求不再跨网络等待持有终端尺寸锁，避免 Connecting pane 的 GUI 布局操作（包括 New Tab）一起卡死；PTY 请求等待上限 30 秒，不包含交互认证。Windows 119 项测试及 Release 构建通过，本地包 `ssh-connect-responsive-20261012`。构建环境已迁到 `termviai-win`，脚本为 `termviai-build-20260924.cmd`；工作树既有窗口缩放改动保留。详见 [SSH_RECONNECT.md](SSH_RECONNECT.md)。该修复尚未新增 GitHub Release。
+当前版本为 `v0.1.0-beta.3`。本轮包含同主机整组 SSH 重连生命周期修复、最大化客户区边界保护、整个 tab/终端组拖动排序与小手反馈、新应用图标及 Windows CI 回归补充。Windows 原生 140 项测试和 Release 构建通过，CLI/字符串版本为 `0.1.0-beta.3`，PE 数值版本 `0.1.0.3`。详见 [beta.3 发布说明](RELEASE_V0.1.0_BETA.3.md) 与 [验证记录](RELEASE_V0.1.0_BETA.3_VALIDATION.md)。
 
-新会话先读 [NEW_SESSION_HANDOVER.md](NEW_SESSION_HANDOVER.md)，其中记录了实际 checkout、远端差异、Windows 构建入口和发布回传验证结果。
+品牌释义：TermViAI = Terminal Via AI，指应用通过 AI 制作，当前没有内置 AI 功能。图标源为 `assets/icon/termviai-icon.png`，导出脚本 `assets/icon/export.py`。拖动排序保留 SSH、布局、广播和选中状态；真实 GUI 与网络场景待持续人工验收。
+
+Windows 构建环境为 `termviai-win`，本轮脚本 `termviai-beta3.cmd`；Windows 源码快照不是代码真源。此前 10 月 12 日的 `ssh-group-reconnect`、`maximized-tabs`、`tab-reorder`、`tab-feedback` 和 `termviai-icon` 包是使用 beta.2 字符串的历史验证包，以正式 beta.3 Release 为准。细节见 [SSH_RECONNECT.md](SSH_RECONNECT.md) 和 [UI_VALIDATION.md](UI_VALIDATION.md)。
 
 本文是 TermViAI 后续开发的优先上下文。历次实现细节和历史验证保留在 [HANDOVER.md](HANDOVER.md) 与 [STATUS.md](STATUS.md)；若历史段落与本文冲突，以本文和当前代码为准。
 
@@ -15,11 +17,11 @@
 - GitHub 仓库：<https://github.com/hanwlax/TermViAI>。
 - 当前分支：`main`，远端为 `origin/main`。
 - 首个公开版本：`v0.1.0-beta.1`。
-- 当前版本：`v0.1.0-beta.2`；发布提交以该 Git 标签指向的提交为准。
-- Release：<https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.2>，标记为 prerelease。
-- Windows 便携包：`TermViAI-v0.1.0-beta.2-windows-x86_64.zip`。
-- 发布包 SHA-256：`2dbbaf31f10acbfa2bfbe07b94765ae22ea8b8cb24f6f0c29490365c36ec97e8`。
-- 本地构建、版本与归档验证见 [RELEASE_V0.1.0_BETA.2_VALIDATION.md](RELEASE_V0.1.0_BETA.2_VALIDATION.md)；GitHub 回传附件、ZIP CRC 和包内 8 个文件 SHA-256 均已核验成功。
+- 当前版本：`v0.1.0-beta.3`；发布提交以该 Git 标签指向的提交为准。
+- Release：<https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.3>，标记为 prerelease。
+- Windows 便携包：`TermViAI-v0.1.0-beta.3-windows-x86_64.zip`。
+- 发布包 SHA-256：`1f60d24c1622af1cf7b9cbc1f08c582e4ad07d6da4a9629785fa15fd7279a9a9`。
+- 本地构建、版本、嵌入图标与归档验证见 [RELEASE_V0.1.0_BETA.3_VALIDATION.md](RELEASE_V0.1.0_BETA.3_VALIDATION.md)。GitHub Release 为正式附件真源，发布后须回传 ZIP 与校验文件核验。
 
 从首个发布版本起，**不保留任何旧品牌兼容层**。源码、模块、配置、环境变量和数据路径不得重新引入先前品牌标识。当前配置项为 `termviai_ui`，数据目录覆盖变量为 `TERMVIAI_DATA_DIR`，Windows 默认数据目录为 `%APPDATA%\wezterm\termviai`；不迁移更早的实验数据目录。
 
@@ -70,9 +72,9 @@
 - New Tab 精简版通过工作区存储 7 项（含旧历史清理和保存数据保留）、GUI 61 项测试及 Windows x64 Release 构建；验证包目录为 `new-tab-simplified-20260918`。
 - 重连广播输入修正版通过 84 项不同测试（Mux 重连/输入 11、广播 12、GUI 61）及 Windows x64 Release 构建，已合入 beta.2。
 - beta.2 发布前通过 116 项测试：Mux 36、广播 12、GUI TermViAI 61、工作区存储 7。Windows x64 Release 构建和 ZIP 完整性校验通过。
-- 最终二进制的 CLI 版本与 Windows FileVersion/ProductVersion 均为 `0.1.0-beta.2`，Windows 数值资源版本为 `0.1.0.2`。
+- beta.2 二进制的 CLI 版本与 Windows FileVersion/ProductVersion 均为 `0.1.0-beta.2`，Windows 数值资源版本为 `0.1.0.2`。
 - Windows 构建快照是一次性构建输入，不是源码真源；具体位置以构建脚本的工作目录为准。
-- 最终本地发布目录为 `TermViAI-v0.1.0-beta.2`，GitHub Release 是对外发布真源。beta.1 及其附件保留。
+- beta.2 的历史本地发布目录为 `TermViAI-v0.1.0-beta.2`，GitHub Release 是对外发布真源。beta.1 及其附件保留。
 - 构建过程中可见的上游弃用、dead code 和 OpenSSL PDB 警告没有阻止构建；后续修改不应把这些历史警告误判为本次功能回归。
 
 发布前最低检查：
@@ -95,7 +97,7 @@
 
 ### P1：Beta 反馈与稳定性
 
-- 收集 beta.2 的崩溃、断线、慢连接和复杂布局恢复反馈，为下一版修复。
+- 收集 beta.3 的崩溃、断线、慢连接和复杂布局恢复反馈，为下一版修复。
 - 为广播写入增加慢目标与背压压力测试，测试 16/32 pane 的延迟、CPU 和内存。
 - 检查 settings、hosts、keys 和 workspace JSON 损坏时的恢复路径及错误提示。
 - 补充真实 SSH 断线重连压力测试，以及 Host 重命名后的历史项一致性。
@@ -104,7 +106,7 @@
 
 - 建立只面向 TermViAI 的 Windows CI、测试和带签名校验的 Release 流程。
 - 评估 Windows 安装包、代码签名、自动更新、崩溃报告和版本升级策略。
-- 在稳定前继续使用 SemVer Beta 编号；下一修复版可采用 `v0.1.0-beta.3`，不要重复发布 beta.2。
+- 在稳定前继续使用 SemVer Beta 编号；下一修复版可采用 `v0.1.0-beta.4`，不要重复发布已发布的 Beta 标签。
 
 ### 明确延后
 

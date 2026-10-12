@@ -4,6 +4,10 @@
 
 > 最新、精简且可执行的项目上下文见 [MEMORY.md](MEMORY.md)。后续工作应先读取该文件；下文保留完整历史记录。
 
+## 2026-10-12 TermViAI v0.1.0-beta.3
+
+第三个 Beta 汇总同主机整组重连、Windows 最大化边界、tab 拖动排序/反馈和新应用图标。Windows 原生 140 项测试、Release 构建、beta.3 版本资源和 10 个嵌入图标尺寸核验通过。最新入口见 [MEMORY.md](MEMORY.md)、[发布说明](RELEASE_V0.1.0_BETA.3.md) 与 [验证记录](RELEASE_V0.1.0_BETA.3_VALIDATION.md)。历史本地测试包沿用 beta.2 字符串，正式 beta.3 发布包为升级入口。
+
 ## 2026-09-18 TermViAI v0.1.0-beta.2
 
 本轮 SSH 原位/整组重连、失效缓存恢复、历史重叠修复、重连广播输入通道重建，以及 New Tab 自动历史移除汇总为第二个 Beta。源码 `VERSION`、Cargo 版本与 Windows 资源版本同步到 `0.1.0-beta.2`（数值资源版本 `0.1.0.2`）。发布说明见 [RELEASE_V0.1.0_BETA.2.md](RELEASE_V0.1.0_BETA.2.md)，发布验证记录见 [RELEASE_V0.1.0_BETA.2_VALIDATION.md](RELEASE_V0.1.0_BETA.2_VALIDATION.md)。
