@@ -685,6 +685,7 @@ fn action_hint(
         },
         Action::ReconnectPane(_) => "Reconnect this SSH session",
         Action::ReconnectGroup(_) => "Reconnect all SSH sessions in this tab",
+        Action::Tab(_) => "Drag to reorder tabs",
         _ => return None,
     })
 }
@@ -820,13 +821,7 @@ fn tray_label(label: &str, width: f32) -> String {
     text
 }
 
-fn shield_tray(
-    hits: &mut Vec<Hit>,
-    width: f32,
-    height: f32,
-    reserved: f32,
-    content_left: f32,
-) {
+fn shield_tray(hits: &mut Vec<Hit>, width: f32, height: f32, reserved: f32, content_left: f32) {
     if reserved > 0. && width > content_left {
         hits.push(Hit {
             x: content_left,
@@ -1216,6 +1211,28 @@ fn color(s: &str) -> window::color::LinearRgba {
 }
 
 impl TermWindow {
+    pub(super) fn termviai_tab_strip(&self) -> Vec<(usize, super::termviai_dock::Rect)> {
+        self.termviai_ui
+            .hits
+            .iter()
+            .filter_map(|hit| {
+                if let Action::Tab(id) = hit.action {
+                    Some((
+                        id,
+                        super::termviai_dock::Rect {
+                            x: hit.x,
+                            y: hit.y,
+                            w: hit.w,
+                            h: hit.h,
+                        },
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn termviai_sidebar_pixel_width(&self, dpi: f32) -> f32 {
         if self.config.termviai_ui {
             self.termviai_ui.sidebar_width(Instant::now()) * dpi / 96.
@@ -1240,7 +1257,8 @@ impl TermWindow {
 
     pub(super) fn termviai_confirmation_input_active(&self) -> bool {
         self.config.termviai_ui
-            && (self.termviai_confirm.is_active() || self.termviai_ui.confirm_keys.pending.is_some())
+            && (self.termviai_confirm.is_active()
+                || self.termviai_ui.confirm_keys.pending.is_some())
     }
     pub(super) fn termviai_input_generation(&self) -> u64 {
         self.termviai_ui.generation
@@ -1406,7 +1424,11 @@ impl TermWindow {
             Action::ToggleTray => {
                 self.termviai_ui.tray_expanded = !self.termviai_ui.tray_expanded;
                 self.termviai_ui.tray_motion.set_target(
-                    if self.termviai_ui.tray_expanded { 1. } else { 0. },
+                    if self.termviai_ui.tray_expanded {
+                        1.
+                    } else {
+                        0.
+                    },
                     Instant::now(),
                     Duration::from_millis(200),
                 );
@@ -1658,7 +1680,8 @@ impl TermWindow {
             || self.termviai_ui.pressed.is_some()
             || self.termviai_ui.tab_drag.is_some();
         if !capture {
-            if matches!(event.kind, MouseEventKind::Move) && self.termviai_ui.hover.take().is_some() {
+            if matches!(event.kind, MouseEventKind::Move) && self.termviai_ui.hover.take().is_some()
+            {
                 context.invalidate();
             }
             return false;
@@ -1669,10 +1692,11 @@ impl TermWindow {
                 if self.termviai_ui.tab_drag.is_some() {
                     if !event.mouse_buttons.contains(window::MouseButtons::LEFT) {
                         self.reset_termviai_interaction();
+                        context.set_cursor(Some(CursorIcon::Default));
                     } else {
                         self.update_termviai_tab_drag(x, y);
+                        context.set_cursor(Some(CursorIcon::Grabbing));
                     }
-                    context.set_cursor(Some(CursorIcon::Default));
                     return true;
                 }
                 // Windows performs caption hit testing before the next button press.
@@ -1727,6 +1751,11 @@ impl TermWindow {
             }
             MouseEventKind::Release(MousePress::Left) => {
                 if self.termviai_ui.tab_drag.is_some() {
+                    context.set_cursor(Some(if matches!(over, Some(Action::Tab(_))) {
+                        CursorIcon::Pointer
+                    } else {
+                        CursorIcon::Default
+                    }));
                     self.update_termviai_tab_drag(x, y);
                     match self.finish_termviai_tab_drag() {
                         Ok(false) => {}
@@ -1752,6 +1781,16 @@ impl TermWindow {
                 context.invalidate();
             }
             MouseEventKind::VertWheel(amount) => {
+                if self.termviai_ui.tab_drag.is_some() && y < 52. {
+                    let step = amount.unsigned_abs().max(1) as usize;
+                    self.termviai_ui.tab_scroll = if amount > 0 {
+                        self.termviai_ui.tab_scroll.saturating_sub(step)
+                    } else {
+                        self.termviai_ui.tab_scroll.saturating_add(step)
+                    };
+                    context.invalidate();
+                    return true;
+                }
                 if self.termviai_ui.closing_form.is_some() {
                     return true;
                 }
@@ -1891,7 +1930,9 @@ impl TermWindow {
                 promise::spawn::spawn(async move {
                     if let Ok(text) = future.await {
                         w.notify(TermWindowNotif::Apply(Box::new(move |tw| {
-                            if tw.termviai_ui_input_active() && tw.termviai_ui.generation == generation {
+                            if tw.termviai_ui_input_active()
+                                && tw.termviai_ui.generation == generation
+                            {
                                 if let Some(input) = tw.termviai_ui.input() {
                                     input.insert(&text);
                                 }
@@ -1934,10 +1975,7 @@ impl TermWindow {
                         .hits
                         .iter()
                         .find(|h| {
-                            matches!(
-                                h.action,
-                                Action::OpenSaved(_) | Action::ConnectRecent(_)
-                            )
+                            matches!(h.action, Action::OpenSaved(_) | Action::ConnectRecent(_))
                         })
                         .map(|h| h.action.clone())
                         .unwrap_or(Action::QuickConnect);
@@ -2060,7 +2098,9 @@ impl TermWindow {
                     .then_some(positioned.pane.pane_id())
             })
             .collect();
-        if active_tab.is_none() && self.termviai_ui.page == Page::Terminal && !self.termviai_ui.connecting
+        if active_tab.is_none()
+            && self.termviai_ui.page == Page::Terminal
+            && !self.termviai_ui.connecting
         {
             self.termviai_ui.page = Page::Hosts;
         }
@@ -2613,13 +2653,7 @@ impl TermWindow {
             let progress = ui.tray_motion.value(now);
             let tray_top = h - BROADCAST_TRAY_HEIGHT * progress;
             let layout = TrayLayout::new(w, content_left);
-            shield_tray(
-                &mut hits,
-                w,
-                h,
-                ui.broadcast_tray_height(),
-                content_left,
-            );
+            shield_tray(&mut hits, w, h, ui.broadcast_tray_height(), content_left);
             if progress > 0. {
                 tile(
                     &mut tiles,
@@ -4007,8 +4041,8 @@ impl TermWindow {
         let mut notice_due = None;
         if let Some((text, until)) = &ui.notice {
             if now < *until {
-                let width = (text.chars().count() as f32 * 8. + 30.)
-                    .min((w - content_left - 30.).max(1.));
+                let width =
+                    (text.chars().count() as f32 * 8. + 30.).min((w - content_left - 30.).max(1.));
                 tile(
                     &mut tiles,
                     content_left + 16.,
@@ -4034,6 +4068,12 @@ impl TermWindow {
                 .set_target(1., now, Duration::from_millis(100));
         }
         if let Some(drag) = drag_visuals {
+            if let Some(x) = drag.insertion_x {
+                tile(&mut tiles, x - 2., 7., 3., 38., "", "#a6a0ff", INK, false);
+                if let Some(t) = tiles.last_mut() {
+                    t.zindex = 52;
+                }
+            }
             if let Some(rect) = drag.preview {
                 tile(
                     &mut tiles,

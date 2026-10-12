@@ -146,6 +146,37 @@ impl Window {
         None
     }
 
+    /// Move an existing tab without closing panes or changing focus/history.
+    /// IDs keep a queued drop valid even if other tabs close during the drag.
+    pub fn reorder_tab_before(&mut self, id: TabId, before: Option<TabId>) -> anyhow::Result<bool> {
+        let from = self
+            .get_tab_idx_for_id(id)
+            .ok_or_else(|| anyhow::anyhow!("The dragged tab closed."))?;
+        if before == Some(id) {
+            return Ok(false);
+        }
+        let boundary = match before {
+            Some(id) => self
+                .get_tab_idx_for_id(id)
+                .ok_or_else(|| anyhow::anyhow!("The destination tab closed."))?,
+            None => self.tabs.len(),
+        };
+        let to = boundary - usize::from(from < boundary);
+        if from == to {
+            return Ok(false);
+        }
+        let active = self.get_active_tab().map(|tab| tab.tab_id());
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        if let Some(active) = active {
+            self.active_tab_idx = self.get_tab_idx_for_id(active).unwrap();
+        }
+        if let Some(mux) = Mux::try_get() {
+            mux.notify(MuxNotification::WindowInvalidated(self.id));
+        }
+        Ok(true)
+    }
+
     /// Re-establish a valid active tab after a tab removal.
     fn fixup_active_tab_after_removal(&mut self, active: Option<Arc<Tab>>) {
         let len = self.tabs.len();
@@ -303,5 +334,82 @@ impl Window {
         if invalidated {
             self.invalidate();
         }
+    }
+}
+
+#[cfg(test)]
+mod termviai_reorder_tests {
+    use super::*;
+    use wezterm_term::TerminalSize;
+
+    fn setup() -> (Window, Vec<TabId>) {
+        let mut window = Window::new(Some("test".into()), None);
+        for _ in 0..4 {
+            window.tabs.push(Arc::new(Tab::new(&TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            })));
+        }
+        let ids = window.tabs.iter().map(|tab| tab.tab_id()).collect();
+        window.active_tab_idx = 1;
+        window.last_active_tab_id = Some(window.tabs[0].tab_id());
+        (window, ids)
+    }
+
+    fn ids(window: &Window) -> Vec<TabId> {
+        window.iter_tabs().map(|tab| tab.tab_id()).collect()
+    }
+
+    #[test]
+    fn moving_tabs_both_directions_preserves_active_and_previous_tab() {
+        let (mut window, original) = setup();
+        let objects = window.tabs.clone();
+        assert!(window
+            .reorder_tab_before(original[3], Some(original[0]))
+            .unwrap());
+        assert_eq!(
+            ids(&window),
+            [original[3], original[0], original[1], original[2]]
+        );
+        assert!(window.reorder_tab_before(original[3], None).unwrap());
+        assert_eq!(ids(&window), original);
+        assert!(window.reorder_tab_before(original[1], None).unwrap());
+        assert_eq!(
+            ids(&window),
+            [original[0], original[2], original[3], original[1]]
+        );
+        assert_eq!(window.get_active_tab().unwrap().tab_id(), original[1]);
+        assert_eq!(window.last_active_tab_id, Some(original[0]));
+        for tab in window.iter_tabs() {
+            assert!(objects.iter().any(|old| Arc::ptr_eq(old, tab)));
+        }
+    }
+
+    #[test]
+    fn stale_drop_and_no_op_never_change_order_or_focus() {
+        let (mut window, original) = setup();
+        assert!(!window
+            .reorder_tab_before(original[1], Some(original[1]))
+            .unwrap());
+        assert!(!window
+            .reorder_tab_before(original[1], Some(original[2]))
+            .unwrap());
+        assert!(window
+            .reorder_tab_before(original[0], Some(usize::MAX))
+            .is_err());
+        assert!(window.reorder_tab_before(usize::MAX, None).is_err());
+        assert_eq!(ids(&window), original);
+        assert_eq!(window.get_active_tab().unwrap().tab_id(), original[1]);
+        // A different tab closes before release: resolve the stable anchor ID.
+        window.tabs.remove(0);
+        window.active_tab_idx = 0;
+        assert!(window
+            .reorder_tab_before(original[3], Some(original[1]))
+            .unwrap());
+        assert_eq!(ids(&window), [original[3], original[1], original[2]]);
+        assert_eq!(window.get_active_tab().unwrap().tab_id(), original[1]);
     }
 }

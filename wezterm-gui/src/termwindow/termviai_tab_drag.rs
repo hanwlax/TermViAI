@@ -1,4 +1,4 @@
-//! Move an existing single-session tab into another tab without reconnecting.
+//! Reorder whole tabs, or dock a single-session tab, without reconnecting.
 
 use super::termviai_dock::{drag_threshold_reached, DockSide, Rect};
 use super::{TermWindow, TermWindowNotif};
@@ -27,12 +27,15 @@ pub(super) struct TabDrag {
     title: String,
     moved: bool,
     target: Option<DropTarget>,
+    can_dock: bool,
+    reorder: Option<(Option<usize>, f32)>,
 }
 
 pub(super) struct DragVisuals {
     pub preview: Option<Rect>,
     pub pointer: (f32, f32),
     pub title: String,
+    pub insertion_x: Option<f32>,
 }
 
 impl TabDrag {
@@ -41,7 +44,56 @@ impl TabDrag {
         self.moved |= drag_threshold_reached(self.start, self.pointer);
         // Leaving a valid target must immediately discard its previous preview.
         self.target = None;
+        self.reorder = None;
     }
+}
+
+/// Match visible tab halves to stable insertion anchors in the full tab list.
+/// Virtual New Tab and window controls are excluded by the strip snapshot.
+fn strip_insertion(
+    visible: &[(usize, Rect)],
+    all: &[usize],
+    x: f32,
+    y: f32,
+) -> Option<(Option<usize>, f32)> {
+    let (_, first) = visible.first()?;
+    let (_, last) = visible.last()?;
+    if !x.is_finite()
+        || !y.is_finite()
+        || y < first.y
+        || y >= first.y + first.h
+        || x < first.x - 8.
+        || x >= last.x + last.w + 8.
+    {
+        return None;
+    }
+    for (id, rect) in visible {
+        if x < rect.x + rect.w / 2. {
+            return Some((Some(*id), rect.x));
+        }
+    }
+    let (last_id, rect) = visible.last()?;
+    let index = all.iter().position(|id| id == last_id)?;
+    Some((all.get(index + 1).copied(), rect.x + rect.w))
+}
+
+fn reorder_target(
+    visible: &[(usize, Rect)],
+    all: &[usize],
+    source: usize,
+    x: f32,
+    y: f32,
+) -> Option<(Option<usize>, f32)> {
+    let (before, marker) = strip_insertion(visible, all, x, y)?;
+    let from = all.iter().position(|id| *id == source)?;
+    let boundary = match before {
+        Some(id) => all.iter().position(|candidate| *candidate == id)?,
+        None => all.len(),
+    };
+    // Both halves of the source tab resolve to its current position. Hide
+    // those markers, and adjacent drop slots that would also leave it there.
+    let to = boundary - usize::from(from < boundary);
+    (from != to).then_some((before, marker))
 }
 
 fn valid_source(mux: &Mux, window_id: usize, tab_id: usize, pane_id: usize) -> bool {
@@ -137,43 +189,50 @@ fn split_fits(tab: &Tab, pane_index: usize, side: DockSide) -> bool {
 }
 
 impl TermWindow {
-    /// A press on an inactive, single-session tab can become a docking drag.
-    /// Return false for ordinary tabs that should retain their existing clicks.
+    /// Any real tab can reorder. Only inactive, single-session tabs can dock.
     pub(super) fn begin_termviai_tab_drag(&mut self, tab_id: usize, x: f32, y: f32) -> bool {
         self.termviai_ui.tab_drag = None;
-        if !self.config.termviai_ui || self.termviai_library_active() || self.get_modal().is_some() {
+        if !self.config.termviai_ui || self.get_modal().is_some() {
             return false;
         }
         let mux = Mux::get();
         let Some(destination) = mux.get_active_tab_for_window(self.mux_window_id) else {
             return false;
         };
-        if destination.tab_id() == tab_id || destination.get_zoomed_pane().is_some() {
-            return false;
-        }
-        let Some(source) = mux.get_tab(tab_id).and_then(|tab| tab.get_active_pane()) else {
+        let Some(source_tab) = mux.get_tab(tab_id) else {
             return false;
         };
+        let Some(source) = source_tab.get_active_pane() else {
+            return false;
+        };
+        if !mux
+            .get_window(self.mux_window_id)
+            .is_some_and(|w| w.get_tab_idx_for_id(tab_id).is_some())
+        {
+            return false;
+        }
         // Drop each RefCell guard before inspecting another tab or pane.
         let source_tab_overlay = self.tab_state(tab_id).overlay.is_some();
         let destination_overlay = self.tab_state(destination.tab_id()).overlay.is_some();
         let source_pane_overlay = self.pane_state(source.pane_id()).overlay.is_some();
-        if !valid_source(&mux, self.mux_window_id, tab_id, source.pane_id())
-            || source_tab_overlay
-            || destination_overlay
-            || source_pane_overlay
-        {
-            return false;
-        }
+        let can_dock = !self.termviai_library_active()
+            && destination.tab_id() != tab_id
+            && destination.get_zoomed_pane().is_none()
+            && valid_source(&mux, self.mux_window_id, tab_id, source.pane_id())
+            && !source_tab_overlay
+            && !destination_overlay
+            && !source_pane_overlay;
         self.termviai_ui.tab_drag = Some(TabDrag {
             source_tab: tab_id,
             source_pane: source.pane_id(),
             destination_tab: destination.tab_id(),
             start: (x, y),
             pointer: (x, y),
-            title: self.termviai_pane_label(source.pane_id()),
+            title: self.termviai_tab_label(&source_tab),
             moved: false,
             target: None,
+            can_dock,
+            reorder: None,
         });
         true
     }
@@ -183,7 +242,20 @@ impl TermWindow {
             return;
         };
         drag.update_pointer(x, y);
-        if drag.moved && !self.termviai_library_active() && self.get_modal().is_none() {
+        if drag.moved && self.get_modal().is_none() {
+            let mux = Mux::get();
+            let all = mux
+                .get_window(self.mux_window_id)
+                .map(|w| w.iter_tabs().map(|tab| tab.tab_id()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            drag.reorder = reorder_target(&self.termviai_tab_strip(), &all, drag.source_tab, x, y);
+        }
+        if drag.moved
+            && drag.reorder.is_none()
+            && drag.can_dock
+            && !self.termviai_library_active()
+            && self.get_modal().is_none()
+        {
             let mux = Mux::get();
             if let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) {
                 if tab.tab_id() == drag.destination_tab
@@ -246,6 +318,22 @@ impl TermWindow {
         if !drag.moved {
             return Ok(false);
         }
+        if self.get_modal().is_some() {
+            return Ok(true);
+        }
+        if let Some((before, _)) = drag.reorder {
+            let mux = Mux::get();
+            let mut window = mux
+                .get_window_mut(self.mux_window_id)
+                .context("The window closed.")?;
+            window.reorder_tab_before(drag.source_tab, before)?;
+            drop(window);
+            self.update_title();
+            if let Some(window) = &self.window {
+                window.invalidate();
+            }
+            return Ok(true);
+        }
         let Some(target) = drag.target else {
             return Ok(true);
         };
@@ -302,6 +390,7 @@ impl TermWindow {
     pub(super) fn cancel_termviai_tab_drag(&mut self) {
         if self.termviai_ui.tab_drag.take().is_some() {
             if let Some(window) = &self.window {
+                window.set_cursor(Some(window::CursorIcon::Default));
                 window.invalidate();
             }
         }
@@ -313,6 +402,7 @@ impl TermWindow {
             preview: drag.target.map(|target| target.rect.preview(target.side)),
             pointer: drag.pointer,
             title: drag.title.clone(),
+            insertion_x: drag.reorder.map(|(_, x)| x),
         })
     }
 }
@@ -320,6 +410,68 @@ impl TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_drop_uses_midpoints_and_full_order_for_scrolled_tabs() {
+        let visible = [
+            (
+                20,
+                Rect {
+                    x: 220.,
+                    y: 8.,
+                    w: 202.,
+                    h: 36.,
+                },
+            ),
+            (
+                30,
+                Rect {
+                    x: 430.,
+                    y: 8.,
+                    w: 202.,
+                    h: 36.,
+                },
+            ),
+        ];
+        let all = [10, 20, 30, 40];
+        assert_eq!(
+            strip_insertion(&visible, &all, 240., 20.),
+            Some((Some(20), 220.))
+        );
+        assert_eq!(
+            strip_insertion(&visible, &all, 380., 20.),
+            Some((Some(30), 430.))
+        );
+        // Last visible tab isn't the last real tab: insert before hidden tab 40.
+        assert_eq!(
+            strip_insertion(&visible, &all, 620., 20.),
+            Some((Some(40), 632.))
+        );
+        assert_eq!(
+            strip_insertion(&visible, &[10, 20, 30], 620., 20.),
+            Some((None, 632.))
+        );
+        assert!(strip_insertion(&visible, &all, 620., 100.).is_none());
+        assert!(strip_insertion(&visible, &all, 700., 20.).is_none());
+        assert!(strip_insertion(&visible, &all, f32::NAN, 20.).is_none());
+        assert!(strip_insertion(&[], &all, 240., 20.).is_none());
+        // No marker on either half of the dragged tab, including a last tab.
+        for x in [240., 380.] {
+            assert!(reorder_target(&visible, &all, 20, x, 20.).is_none());
+        }
+        for x in [450., 620.] {
+            assert!(reorder_target(&visible, &all, 30, x, 20.).is_none());
+            assert!(reorder_target(&visible, &[10, 20, 30], 30, x, 20.).is_none());
+        }
+        assert_eq!(
+            reorder_target(&visible, &all, 30, 240., 20.),
+            Some((Some(20), 220.))
+        );
+        assert_eq!(
+            reorder_target(&visible, &all, 20, 620., 20.),
+            Some((Some(40), 632.))
+        );
+    }
 
     #[test]
     fn returning_to_tab_after_drag_does_not_become_a_click() {
@@ -332,6 +484,8 @@ mod tests {
             title: String::new(),
             moved: false,
             target: None,
+            can_dock: true,
+            reorder: None,
         };
         drag.update_pointer(242.0, 23.0);
         assert!(!drag.moved);
@@ -351,5 +505,8 @@ mod tests {
         drag.update_pointer(240.0, 20.0);
         assert!(drag.moved);
         assert!(drag.target.is_none());
+        drag.reorder = Some((Some(3), 240.));
+        drag.update_pointer(240.0, 180.0);
+        assert!(drag.reorder.is_none());
     }
 }
