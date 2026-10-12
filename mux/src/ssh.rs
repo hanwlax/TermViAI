@@ -32,6 +32,30 @@ struct PasswordPromptHost {
     history: BasicHistory,
     echo: bool,
 }
+
+const SSH_PTY_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+// Returning an owned size is important: a mutex temporary inside
+// `match block_on(request_pty(...))` lives until the whole match finishes.
+// The GUI also needs this mutex to resize a connecting pane or open New Tab.
+fn ssh_pty_size(size: &Mutex<TerminalSize>) -> anyhow::Result<PtySize> {
+    let snapshot = *size.lock().unwrap();
+    crate::terminal_size_to_pty_size(snapshot)
+}
+
+async fn with_ssh_pty_timeout<T>(
+    request: impl std::future::Future<Output = anyhow::Result<T>>,
+    timeout: Duration,
+) -> anyhow::Result<T> {
+    smol::future::or(request, async move {
+        smol::Timer::after(timeout).await;
+        anyhow::bail!(
+            "Timed out waiting for the SSH server to open a terminal ({} seconds). Try reconnecting.",
+            timeout.as_secs()
+        )
+    })
+    .await
+}
 impl LineEditorHost for PasswordPromptHost {
     fn history(&mut self) -> &mut dyn History {
         &mut self.history
@@ -440,22 +464,24 @@ impl RemoteSshDomain {
         // Release the session lock before awaiting a PTY request.
         let mut session: Option<Session> = self.session.lock().unwrap().as_ref().cloned();
         if let Some(session) = session.take() {
-            let cached = session
-                .request_pty(
+            let cached = with_ssh_pty_timeout(
+                session.request_pty(
                     &config::configuration().term,
                     crate::terminal_size_to_pty_size(size)
                         .context("compute pty size from terminal size")?,
                     command_line.as_deref(),
                     Some(env.clone()),
-                )
-                .await
-                .context("request ssh pty")
-                .and_then(|(concrete_pty, concrete_child)| {
-                    let pty = Box::new(concrete_pty);
-                    let child = Box::new(concrete_child);
-                    let writer = Box::new(pty.take_writer().context("take writer from pty")?);
-                    Ok(StartNewSessionResult { pty, child, writer })
-                });
+                ),
+                SSH_PTY_OPEN_TIMEOUT,
+            )
+            .await
+            .context("request ssh pty")
+            .and_then(|(concrete_pty, concrete_child)| {
+                let pty = Box::new(concrete_pty);
+                let child = Box::new(concrete_child);
+                let writer = Box::new(pty.take_writer().context("take writer from pty")?);
+                Ok(StartNewSessionResult { pty, child, writer })
+            });
             cached_pty_or_fresh(cached, || self.start_new_session(command_line, env, size)).await
         } else {
             self.start_new_session(command_line, env, size).await
@@ -724,11 +750,16 @@ fn connect_ssh_session(
             SessionEvent::Authenticated => {
                 // Our session has been authenticated: we can now
                 // set up the real pty for the pane
-                match smol::block_on(session.request_pty(
-                    &config::configuration().term,
-                    crate::terminal_size_to_pty_size(*size.lock().unwrap())?,
-                    command_line.as_ref().map(|s| s.as_str()),
-                    Some(env),
+                let initial_size = ssh_pty_size(&size)?;
+                shim.output_line("Authenticated. Opening remote terminal…")?;
+                match smol::block_on(with_ssh_pty_timeout(
+                    session.request_pty(
+                        &config::configuration().term,
+                        initial_size,
+                        command_line.as_ref().map(|s| s.as_str()),
+                        Some(env),
+                    ),
+                    SSH_PTY_OPEN_TIMEOUT,
                 )) {
                     Err(err) => {
                         shim.output_line(&format!("Failed to spawn command: {:#}", err))?;
@@ -1190,7 +1221,9 @@ mod reconnect_tests {
     fn reconnect_new_tab_recovers_from_generic_socket_error_once() {
         let attempts = Cell::new(0);
         let result = smol::block_on(cached_pty_or_fresh(
-            Err(anyhow::anyhow!("request ssh pty: Fatal: Socket error: No error")),
+            Err(anyhow::anyhow!(
+                "request ssh pty: Fatal: Socket error: No error"
+            )),
             || async {
                 attempts.set(attempts.get() + 1);
                 Ok("new transport")
@@ -1217,7 +1250,105 @@ mod reconnect_tests {
                 Err(anyhow::anyhow!("fresh authentication failed"))
             },
         ));
-        assert_eq!(result.unwrap_err().to_string(), "fresh authentication failed");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "fresh authentication failed"
+        );
         assert_eq!(attempts.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod connection_responsiveness_tests {
+    use super::*;
+
+    fn size() -> TerminalSize {
+        TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 96,
+        }
+    }
+
+    #[test]
+    fn stalled_pty_open_does_not_lock_connecting_pane_size() {
+        let shared_size = Arc::new(Mutex::new(size()));
+        let worker_size = Arc::clone(&shared_size);
+        let (entered, waiting) = channel();
+        let (release, resumed) = smol::channel::bounded::<()>(1);
+        let worker = std::thread::spawn(move || {
+            // Mirror the authentication thread's match/block_on lifetime.
+            let initial_size = ssh_pty_size(&worker_size).unwrap();
+            match smol::block_on(with_ssh_pty_timeout(
+                async {
+                    entered.send(initial_size).unwrap();
+                    resumed.recv().await?;
+                    Ok(())
+                },
+                Duration::from_secs(2),
+            )) {
+                Ok(()) => {}
+                Err(err) => panic!("{err:#}"),
+            }
+        });
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap().cols,
+            80
+        );
+        // Fail promptly instead of deadlocking the test if the auth thread
+        // still owns the size lock. This is the lock used on the GUI thread.
+        assert!(shared_size.try_lock().is_ok());
+        let (_connected, receiver) = channel();
+        let pty = WrappedSshPty {
+            inner: RefCell::new(WrappedSshPtyInner::Connecting {
+                reader: None,
+                connected: receiver,
+                size: Arc::clone(&shared_size),
+            }),
+        };
+        let mut resized = pty.get_size().unwrap();
+        resized.rows = 40;
+        resized.cols = 120;
+        pty.resize(resized).unwrap();
+        assert_eq!(pty.get_size().unwrap().cols, 120);
+        release.try_send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn stalled_pty_request_times_out_and_drops_its_reply_receiver() {
+        let (reply, receiver) = smol::channel::bounded::<()>(1);
+        let error = smol::block_on(with_ssh_pty_timeout(
+            async move {
+                receiver.recv().await?;
+                Ok(())
+            },
+            Duration::from_millis(20),
+        ))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Timed out waiting for the SSH server"));
+        assert!(reply.try_send(()).is_err());
+    }
+
+    #[test]
+    fn responsive_pty_request_preserves_success_and_server_errors() {
+        assert_eq!(
+            smol::block_on(with_ssh_pty_timeout(
+                async { Ok(42) },
+                Duration::from_secs(2)
+            ))
+            .unwrap(),
+            42
+        );
+        let error = smol::block_on(with_ssh_pty_timeout(
+            async { Err::<(), _>(anyhow!("server denied shell")) },
+            Duration::from_secs(2),
+        ))
+        .unwrap_err();
+        assert_eq!(error.to_string(), "server denied shell");
     }
 }

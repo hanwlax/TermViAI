@@ -1,6 +1,18 @@
 # SSH 原位重连
 
-更新时间：2026-09-18（Asia/Shanghai）
+更新时间：2026-10-12（Asia/Shanghai）
+
+## 2026-10-12 SSH 建连等待导致界面卡死
+
+用户反馈连接停在服务器 `Authorized Only...` 提示后，点击顶栏 `+` 导致应用无响应。定位到认证完成后 `match block_on(session.request_pty(... *size.lock() ...))` 中的临时 MutexGuard：Rust 会把锁保留到整个 match 结束，GUI 对 Connecting pane 的 resize/get_size 因此等待远端 PTY/shell 创建请求。
+
+修复在发起请求前取出尺寸副本并释放锁；认证成功后显示 `Authenticated. Opening remote terminal…` 阶段提示。新会话和缓存会话的 PTY 创建请求均增加 30 秒等待上限，失败显示在原终端；缓存请求失败继续走既有的新传输重试流程。该时限不包含交互输入密码，也不限制已经建立的 shell。
+
+这是调用方等待上限，不是强制中断 SSH 库内部的阻塞调用；底层请求仍可能等待库/网络返回。服务器认证慢、PAM/登录脚本慢等原因尚未通过真实主机验证，不应把修复界面锁等待等同于修复所有服务器延迟。
+
+Windows x64 本轮验证：Mux 39（新增 3 项等待期间尺寸可访问、超时释放、正常结果/错误保留测试）、广播 12、GUI 61、存储 7，共 119 项通过，Release 构建成功。构建目录已迁至本机 `termviai-win`，使用 `termviai-build-20260924.cmd`；本地修复包为 `releases/ssh-connect-responsive-20261012`，仍使用 beta.2 版本字符串，未发布新 GitHub Release。
+
+本次只改 SSH 建连代码；工作树内已有的窗口缩放修改原样保留，Windows 快照中的这些修改与工作树一致并随本地包构建。未在真实 GUI/SSH 主机上自动复现；人工验收需覆盖慢连接时点 `+`、切换 Hosts、缩放、关闭 pane、超时后重连、密码认证和重连后广播。
 
 ## 用户行为
 
@@ -29,7 +41,7 @@
 - `wezterm-gui/src/termwindow/termviai_workspace.rs`：异步重连、并发保护和错误提示。
 - `wezterm-gui/src/termwindow/termviai_broadcast.rs`：断线输入与广播隔离；具体失败 pane/原因写日志，后续非空广播全部提交成功时清除旧错误栏。
 
-## 验证
+## 2026-09-18 重连验证记录
 
 Windows x64 Release 环境已通过：
 
