@@ -76,9 +76,17 @@ pub(crate) struct Exec {
 #[derive(Clone)]
 pub struct Session {
     tx: SessionSender,
+    // PTYs retain their own senders; only Session handles own this lifetime.
+    // Replacing a domain's cached handle must not close another handle that
+    // is still authenticating or about to request its first PTY.
+    _lifetime: Arc<SessionLifetime>,
 }
 
-impl Drop for Session {
+struct SessionLifetime {
+    tx: SessionSender,
+}
+
+impl Drop for SessionLifetime {
     fn drop(&mut self) {
         self.tx.try_send(SessionRequest::SessionDropped).ok();
         log::trace!("Drop Session");
@@ -86,6 +94,13 @@ impl Drop for Session {
 }
 
 impl Session {
+    fn from_sender(tx: SessionSender) -> Self {
+        Self {
+            _lifetime: Arc::new(SessionLifetime { tx: tx.clone() }),
+            tx,
+        }
+    }
+
     pub fn connect(config: ConfigMap) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
         let (tx_event, rx_event) = bounded(8);
         let (tx_req, rx_req) = bounded(8);
@@ -125,7 +140,7 @@ impl Session {
             keep_alive,
         };
         std::thread::spawn(move || inner.run());
-        Ok((Self { tx: session_sender }, rx_event))
+        Ok((Self::from_sender(session_sender), rx_event))
     }
 
     pub async fn request_pty(
@@ -195,4 +210,69 @@ pub struct ExecResult {
     pub stdout: FileDescriptor,
     pub stderr: FileDescriptor,
     pub child: SshChildProcess,
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use smol::channel::TryRecvError;
+
+    fn session() -> (Session, Receiver<SessionRequest>) {
+        let (tx, rx) = bounded(8);
+        let (pipe, _reader) = socketpair().unwrap();
+        (
+            Session::from_sender(SessionSender {
+                tx,
+                pipe: Arc::new(Mutex::new(pipe)),
+            }),
+            rx,
+        )
+    }
+
+    #[test]
+    fn dropping_a_cached_clone_keeps_authentication_session_alive() {
+        let (auth_session, requests) = session();
+        let cached = auth_session.clone();
+        drop(cached);
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        drop(auth_session);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(SessionRequest::SessionDropped)
+        ));
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Closed)));
+    }
+
+    #[test]
+    fn group_reconnect_cache_replacement_keeps_all_three_sessions_alive() {
+        let (first, first_requests) = session();
+        let (second, second_requests) = session();
+        let (third, third_requests) = session();
+        let mut cached = Some(first.clone());
+        cached.replace(second.clone());
+        cached.replace(third.clone());
+        for requests in [&first_requests, &second_requests, &third_requests] {
+            assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        }
+        drop(first);
+        drop(second);
+        assert!(matches!(
+            first_requests.try_recv(),
+            Ok(SessionRequest::SessionDropped)
+        ));
+        assert!(matches!(
+            second_requests.try_recv(),
+            Ok(SessionRequest::SessionDropped)
+        ));
+        drop(third);
+        assert!(matches!(
+            third_requests.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        drop(cached);
+        assert!(matches!(
+            third_requests.try_recv(),
+            Ok(SessionRequest::SessionDropped)
+        ));
+    }
 }

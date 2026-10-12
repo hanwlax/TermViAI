@@ -2,6 +2,16 @@
 
 更新时间：2026-10-12（Asia/Shanghai）
 
+## 2026-10-12 同主机整组重连时部分终端失败
+
+四终端组合中三个 pane 使用同一 SSH 主机，整组重连后前两个在认证成功后显示 `SSH session is dead`，最后一个成功。每个 pane 的显式重连都会创建独立传输并替换域缓存；原有 `Session::drop` 在任意克隆释放时发送 `SessionDropped`。后续 pane 替换缓存会使前一个尚未打开 PTY 的会话收到关闭通知，后台线程在没有 channel 时结束。
+
+修复为所有 `Session` 克隆共享一个引用计数生命周期，仅最后一个会话句柄释放时发送关闭通知。PTY/SFTP 的请求 sender 不参与该引用计数，继续保留既有的“会话释放后等待已有 channel 结束”行为。缓存替换不会再关闭仍由认证线程持有的连接；无需串行化整组重连或复用已经失效的传输。
+
+新增回归测试覆盖缓存克隆释放、三个同主机连接依次替换缓存、最后一个句柄释放后发送关闭通知；Windows CI 增加这些测试。真实四 pane SSH 场景仍需人工验收。
+
+Windows x64 验证通过：SSH 新增回归 2、mux 39、广播 12、GUI 61、存储 7，共 121 项；Release 构建成功。本地验证包为 `releases/ssh-group-reconnect-20261012.zip`，版本字符串仍为 beta.2，未发布新 GitHub Release。验收请使用原四终端组合，三个 pane 指向同一主机，断线后整组重连，检查三个远端 shell、历史与广播，并重复重连。
+
 ## 2026-10-12 SSH 建连等待导致界面卡死
 
 用户反馈连接停在服务器 `Authorized Only...` 提示后，点击顶栏 `+` 导致应用无响应。定位到认证完成后 `match block_on(session.request_pty(... *size.lock() ...))` 中的临时 MutexGuard：Rust 会把锁保留到整个 match 结束，GUI 对 Connecting pane 的 resize/get_size 因此等待远端 PTY/shell 创建请求。
