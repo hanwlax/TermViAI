@@ -661,13 +661,6 @@ impl WindowInner {
         .detach();
     }
 
-    fn set_title(&mut self, title: &str) {
-        let title = wide_string(title);
-        unsafe {
-            SetWindowTextW(self.hwnd.0, title.as_ptr());
-        }
-    }
-
     fn set_text_cursor_position(&mut self, cursor: Rect) {
         self.set_ime_window_position(cursor);
     }
@@ -873,10 +866,23 @@ impl WindowOps for Window {
 
     fn set_title(&self, title: &str) {
         let title = title.to_owned();
-        Connection::with_window_inner(self.0, move |inner| {
-            inner.set_title(&title);
-            Ok(())
-        });
+        let window = self.0;
+        promise::spawn::spawn_into_main_thread(async move {
+            // SetWindowText sends synchronous window messages. Do not hold
+            // WindowInner's mutable borrow across it: custom frame callbacks
+            // need to borrow the same object to retain our client-area rules.
+            if let Some(handle) = Connection::get()
+                .expect("Connection::init has not been called")
+                .get_window(window)
+            {
+                let hwnd = handle.borrow().hwnd;
+                let title = wide_string(&title);
+                unsafe {
+                    SetWindowTextW(hwnd.0, title.as_ptr());
+                }
+            }
+        })
+        .detach();
     }
 
     fn toggle_fullscreen(&self) {
@@ -1136,6 +1142,166 @@ fn no_native_title_bar(decorations: WindowDecorations) -> bool {
         || decorations.contains(WindowDecorations::INTEGRATED_BUTTONS)
 }
 
+fn custom_frame_client_rect(
+    mut rect: RECT,
+    frame_x: i32,
+    frame_y: i32,
+    padding: i32,
+    is_win10: bool,
+    is_maximized: bool,
+    work_area: Option<RECT>,
+) -> RECT {
+    rect.right -= frame_x + padding;
+    rect.left += frame_x + padding;
+    if is_win10 {
+        if is_maximized {
+            rect.top += frame_y + padding;
+            rect.bottom -= frame_y + padding - 2;
+        } else {
+            rect.top += 1;
+            rect.bottom -= frame_y - padding;
+        }
+    } else {
+        rect.bottom -= frame_y + padding;
+        if is_maximized {
+            rect.top += frame_y + padding;
+        }
+    }
+    if is_maximized {
+        if let Some(work) = work_area {
+            // Maximized outer frames may extend beyond the monitor. Our
+            // custom title bar is client content and must remain on-screen,
+            // including when the taskbar occupies the top or left edge.
+            rect.left = rect.left.max(work.left);
+            rect.top = rect.top.max(work.top);
+            rect.right = rect.right.min(work.right);
+            rect.bottom = rect.bottom.min(work.bottom);
+        }
+    }
+    rect
+}
+
+#[cfg(test)]
+mod termviai_frame_tests {
+    use super::*;
+
+    fn bounds(rect: RECT) -> (i32, i32, i32, i32) {
+        (rect.left, rect.top, rect.right, rect.bottom)
+    }
+
+    #[test]
+    fn maximized_title_bar_stays_inside_work_area_even_with_oversized_frame() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let outer = RECT {
+            left: -16,
+            top: -16,
+            right: 1936,
+            bottom: 1056,
+        };
+        for win10 in [true, false] {
+            let client = custom_frame_client_rect(outer, 4, 4, 4, win10, true, Some(work));
+            assert_eq!(bounds(client), bounds(work));
+        }
+    }
+
+    #[test]
+    fn maximized_client_respects_taskbar_edges_and_negative_monitor_coordinates() {
+        // A monitor to the left of the primary, with a taskbar at any edge.
+        for work in [
+            RECT {
+                left: -1920,
+                top: 0,
+                right: 0,
+                bottom: 1040,
+            },
+            RECT {
+                left: -1920,
+                top: 40,
+                right: 0,
+                bottom: 1080,
+            },
+            RECT {
+                left: -1880,
+                top: 0,
+                right: 0,
+                bottom: 1080,
+            },
+            RECT {
+                left: -1920,
+                top: 0,
+                right: -40,
+                bottom: 1080,
+            },
+        ] {
+            for dpi_frame in [8, 12, 16] {
+                let outer = RECT {
+                    left: work.left - dpi_frame,
+                    top: work.top - dpi_frame,
+                    right: work.right + dpi_frame,
+                    bottom: work.bottom + dpi_frame,
+                };
+                for win10 in [true, false] {
+                    let client = custom_frame_client_rect(
+                        outer,
+                        dpi_frame / 2,
+                        dpi_frame / 2,
+                        dpi_frame / 2,
+                        win10,
+                        true,
+                        Some(work),
+                    );
+                    assert_eq!(bounds(client), bounds(work));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normal_windows_keep_custom_title_bar_insets_and_can_extend_across_monitors() {
+        let outer = RECT {
+            left: -100,
+            top: -100,
+            right: 1000,
+            bottom: 800,
+        };
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        assert_eq!(
+            bounds(custom_frame_client_rect(
+                outer,
+                4,
+                4,
+                4,
+                false,
+                false,
+                Some(work)
+            )),
+            (-92, -100, 992, 792)
+        );
+        assert_eq!(
+            bounds(custom_frame_client_rect(
+                outer,
+                4,
+                4,
+                4,
+                true,
+                false,
+                Some(work)
+            )),
+            (-92, -99, 992, 800)
+        );
+    }
+}
+
 unsafe fn wm_nccalcsize(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     let inner = rc_from_hwnd(hwnd)?;
     let inner = match inner.try_borrow() {
@@ -1161,29 +1327,31 @@ unsafe fn wm_nccalcsize(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) 
 
         let params = (lparam as *mut NCCALCSIZE_PARAMS).as_mut().unwrap();
 
-        let requested_client_rect = &mut params.rgrc[0];
-
-        requested_client_rect.right -= frame_x + padding;
-        requested_client_rect.left += frame_x + padding;
-
-        let is_maximized = get_window_state(hwnd) == WindowState::MAXIMIZED;
-
-        // Handle bugged top window border on Windows 10
-        if *IS_WIN10 {
-            if is_maximized {
-                requested_client_rect.top += frame_y + padding;
-                requested_client_rect.bottom -= frame_y + padding - 2;
+        let is_maximized = IsZoomed(hwnd) != 0;
+        let work_area = if is_maximized {
+            let mut monitor: MONITORINFO = std::mem::zeroed();
+            monitor.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            ) != 0
+            {
+                Some(monitor.rcWork)
             } else {
-                requested_client_rect.top += 1;
-                requested_client_rect.bottom -= frame_y - padding;
+                None
             }
         } else {
-            requested_client_rect.bottom -= frame_y + padding;
-
-            if is_maximized {
-                requested_client_rect.top += frame_y + padding;
-            }
-        }
+            None
+        };
+        params.rgrc[0] = custom_frame_client_rect(
+            params.rgrc[0],
+            frame_x,
+            frame_y,
+            padding,
+            *IS_WIN10,
+            is_maximized,
+            work_area,
+        );
     }
 
     Some(0)
