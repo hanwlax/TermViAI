@@ -1,5 +1,7 @@
 # TermViAI 项目交接文档
 
+> 新会话入口（2026-09-24 核对）：[NEW_SESSION_HANDOVER.md](NEW_SESSION_HANDOVER.md)。包含实际仓库位置、未提交修改、远端 CI 更新、构建入口及发布完成证据。
+
 > 最新、精简且可执行的项目上下文见 [MEMORY.md](MEMORY.md)。后续工作应先读取该文件；下文保留完整历史记录。
 
 ## 2026-09-18 TermViAI v0.1.0-beta.2

@@ -1038,7 +1038,7 @@ def generate_actions(namer, jobber, trigger, is_continuous, is_tag=False):
         print(name)
         job, uploader = jobber(t)
 
-        file_name = f".github/workflows/gen_{name}.yml"
+        file_name = f"ci/upstream-workflows/gen_{name}.yml"
         if job.container:
             if t.app_image:
                 container = f"container:\n      image: {yv(job.container)}\n      options: --privileged"
@@ -1160,10 +1160,11 @@ on:
 
 
 def remove_gen_actions():
-    for name in glob.glob(".github/workflows/gen_*.yml"):
+    for name in glob.glob("ci/upstream-workflows/gen_*.yml"):
         os.remove(name)
 
 
+os.makedirs("ci/upstream-workflows", exist_ok=True)
 remove_gen_actions()
 generate_pr_actions()
 continuous_actions()

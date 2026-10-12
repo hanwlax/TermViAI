@@ -14,12 +14,19 @@ on:
       - "**/*.rs"
       - ".github/workflows/fmt.yml"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: fmt-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check-code-formatting:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
       - name: "Install Rust"
         uses: dtolnay/rust-toolchain@nightly
         with:

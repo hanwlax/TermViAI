@@ -1,0 +1,78 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/build.rs'
+      - '.cargo/**'
+      - '.gitmodules'
+      - 'deps/**'
+      - 'assets/**'
+      - '.github/workflows/windows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/build.rs'
+      - '.cargo/**'
+      - '.gitmodules'
+      - 'deps/**'
+      - 'assets/**'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: '0'
+      RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            termviai
+      - name: Configure Perl for native dependencies
+        run: Add-Content $env:GITHUB_PATH 'C:\Strawberry\perl\bin'
+      - name: Build Windows GUI
+        run: cargo build --locked --release -p wezterm-gui
+      - name: Test broadcast policy
+        run: cargo test --locked --release --manifest-path termviai/Cargo.toml
+      - name: Test mux
+        run: cargo test --locked --release -p mux -- --test-threads=1
+      - name: Test TermViAI GUI behavior
+        run: cargo test --locked --release -p wezterm-gui termviai_ -- --test-threads=1
+      - name: Upload GUI build
+        uses: actions/upload-artifact@v7
+        with:
+          name: TermViAI-windows-x86_64-build
+          path: target/release/wezterm-gui.exe
+          if-no-files-found: error
+          retention-days: 7

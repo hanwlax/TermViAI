@@ -38,7 +38,7 @@
 
 压缩包内包含 `TermViAI.exe`、`OpenConsole.exe`、`conpty.dll`、`libEGL.dll`、`libGLESv2.dll`、MIT 许可证、README、发布说明和各文件的 `SHA256SUMS.txt`。外部 `.zip.sha256` 与 ZIP 一起作为 Release 附件。
 
-发布操作最后须重新下载 GitHub 附件，验证下载 ZIP 与上述 SHA-256 相同，并检查包内校验清单。
+GitHub 附件回传验证已完成：下载 ZIP 与上述 SHA-256 相同，ZIP CRC 和包内 8 个文件校验全部通过。2026-09-24 再次确认 Release 非 draft、两个附件均上传完成，并核对本机 `verify-v0.1.0-beta.2/verification.json` 留存记录；本次文档整理未重复运行构建测试。
 
 ## 验证边界
 

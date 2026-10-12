@@ -44,6 +44,8 @@ cargo build --locked --release -p wezterm-gui
 
 The Cargo output is still named `wezterm-gui.exe` internally; official TermViAI release packages publish it as `TermViAI.exe` with TermViAI Windows product metadata.
 
+CI builds the Windows x86_64 GUI and runs broadcast policy, mux, and TermViAI GUI tests on relevant pushes and pull requests to `main`. Rust formatting is checked separately. Windows CI can also be started manually; scheduled upstream builds and publishing workflows are archived under [`ci/upstream-workflows`](ci/upstream-workflows).
+
 Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.2.md](docs/termviai/RELEASE_V0.1.0_BETA.2.md).
 
 ## Project origin and license
