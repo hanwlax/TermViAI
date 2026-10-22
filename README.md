@@ -4,13 +4,13 @@
 
 TermViAI combines WezTerm's terminal, SSH, PTY and GPU rendering foundations with a focused host library, multi-host tab groups and selective input broadcasting. The interface uses Catppuccin Mocha and JetBrainsMono Nerd Font Mono by default.
 
-> Current version: **v0.1.0-beta.3**. This beta targets Windows 10/11 x86_64.
+> Current version: **v0.1.0-beta.4**. This beta targets Windows 10/11 x86_64.
 
 ## Features
 
-- Local Hosts and Keychain management without an account.
+- Local Hosts and Keychain management, including reusable identities and passwords saved in Windows Credential Manager.
 - Multiple SSH hosts in one tab with proportional split layouts.
-- Drag terminal tabs and multi-host groups along the tab bar to reorder them.
+- Drag tabs along the tab bar, or drag pane headers to reorder terminals within a group.
 - Whole-group and per-terminal broadcast controls.
 - Saved SSH tab groups and recent connections.
 - In-place SSH reconnect with scrollback preserved, including whole-group reconnect.
@@ -21,15 +21,15 @@ TermViAI combines WezTerm's terminal, SSH, PTY and GPU rendering foundations wit
 
 ## Download
 
-Download **TermViAI-v0.1.0-beta.3-windows-x86_64.zip** from the [v0.1.0-beta.3 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.3), extract it, and run `TermViAI.exe`.
+Download **TermViAI-v0.1.0-beta.4-windows-x86_64.zip** from the [v0.1.0-beta.4 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.4), extract it, and run `TermViAI.exe`.
 
 This is a portable beta build. Keep `OpenConsole.exe`, `conpty.dll`, `libEGL.dll` and `libGLESv2.dll` beside the executable.
 
 ## Basic use
 
 1. Open **Hosts** and select **Add Host**.
-2. Enter the SSH address, port, username and optional private key.
-3. Open a host, then add more hosts to the same tab from the terminal controls.
+2. Enter the SSH address, port and username; enter a password or select an identity/key from Keychain. Enable **Remember password** to save it for later sessions.
+3. Open hosts in separate tabs, then drag a tab into another terminal to combine them.
 4. Use the tab broadcast control for the whole group, or choose individual terminals from pane headers and the bottom toolbar.
 5. Press `Ctrl+S` to save a multi-host tab group.
 
@@ -45,9 +45,9 @@ cargo build --locked --release -p wezterm-gui
 
 The Cargo output is still named `wezterm-gui.exe` internally; official TermViAI release packages publish it as `TermViAI.exe` with TermViAI Windows product metadata.
 
-CI builds the Windows x86_64 GUI and runs broadcast policy, mux, and TermViAI GUI tests on relevant pushes and pull requests to `main`. Rust formatting is checked separately. Windows CI can also be started manually; scheduled upstream builds and publishing workflows are archived under [`ci/upstream-workflows`](ci/upstream-workflows).
+CI builds the Windows x86_64 GUI and runs broadcast policy, SSH, window, mux, and GUI tests on relevant pushes and pull requests to `main`. Rust formatting is checked separately. Windows CI can also be started manually; scheduled upstream builds and publishing workflows are archived under [`ci/upstream-workflows`](ci/upstream-workflows).
 
-Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.3.md](docs/termviai/RELEASE_V0.1.0_BETA.3.md).
+Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.4.md](docs/termviai/RELEASE_V0.1.0_BETA.4.md).
 
 ## Project origin and license
 

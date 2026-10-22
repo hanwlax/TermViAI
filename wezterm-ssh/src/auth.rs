@@ -131,6 +131,12 @@ impl crate::sessioninner::SessionInner {
     #[cfg(feature = "libssh-rs")]
     pub fn authenticate_libssh(&mut self, sess: &libssh_rs::Session) -> anyhow::Result<()> {
         use std::collections::HashMap;
+        let mut saved_password = self
+            .config
+            .get("termviai_credential")
+            .map(|id| crate::credentials::load(id))
+            .transpose()?
+            .flatten();
         let tx = self.tx_event.clone();
 
         // Set the callback for pubkey auth
@@ -164,6 +170,18 @@ impl crate::sessioninner::SessionInner {
 
         loop {
             let auth_methods = sess.userauth_list(None)?;
+            // Try a supplied password once. Rejection falls through to the normal
+            // interactive prompt; never replay it for key passphrases or OTPs.
+            if auth_methods.contains(AuthMethods::PASSWORD) {
+                if let Some(password) = saved_password.take() {
+                    match sess.userauth_password(None, Some(&password))? {
+                        AuthStatus::Success => return Ok(()),
+                        AuthStatus::Partial => continue,
+                        _ => {}
+                    }
+                }
+            }
+
             let mut status_by_method = HashMap::new();
 
             if auth_methods.contains(AuthMethods::PUBLIC_KEY) {
@@ -182,6 +200,14 @@ impl crate::sessioninner::SessionInner {
                         AuthStatus::Success => return Ok(()),
                         AuthStatus::Info => {
                             let info = sess.userauth_keyboard_interactive_info()?;
+                            if info.prompts.len() == 1
+                                && is_password_prompt(&info.prompts[0].prompt, info.prompts[0].echo)
+                            {
+                                if let Some(password) = saved_password.take() {
+                                    sess.userauth_keyboard_interactive_set_answers(&[password])?;
+                                    continue;
+                                }
+                            }
 
                             let (reply, answers) = bounded(1);
                             self.tx_event
@@ -261,6 +287,12 @@ impl crate::sessioninner::SessionInner {
     ) -> anyhow::Result<()> {
         use std::collections::HashSet;
 
+        let mut saved_password = self
+            .config
+            .get("termviai_credential")
+            .map(|id| crate::credentials::load(id))
+            .transpose()?
+            .flatten();
         loop {
             if sess.authenticated() {
                 return Ok(());
@@ -272,6 +304,13 @@ impl crate::sessioninner::SessionInner {
             let methods: HashSet<&str> = sess.auth_methods(&user)?.split(',').collect();
             log::trace!("ssh auth methods: {:?}", methods);
 
+            if !sess.authenticated() && methods.contains("password") {
+                if let Some(password) = saved_password.take() {
+                    if sess.userauth_password(user, &password).is_ok() {
+                        continue;
+                    }
+                }
+            }
             if !sess.authenticated() && methods.contains("publickey") {
                 if self.agent_auth(sess, user)? {
                     continue;
@@ -311,6 +350,7 @@ impl crate::sessioninner::SessionInner {
             if !sess.authenticated() && methods.contains("keyboard-interactive") {
                 struct Helper<'a> {
                     tx_event: &'a Sender<SessionEvent>,
+                    saved_password: &'a mut Option<String>,
                 }
 
                 impl<'a> ssh2::KeyboardInteractivePrompt for Helper<'a> {
@@ -320,6 +360,13 @@ impl crate::sessioninner::SessionInner {
                         instructions: &str,
                         prompts: &[ssh2::Prompt<'b>],
                     ) -> Vec<String> {
+                        if prompts.len() == 1
+                            && is_password_prompt(&prompts[0].text, prompts[0].echo)
+                        {
+                            if let Some(password) = self.saved_password.take() {
+                                return vec![password];
+                            }
+                        }
                         let (reply, answers) = bounded(1);
                         if let Err(err) = self.tx_event.try_send(SessionEvent::Authenticate(
                             AuthenticationEvent {
@@ -354,6 +401,7 @@ impl crate::sessioninner::SessionInner {
 
                 let mut helper = Helper {
                     tx_event: &self.tx_event,
+                    saved_password: &mut saved_password,
                 };
 
                 if let Err(err) = sess.userauth_keyboard_interactive(user, &mut helper) {
@@ -361,5 +409,31 @@ impl crate::sessioninner::SessionInner {
                 }
             }
         }
+    }
+}
+
+fn is_password_prompt(prompt: &str, echo: bool) -> bool {
+    !echo
+        && matches!(
+            prompt.trim().to_ascii_lowercase().as_str(),
+            "password:" | "password"
+        )
+}
+
+#[cfg(test)]
+mod saved_password_tests {
+    #[test]
+    fn only_plain_password_challenges_are_eligible() {
+        assert!(super::is_password_prompt(" Password: ", false));
+        for prompt in [
+            "OTP:",
+            "Verification code:",
+            "New password:",
+            "Passphrase:",
+            "Password and OTP:",
+        ] {
+            assert!(!super::is_password_prompt(prompt, false));
+        }
+        assert!(!super::is_password_prompt("Password:", true));
     }
 }

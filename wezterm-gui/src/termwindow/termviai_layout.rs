@@ -568,8 +568,7 @@ mod tests {
         assert_eq!(canvas_bottom - collapsed_bottom, PANE_GUTTER);
 
         let expanded_bottom = workspace_frame_bottom(canvas_bottom, 1.);
-        let surface_top =
-            canvas_bottom - BROADCAST_TRAY_HEIGHT + BROADCAST_SURFACE_TOP_INSET;
+        let surface_top = canvas_bottom - BROADCAST_TRAY_HEIGHT + BROADCAST_SURFACE_TOP_INSET;
         assert_eq!(surface_top - expanded_bottom, PANE_GUTTER);
     }
 }

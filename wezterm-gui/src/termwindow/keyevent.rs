@@ -402,7 +402,9 @@ impl super::TermWindow {
                                 pane.key_down(term_key, tw_raw_modifiers)
                             })
                         } else {
-                            self.termviai_send_input(&pane, || pane.key_up(term_key, tw_raw_modifiers))
+                            self.termviai_send_input(&pane, || {
+                                pane.key_up(term_key, tw_raw_modifiers)
+                            })
                         }
                         .is_ok();
                     };

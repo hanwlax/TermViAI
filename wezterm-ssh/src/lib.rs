@@ -4,6 +4,7 @@ compile_error!("Either libssh-rs or ssh2 must be enabled!");
 mod auth;
 mod channelwrap;
 mod config;
+pub mod credentials;
 mod dirwrap;
 mod filewrap;
 mod host;

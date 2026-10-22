@@ -1376,7 +1376,9 @@ mod reconnect_tests {
                 "test",
                 Box::new(Vec::<u8>::new()),
             );
-            terminal.advance_bytes("saved\x1b7\r\nhistory one\r\nhistory two\r\nhistory three\r\nold prompt");
+            terminal.advance_bytes(
+                "saved\x1b7\r\nhistory one\r\nhistory two\r\nhistory three\r\nold prompt",
+            );
             if alternate_screen {
                 terminal.advance_bytes("\x1b[?1049hfull screen program");
             }
@@ -1391,7 +1393,11 @@ mod reconnect_tests {
                 .join("\n");
             assert!(!terminal.is_alt_screen_active());
             for expected in [
-                "history one", "history two", "history three", "old prompt", "new prompt",
+                "history one",
+                "history two",
+                "history three",
+                "old prompt",
+                "new prompt",
             ] {
                 assert!(text.contains(expected), "missing {expected}: {text}");
             }

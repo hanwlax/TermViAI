@@ -1747,7 +1747,9 @@ pub fn default_hyperlink_rules() -> Vec<hyperlink::Rule> {
 }
 
 fn default_harfbuzz_features() -> Vec<String> {
-    ["kern", "liga", "clig"]
+    // Keep terminal punctuation literal (e.g. JetBrains Mono's ]# ligature).
+    // Explicit user/font features can still opt into programming ligatures.
+    ["kern", "liga=0", "clig=0", "calt=0"]
         .iter()
         .map(|&s| s.to_string())
         .collect()
@@ -1762,9 +1764,11 @@ fn default_font_size() -> f64 {
 }
 
 fn default_termviai_font() -> TextStyle {
+    let mut font = crate::font::FontAttributes::new("JetBrainsMono NFM");
+    font.weight = crate::font::FontWeight::MEDIUM;
     TextStyle {
         // Windows registers JetBrainsMono Nerd Font Mono with this family name.
-        font: vec![crate::font::FontAttributes::new("JetBrainsMono NFM")],
+        font: vec![font],
         foreground: None,
     }
 }

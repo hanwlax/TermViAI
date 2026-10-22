@@ -22,6 +22,73 @@ use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
 use std::time::{Duration, Instant};
 
+const MAX_IDLE_POLL_WAIT: Duration = Duration::from_secs(30);
+
+fn ssh_poll_timeout(
+    backoff: Duration,
+    keep_alive: Option<Duration>,
+    since_keep_alive: Duration,
+) -> Duration {
+    let bounded = backoff.min(MAX_IDLE_POLL_WAIT);
+    match keep_alive {
+        Some(interval) => bounded.min(interval.saturating_sub(since_keep_alive)),
+        None => bounded,
+    }
+}
+
+#[cfg(test)]
+mod keepalive_poll_tests {
+    use super::*;
+
+    #[test]
+    fn idle_sessions_send_keepalives_on_schedule_without_incoming_events() {
+        // Virtual time avoids waiting for hours or contacting real SSH hosts.
+        // All four sessions are idle; they have independent loop phases.
+        for interval in [1, 30, 120] {
+            let interval = Duration::from_secs(interval);
+            for phase in [0, 100, 500, 900] {
+                let mut now = Duration::from_millis(phase);
+                let mut last = Duration::ZERO;
+                let mut backoff = Duration::from_millis(100);
+                let mut sent = 0;
+                while sent < 100 {
+                    if now - last >= interval {
+                        assert!(now - last <= interval, "missed the keepalive deadline");
+                        last = now;
+                        sent += 1;
+                    }
+                    now += ssh_poll_timeout(backoff, Some(interval), now - last);
+                    backoff = backoff.saturating_mul(2).min(MAX_IDLE_POLL_WAIT);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overdue_and_disabled_keepalives_have_bounded_poll_waits() {
+        assert_eq!(
+            ssh_poll_timeout(
+                Duration::MAX,
+                Some(Duration::from_secs(30)),
+                Duration::from_secs(31)
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            ssh_poll_timeout(Duration::MAX, None, Duration::MAX),
+            MAX_IDLE_POLL_WAIT
+        );
+        assert_eq!(
+            ssh_poll_timeout(
+                Duration::from_millis(100),
+                Some(Duration::from_secs(30)),
+                Duration::ZERO
+            ),
+            Duration::from_millis(100)
+        );
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DescriptorState {
     pub fd: Option<FileDescriptor>,
@@ -63,6 +130,16 @@ impl Drop for SessionInner {
 impl SessionInner {
     pub fn run(&mut self) {
         if let Err(err) = self.run_impl() {
+            // Authentication's event receiver is gone after the PTY opens.
+            // Preserve transport errors in the application log as well.
+            log::warn!(
+                "SSH transport to {}:{} stopped: {err:#}",
+                self.config
+                    .get("hostname")
+                    .map(String::as_str)
+                    .unwrap_or("unknown"),
+                self.config.get("port").map(String::as_str).unwrap_or("22"),
+            );
             self.tx_event
                 .try_send(SessionEvent::Error(format!("{:#}", err)))
                 .ok();
@@ -434,7 +511,12 @@ impl SessionInner {
                         let ignore_me = [0x42; 128];
                         if let Err(err) = sess.sess.send_ignore(&ignore_me) {
                             log::warn!(
-                                "Error sending IGNORE packet: {err:#}. Is peer disconnected?"
+                                "Error sending SSH keepalive to {}:{}: {err:#}",
+                                self.config
+                                    .get("hostname")
+                                    .map(String::as_str)
+                                    .unwrap_or("unknown"),
+                                self.config.get("port").map(String::as_str).unwrap_or("22"),
                             );
                         }
                     }
@@ -446,6 +528,14 @@ impl SessionInner {
 
     fn request_loop(&mut self, sess: &mut SessionWrap) -> anyhow::Result<()> {
         let mut sleep_delay = Duration::from_millis(100);
+        // Only libssh currently schedules IGNORE packets in do_keepalive.
+        // Applying that deadline to ssh2 would spin once it expired.
+        let scheduled_keepalive = match &*sess {
+            #[cfg(feature = "ssh2")]
+            SessionWrap::Ssh2(_) => None,
+            #[cfg(feature = "libssh-rs")]
+            SessionWrap::LibSsh(_) => self.keep_alive,
+        };
 
         loop {
             self.do_keepalive(sess)?;
@@ -494,8 +584,15 @@ impl SessionInner {
                 }
             }
 
-            poll(&mut poll_array, Some(sleep_delay)).context("poll")?;
-            sleep_delay += sleep_delay;
+            // Outgoing IGNORE packets do not require the server to reply.
+            // An idle socket may never wake poll, so enforce our own deadline.
+            let timeout = ssh_poll_timeout(
+                sleep_delay,
+                scheduled_keepalive,
+                self.last_keep_alive.elapsed(),
+            );
+            poll(&mut poll_array, Some(timeout)).context("poll")?;
+            sleep_delay = sleep_delay.saturating_mul(2).min(MAX_IDLE_POLL_WAIT);
 
             for (idx, poll) in poll_array.iter().enumerate() {
                 if poll.revents != 0 {
@@ -596,6 +693,18 @@ impl SessionInner {
                     Ok(_) => {}
                     Err(err) => {
                         if out.buf.is_empty() {
+                            if !chan.exited {
+                                log::info!(
+                                    "SSH stream closed on {}:{} channel {} stream {}: {err:#}",
+                                    self.config
+                                        .get("hostname")
+                                        .map(String::as_str)
+                                        .unwrap_or("unknown"),
+                                    self.config.get("port").map(String::as_str).unwrap_or("22"),
+                                    id,
+                                    idx,
+                                );
+                            }
                             log::trace!(
                                 "Failed to read data from channel {} stream {}: {:#}, closing pipe",
                                 id,

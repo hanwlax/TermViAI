@@ -12,6 +12,7 @@ pub enum Icon {
     Menu,
     Hosts,
     Key,
+    Identity,
     Terminal,
     Search,
     Plus,
@@ -40,6 +41,7 @@ pub enum Icon {
     Link,
     Power,
     Refresh,
+    Alert,
 }
 
 impl Icon {
@@ -62,6 +64,7 @@ impl Icon {
             Self::Menu => MENU,
             Self::Hosts => HOSTS,
             Self::Key => KEY,
+            Self::Identity => IDENTITY,
             Self::Terminal => TERMINAL,
             Self::Search => SEARCH,
             Self::Plus => PLUS,
@@ -81,6 +84,7 @@ impl Icon {
             Self::Checkbox => CHECKBOX,
             Self::CheckboxChecked => CHECKBOX_CHECKED,
             Self::Broadcast => BROADCAST,
+            Self::Alert => ALERT,
             Self::SplitRight => SPLIT_RIGHT,
             Self::SplitDown => SPLIT_DOWN,
             Self::ArrowLeft => ARROW_LEFT,
@@ -193,6 +197,27 @@ const HOSTS: &[Poly] = &[
     fill(&[circle(7, 7, 1), circle(7, 17, 1)]),
 ];
 
+const IDENTITY: &[Poly] = &[outline(&[
+    m(5, 4),
+    l(19, 4),
+    q(22, 4, 22, 7),
+    l(22, 17),
+    q(22, 20, 19, 20),
+    l(5, 20),
+    q(2, 20, 2, 17),
+    l(2, 7),
+    q(2, 4, 5, 4),
+    PolyCommand::Close,
+    circle(8, 9, 2),
+    m(5, 16),
+    q(5, 12, 8, 12),
+    q(11, 12, 11, 16),
+    m(15, 9),
+    l(19, 9),
+    m(15, 14),
+    l(19, 14),
+])];
+
 const KEY: &[Poly] = &[outline(&[
     circle(8, 8, 5),
     m(12, 12),
@@ -262,27 +287,22 @@ const RESTORE: &[Poly] = &[outline(&[
     PolyCommand::Close,
 ])];
 
+// One rounded frame with restrained dividers reads cleanly at 16 px.
 const GRID: &[Poly] = &[outline(&[
-    m(4, 4),
-    l(10, 4),
-    l(10, 10),
-    l(4, 10),
+    m(6, 4),
+    l(18, 4),
+    q(20, 4, 20, 6),
+    l(20, 18),
+    q(20, 20, 18, 20),
+    l(6, 20),
+    q(4, 20, 4, 18),
+    l(4, 6),
+    q(4, 4, 6, 4),
     PolyCommand::Close,
-    m(14, 4),
-    l(20, 4),
-    l(20, 10),
-    l(14, 10),
-    PolyCommand::Close,
-    m(4, 14),
-    l(10, 14),
-    l(10, 20),
-    l(4, 20),
-    PolyCommand::Close,
-    m(14, 14),
-    l(20, 14),
-    l(20, 20),
-    l(14, 20),
-    PolyCommand::Close,
+    m(12, 4),
+    l(12, 20),
+    m(4, 12),
+    l(20, 12),
 ])];
 const LIST: &[Poly] = &[
     outline(&[m(9, 6), l(21, 6), m(9, 12), l(21, 12), m(9, 18), l(21, 18)]),
@@ -319,25 +339,21 @@ const CHECK: &[Poly] = &[outline(&[m(4, 12), l(9, 17), l(20, 6)])];
 const CHECKBOX: &[Poly] = &[FRAME];
 const CHECKBOX_CHECKED: &[Poly] = &[FRAME, TICK];
 
+// Balanced signal arcs; no antenna pedestal or dense intersecting strokes.
 const BROADCAST: &[Poly] = &[
     outline(&[
-        m(5, 4),
-        q(1, 8, 2, 13),
-        q(2, 16, 5, 19),
-        m(19, 4),
-        q(23, 8, 22, 13),
-        q(22, 16, 19, 19),
-        m(8, 7),
-        q(4, 11, 8, 15),
-        m(16, 7),
-        q(20, 11, 16, 15),
-        m(12, 14),
-        l(12, 21),
-        m(8, 21),
-        l(16, 21),
+        m(5, 5),
+        q(0, 12, 5, 19),
+        m(19, 5),
+        q(24, 12, 19, 19),
+        m(8, 8),
+        q(5, 12, 8, 16),
+        m(16, 8),
+        q(19, 12, 16, 16),
     ]),
-    fill(&[circle(12, 11, 2)]),
+    fill(&[circle(12, 12, 2)]),
 ];
+const ALERT: &[Poly] = &[outline(&[m(12, 5), l(12, 13)]), fill(&[circle(12, 18, 1)])];
 
 const SPLIT_RIGHT: &[Poly] = &[FRAME, outline(&[m(12, 4), l(12, 20)])];
 const SPLIT_DOWN: &[Poly] = &[FRAME, outline(&[m(4, 12), l(20, 12)])];
@@ -402,6 +418,7 @@ mod tests {
         Icon::Menu,
         Icon::Hosts,
         Icon::Key,
+        Icon::Identity,
         Icon::Terminal,
         Icon::Search,
         Icon::Plus,
@@ -430,6 +447,7 @@ mod tests {
         Icon::Link,
         Icon::Power,
         Icon::Refresh,
+        Icon::Alert,
     ];
 
     fn value(coord: BlockCoord) -> f32 {

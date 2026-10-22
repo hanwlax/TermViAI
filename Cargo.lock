@@ -7109,7 +7109,7 @@ dependencies = [
 
 [[package]]
 name = "wezterm-gui"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 dependencies = [
  "anyhow",
  "benchmarking",
@@ -7310,6 +7310,7 @@ dependencies = [
  "thiserror 1.0.69",
  "wezterm-uds",
  "whoami",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

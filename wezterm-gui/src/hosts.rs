@@ -13,6 +13,10 @@ pub struct Host {
     pub username: String,
     pub group: String,
     pub identity_file: String,
+    pub identity_id: String,
+    pub credential_id: String,
+    // An opaque session reference may be persisted; its password only lives in memory.
+    pub session_credential: String,
 }
 
 impl Host {
@@ -65,6 +69,31 @@ impl Host {
         }
         if !self.identity_file.is_empty() && !Path::new(&self.identity_file).is_file() {
             bail!("The private key file does not exist on this computer.");
+        }
+        Ok(())
+    }
+
+    pub fn credential_ref(&self) -> &str {
+        if !self.session_credential.is_empty() {
+            &self.session_credential
+        } else {
+            &self.credential_id
+        }
+    }
+
+    pub fn resolve_identity(&mut self, store: &HostStore) -> anyhow::Result<()> {
+        if !self.identity_id.is_empty() {
+            let identity = store
+                .identities
+                .iter()
+                .find(|i| i.id == self.identity_id)
+                .context(
+                "This identity is no longer in Keychain. Edit the host to choose authentication.",
+            )?;
+            self.username = identity.username.clone();
+            self.credential_id = identity.id.clone();
+            self.session_credential.clear();
+            self.identity_file.clear();
         }
         Ok(())
     }
@@ -129,14 +158,45 @@ pub struct KeyFile {
     pub path: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Identity {
+    pub id: String,
+    pub label: String,
+    pub username: String,
+}
+
+pub fn new_credential_id() -> String {
+    format!("{:032x}", fastrand::u128(..))
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostStore {
     pub hosts: Vec<Host>,
     pub keys: Vec<KeyFile>,
+    pub identities: Vec<Identity>,
 }
 
 impl HostStore {
+    /// Duplicate against a freshly loaded library, preserving all connection fields.
+    pub fn duplicate_host(&mut self, original: &Host) -> anyhow::Result<Host> {
+        anyhow::ensure!(
+            self.hosts.contains(original),
+            "This host changed. Reopen its menu and try again."
+        );
+        let mut copy = original.clone();
+        let base = format!("{}-copy", original.label);
+        copy.label = base.clone();
+        let mut suffix = 2;
+        while self.hosts.iter().any(|host| host.label == copy.label) {
+            copy.label = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        self.hosts.push(copy.clone());
+        Ok(copy)
+    }
+
     pub fn path() -> PathBuf {
         std::env::var_os("TERMVIAI_DATA_DIR")
             .map(PathBuf::from)
@@ -146,7 +206,7 @@ impl HostStore {
     pub fn load() -> anyhow::Result<Self> {
         Self::load_from(&Self::path())
     }
-    fn load_from(path: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn load_from(path: &Path) -> anyhow::Result<Self> {
         match std::fs::File::open(path) {
             Ok(f) => serde_json::from_reader(f)
                 .context("Could not read the local host library. The file has been preserved."),
@@ -157,7 +217,7 @@ impl HostStore {
     pub fn save(&self) -> anyhow::Result<()> {
         self.save_to(&Self::path())
     }
-    fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+    pub(crate) fn save_to(&self, path: &Path) -> anyhow::Result<()> {
         let dir = path.parent().context("Missing library directory")?;
         std::fs::create_dir_all(dir)?;
         let mut file = tempfile::NamedTempFile::new_in(dir)?;
@@ -174,6 +234,69 @@ impl HostStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_libraries_and_identity_references_round_trip_without_passwords() {
+        let mut store: HostStore = serde_json::from_str(
+            r#"{"hosts":[{"label":"old","address":"example.org","port":22}],"keys":[]}"#,
+        )
+        .unwrap();
+        assert!(store.identities.is_empty());
+        assert!(store.hosts[0].credential_ref().is_empty());
+        store.identities.push(Identity {
+            id: "opaque-ref".into(),
+            label: "Operations".into(),
+            username: "deploy".into(),
+        });
+        store.hosts[0].identity_id = "opaque-ref".into();
+        let mut host = store.hosts[0].clone();
+        host.resolve_identity(&store).unwrap();
+        assert_eq!(host.username, "deploy");
+        assert_eq!(host.credential_ref(), "opaque-ref");
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(!json.contains("password"));
+        assert_eq!(
+            serde_json::from_str::<HostStore>(&json).unwrap().identities,
+            store.identities
+        );
+        host.identity_id = "missing".into();
+        assert!(host.resolve_identity(&store).is_err());
+    }
+
+    #[test]
+    fn duplicate_preserves_connection_fields_and_avoids_label_collisions() {
+        let original = Host {
+            label: "开发".into(),
+            address: "192.0.2.1".into(),
+            port: 2222,
+            username: "alice".into(),
+            group: "Production".into(),
+            identity_file: "C:/keys/id_ed25519".into(),
+            ..Default::default()
+        };
+        let mut store = HostStore {
+            hosts: vec![original.clone()],
+            ..Default::default()
+        };
+        let copy = store.duplicate_host(&original).unwrap();
+        assert_eq!(copy.label, "开发-copy");
+        let mut expected = original.clone();
+        expected.label = copy.label.clone();
+        assert_eq!(copy, expected);
+        assert_eq!(
+            store.duplicate_host(&original).unwrap().label,
+            "开发-copy-2"
+        );
+        assert_eq!(store.hosts[0], original);
+        let path = tempfile::tempdir().unwrap();
+        store.save_to(&path.path().join("hosts.json")).unwrap();
+        let loaded = HostStore::load_from(&path.path().join("hosts.json")).unwrap();
+        assert_eq!(loaded.hosts, store.hosts);
+        let mut stale = original;
+        stale.port = 22;
+        assert!(store.duplicate_host(&stale).is_err());
+        assert_eq!(store.hosts.len(), 3);
+    }
+
     #[test]
     fn ssh_addresses() {
         let host = Host::quick_connect("ssh alice@[2001:db8::1]:2200").unwrap();

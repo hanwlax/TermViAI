@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - 'VERSION'
       - '**/*.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
@@ -16,6 +17,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - 'VERSION'
       - '**/*.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
@@ -65,14 +67,14 @@ jobs:
         run: cargo build --locked --release -p wezterm-gui
       - name: Test broadcast policy
         run: cargo test --locked --release --manifest-path termviai/Cargo.toml
-      - name: Test SSH session lifetime
-        run: cargo test --locked --release -p wezterm-ssh lifetime_tests -- --test-threads=1
+      - name: Test SSH library
+        run: cargo test --locked --release -p wezterm-ssh --lib -- --test-threads=1
       - name: Test maximized custom frame
         run: cargo test --locked --release -p window termviai_frame_tests -- --test-threads=1
       - name: Test mux
         run: cargo test --locked --release -p mux -- --test-threads=1
       - name: Test TermViAI GUI behavior
-        run: cargo test --locked --release -p wezterm-gui termviai_ -- --test-threads=1
+        run: cargo test --locked --release -p wezterm-gui -- --test-threads=1
       - name: Upload GUI build
         uses: actions/upload-artifact@v7
         with:

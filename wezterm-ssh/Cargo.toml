@@ -55,3 +55,6 @@ rstest.workspace = true
 shell-words.workspace = true
 termwiz.workspace = true
 whoami.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security_Credentials", "Win32_Foundation"] }

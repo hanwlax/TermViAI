@@ -28,23 +28,23 @@ pub(super) struct WorkspaceUi {
 
 pub(super) fn group_needs_reconnect(states: impl IntoIterator<Item = bool>) -> bool {
     let mut count = 0;
+    let mut any_disconnected = false;
     for disconnected in states {
-        if !disconnected {
-            return false;
-        }
         count += 1;
+        any_disconnected |= disconnected;
     }
-    count > 1
+    count > 1 && any_disconnected
 }
 
 fn domain_name(host: &Host, ssh_keepalive_interval: u64) -> String {
     format!(
-        "termviai:{}:{}:{}:{}:keepalive={}",
+        "termviai:{}:{}:{}:{}:keepalive={}:auth={}",
         host.username,
         host.endpoint(),
         host.identity_file,
         host.label,
-        ssh_keepalive_interval
+        ssh_keepalive_interval,
+        host.credential_ref()
     )
 }
 
@@ -64,6 +64,11 @@ fn ssh_domain(host: &Host, ssh_keepalive_interval: u64) -> SshDomain {
         domain
             .ssh_option
             .insert("identityfile".into(), host.identity_file.clone());
+    }
+    if !host.credential_ref().is_empty() {
+        domain
+            .ssh_option
+            .insert("termviai_credential".into(), host.credential_ref().into());
     }
     domain
 }
@@ -139,11 +144,12 @@ impl TermWindow {
                     .iter()
                     .filter_map(|positioned| {
                         let pane = &positioned.pane;
-                        (pane.downcast_ref::<LocalPane>()
+                        (pane
+                            .downcast_ref::<LocalPane>()
                             .is_some_and(LocalPane::is_reconnectable_ssh)
-                            && mux.resolve_pane_id(pane.pane_id()).is_some_and(
-                                |(_, window, _)| window == self.mux_window_id,
-                            ))
+                            && mux
+                                .resolve_pane_id(pane.pane_id())
+                                .is_some_and(|(_, window, _)| window == self.mux_window_id))
                         .then_some(pane.pane_id())
                     })
                     .collect::<Vec<_>>()
@@ -159,6 +165,7 @@ impl TermWindow {
             return;
         }
         self.termviai_ui.workspace.reconnect_errors.remove(&pane_id);
+        self.termviai_broadcast.pane_errors.remove(&pane_id);
         if let Err(error) = self.termviai_start_reconnect(pane_id) {
             self.termviai_ui
                 .workspace
@@ -219,10 +226,10 @@ impl TermWindow {
                 // Scope failures to the pane, never to the Hosts/New Tab UI.
                 if let Err(error) = result {
                     if Mux::get().get_pane(pane_id).is_some() {
-                        tw.termviai_ui.workspace.reconnect_errors.insert(
-                            pane_id,
-                            format!("Reconnect failed: {error:#}"),
-                        );
+                        tw.termviai_ui
+                            .workspace
+                            .reconnect_errors
+                            .insert(pane_id, format!("Reconnect failed: {error:#}"));
                     }
                 }
                 tw.termviai_sync_broadcast();
@@ -296,7 +303,11 @@ impl TermWindow {
             "The tab moved to another window."
         );
         let name = self.termviai_tab_label(&tab);
-        let layout = snapshot(tab.codec_pane_tree(), &self.termviai_ui.workspace.hosts, &mux)?;
+        let layout = snapshot(
+            tab.codec_pane_tree(),
+            &self.termviai_ui.workspace.hosts,
+            &mux,
+        )?;
         let previous = self.termviai_ui.workspace.saved_ids.get(&tab_id).cloned();
         let id = self
             .termviai_ui
@@ -343,6 +354,20 @@ impl TermWindow {
             !self.termviai_ui.connecting,
             "An SSH connection is still opening."
         );
+        fn resolve(
+            layout: &mut SavedLayout,
+            store: &crate::hosts::HostStore,
+        ) -> anyhow::Result<()> {
+            match layout {
+                SavedLayout::Pane { host } => host.resolve_identity(store),
+                SavedLayout::Split { first, second, .. } => {
+                    resolve(first, store)?;
+                    resolve(second, store)
+                }
+            }
+        }
+        let mut layout = layout;
+        resolve(&mut layout, &crate::hosts::HostStore::load()?)?;
         let mux = Mux::get();
         let ssh_keepalive_interval = self.termviai_ssh_keepalive_interval();
         for host in layout.hosts() {
@@ -388,10 +413,8 @@ impl TermWindow {
                     .context("No hosts in workspace")?
                     .to_owned()
                     .clone();
-                let domain = SpawnTabDomain::DomainName(domain_name(
-                    &first,
-                    ssh_keepalive_interval,
-                ));
+                let domain =
+                    SpawnTabDomain::DomainName(domain_name(&first, ssh_keepalive_interval));
                 let (tab_id, root_pane) = if let Some((tab_id, pane_id, vertical)) = split {
                     let (pane, _) = mux
                         .split_pane(
@@ -545,6 +568,7 @@ mod keepalive_tests {
             username: "alice".into(),
             group: String::new(),
             identity_file: "key.pem".into(),
+            ..Default::default()
         };
         let enabled = ssh_domain(&host, 30);
         assert_eq!(enabled.ssh_option["serveraliveinterval"], "30");
@@ -559,11 +583,12 @@ mod keepalive_tests {
 mod tests {
     use super::*;
     #[test]
-    fn group_reconnect_requires_every_session_to_be_disconnected() {
+    fn group_reconnect_is_available_for_any_offline_member() {
         assert!(!group_needs_reconnect([]));
         assert!(!group_needs_reconnect([true]));
         assert!(!group_needs_reconnect([false, false]));
-        assert!(!group_needs_reconnect([true, false]));
+        assert!(group_needs_reconnect([true, false]));
+        assert!(group_needs_reconnect([false, true, false, false]));
         assert!(group_needs_reconnect([true, true]));
         assert!(group_needs_reconnect([true, true, true, true]));
     }

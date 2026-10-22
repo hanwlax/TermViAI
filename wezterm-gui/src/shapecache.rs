@@ -191,6 +191,40 @@ mod test {
     }
 
     #[test]
+    fn default_prompt_punctuation_matches_separate_glyphs() {
+        config::use_test_configuration();
+        let config = config::configuration();
+        let fonts = Rc::new(
+            FontConfiguration::new(
+                None,
+                config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize,
+            )
+            .unwrap(),
+        );
+        let render_metrics = RenderMetrics::new(&fonts).unwrap();
+        let mut glyph_cache = GlyphCache::new_in_memory(&fonts, 128).unwrap();
+        let style = TextStyle {
+            font: vec![FontAttributes::new("JetBrains Mono")],
+            foreground: None,
+        };
+        let font = fonts.resolve_font(&style).unwrap();
+        let together = cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "]#");
+        let mut separate = cluster_and_shape(&render_metrics, &mut glyph_cache, &style, &font, "]");
+        separate.extend(cluster_and_shape(
+            &render_metrics,
+            &mut glyph_cache,
+            &style,
+            &font,
+            "#",
+        ));
+        assert_eq!(together.len(), 2);
+        assert!(together
+            .iter()
+            .all(|glyph| glyph.num_cells == 1 && glyph.bitmap_pixel_width > 0));
+        assert_eq!(together, separate);
+    }
+
+    #[test]
     fn ligatures_fira() {
         config::use_test_configuration();
         let _ = env_logger::Builder::new()
@@ -201,6 +235,11 @@ mod test {
         let config = config::configuration();
 
         let mut config: config::Config = (*config).clone();
+        // These snapshots deliberately exercise the optional ligature path.
+        config.harfbuzz_features = ["kern", "liga", "clig", "calt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         config.font = TextStyle {
             font: vec![FontAttributes::new("Fira Code")],
             foreground: None,
@@ -316,7 +355,13 @@ mod test {
             .is_test(true)
             .filter_level(log::LevelFilter::Trace)
             .try_init();
-        let config = config::configuration();
+        let mut config = (*config::configuration()).clone();
+        // Opt in explicitly: TermViAI defaults to literal terminal punctuation.
+        config.harfbuzz_features = ["kern", "liga", "clig", "calt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        config::use_this_configuration(config.clone());
 
         let fonts = Rc::new(
             FontConfiguration::new(

@@ -28,6 +28,7 @@ pub(super) struct TabDrag {
     moved: bool,
     target: Option<DropTarget>,
     can_dock: bool,
+    pane_reorder: bool,
     reorder: Option<(Option<usize>, f32)>,
 }
 
@@ -36,6 +37,7 @@ pub(super) struct DragVisuals {
     pub pointer: (f32, f32),
     pub title: String,
     pub insertion_x: Option<f32>,
+    pub swapping: bool,
 }
 
 impl TabDrag {
@@ -232,9 +234,40 @@ impl TermWindow {
             moved: false,
             target: None,
             can_dock,
+            pane_reorder: false,
             reorder: None,
         });
         true
+    }
+
+    pub(super) fn begin_termviai_pane_drag(&mut self, pane: usize, x: f32, y: f32) {
+        let mux = Mux::get();
+        let Some(tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        if tab.get_zoomed_pane().is_some()
+            || tab.iter_panes_ignoring_zoom().len() < 2
+            || !tab.contains_pane(pane)
+            || self.termviai_library_active()
+            || self.get_modal().is_some()
+            || self.tab_state(tab.tab_id()).overlay.is_some()
+            || self.pane_state(pane).overlay.is_some()
+        {
+            return;
+        }
+        self.termviai_ui.tab_drag = Some(TabDrag {
+            source_tab: tab.tab_id(),
+            source_pane: pane,
+            destination_tab: tab.tab_id(),
+            start: (x, y),
+            pointer: (x, y),
+            title: self.termviai_pane_label(pane),
+            moved: false,
+            target: None,
+            can_dock: false,
+            pane_reorder: true,
+            reorder: None,
+        });
     }
 
     pub(super) fn update_termviai_tab_drag(&mut self, x: f32, y: f32) {
@@ -242,6 +275,34 @@ impl TermWindow {
             return;
         };
         drag.update_pointer(x, y);
+        if drag.pane_reorder {
+            let tab = Mux::get().get_active_tab_for_window(self.mux_window_id);
+            if drag.moved
+                && !self.termviai_library_active()
+                && self.get_modal().is_none()
+                && tab.as_ref().is_some_and(|t| {
+                    t.tab_id() == drag.source_tab
+                        && t.get_zoomed_pane().is_none()
+                        && t.contains_pane(drag.source_pane)
+                })
+            {
+                drag.target = self
+                    .termviai_pane_headers()
+                    .into_iter()
+                    .find(|h| h.pane_id != drag.source_pane && h.frame.contains(x, y))
+                    .map(|h| DropTarget {
+                        tab: drag.source_tab,
+                        pane: h.pane_id,
+                        side: DockSide::Left,
+                        rect: h.frame,
+                    });
+            }
+            self.termviai_ui.tab_drag = Some(drag);
+            if let Some(window) = &self.window {
+                window.invalidate();
+            }
+            return;
+        }
         if drag.moved && self.get_modal().is_none() {
             let mux = Mux::get();
             let all = mux
@@ -321,6 +382,29 @@ impl TermWindow {
         if self.get_modal().is_some() {
             return Ok(true);
         }
+        if drag.pane_reorder {
+            if let Some(target) = drag.target {
+                let mux = Mux::get();
+                let tab = mux
+                    .get_active_tab_for_window(self.mux_window_id)
+                    .context("The group was closed")?;
+                anyhow::ensure!(
+                    tab.tab_id() == drag.source_tab && !self.termviai_library_active(),
+                    "The active group changed"
+                );
+                anyhow::ensure!(
+                    self.tab_state(tab.tab_id()).overlay.is_none()
+                        && self.pane_state(drag.source_pane).overlay.is_none()
+                        && self.pane_state(target.pane).overlay.is_none(),
+                    "A session has an open overlay"
+                );
+                tab.swap_panes_by_id(drag.source_pane, target.pane)?;
+                self.termviai_sync_terminal_layout();
+                self.termviai_workspace_changed();
+                self.update_title();
+            }
+            return Ok(true);
+        }
         if let Some((before, _)) = drag.reorder {
             let mux = Mux::get();
             let mut window = mux
@@ -371,7 +455,9 @@ impl TermWindow {
             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                 let workspace_changed = result.is_ok();
                 if let Err(error) = result {
-                    tw.termviai_ui.error = format!("Could not place session: {error:#}");
+                    tw.termviai_ui
+                        .terminal_errors
+                        .insert(target.tab, format!("Could not place session: {error:#}"));
                 }
                 tw.termviai_sync_broadcast();
                 if workspace_changed {
@@ -399,7 +485,14 @@ impl TermWindow {
     pub(super) fn termviai_tab_drag_visuals(&self) -> Option<DragVisuals> {
         let drag = self.termviai_ui.tab_drag.as_ref()?;
         drag.moved.then(|| DragVisuals {
-            preview: drag.target.map(|target| target.rect.preview(target.side)),
+            preview: drag.target.map(|target| {
+                if drag.pane_reorder {
+                    target.rect
+                } else {
+                    target.rect.preview(target.side)
+                }
+            }),
+            swapping: drag.pane_reorder,
             pointer: drag.pointer,
             title: drag.title.clone(),
             insertion_x: drag.reorder.map(|(_, x)| x),
@@ -485,6 +578,7 @@ mod tests {
             moved: false,
             target: None,
             can_dock: true,
+            pane_reorder: false,
             reorder: None,
         };
         drag.update_pointer(242.0, 23.0);

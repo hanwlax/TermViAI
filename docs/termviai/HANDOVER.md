@@ -4,6 +4,10 @@
 
 > 最新、精简且可执行的项目上下文见 [MEMORY.md](MEMORY.md)。后续工作应先读取该文件；下文保留完整历史记录。
 
+## 2026-10-22 TermViAI v0.1.0-beta.4
+
+第四个 Beta 汇总 Keychain Identities、Host 密码认证、组内终端拖动交换、部分离线重连与广播/表单 UX。Windows 原生 178 项测试和 Release 构建通过。最新行为、发布包摘要与验证边界见 [MEMORY.md](MEMORY.md)、[发布说明](RELEASE_V0.1.0_BETA.4.md) 和 [验证记录](RELEASE_V0.1.0_BETA.4_VALIDATION.md)。
+
 ## 2026-10-12 TermViAI v0.1.0-beta.3
 
 第三个 Beta 汇总同主机整组重连、Windows 最大化边界、tab 拖动排序/反馈和新应用图标。Windows 原生 140 项测试、Release 构建、beta.3 版本资源和 10 个嵌入图标尺寸核验通过。最新入口见 [MEMORY.md](MEMORY.md)、[发布说明](RELEASE_V0.1.0_BETA.3.md) 与 [验证记录](RELEASE_V0.1.0_BETA.3_VALIDATION.md)。历史本地测试包沿用 beta.2 字符串，正式 beta.3 发布包为升级入口。

@@ -1066,6 +1066,71 @@ impl Tab {
             .swap_active_with_index(pane_index, keep_focus)
     }
 
+    /// Exchange existing sessions by stable identity, retaining the layout and focus.
+    pub fn swap_panes_by_id(&self, source: PaneId, target: PaneId) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock();
+        anyhow::ensure!(
+            inner.zoomed.is_none(),
+            "Restore the group before rearranging sessions"
+        );
+        let panes = inner.iter_panes_ignoring_zoom();
+        let source_idx = panes
+            .iter()
+            .position(|p| p.pane.pane_id() == source)
+            .ok_or_else(|| anyhow::anyhow!("The dragged session was closed"))?;
+        let target_idx = panes
+            .iter()
+            .position(|p| p.pane.pane_id() == target)
+            .ok_or_else(|| anyhow::anyhow!("The destination session was closed"))?;
+        if source_idx == target_idx {
+            return Ok(());
+        }
+        // Exchange leaves in place. Do not momentarily focus the dragged pane:
+        // focus reporting can emit escape sequences to the remote application.
+        fn exchange(tree: &mut Tree, source: &Arc<dyn Pane>, target: &Arc<dyn Pane>) {
+            match tree {
+                Tree::Leaf(pane) if pane.pane_id() == source.pane_id() => *pane = target.clone(),
+                Tree::Leaf(pane) if pane.pane_id() == target.pane_id() => *pane = source.clone(),
+                Tree::Node { left, right, .. } => {
+                    exchange(left, source, target);
+                    exchange(right, source, target);
+                }
+                _ => {}
+            }
+        }
+        exchange(
+            inner.pane.as_mut().unwrap(),
+            &panes[source_idx].pane,
+            &panes[target_idx].pane,
+        );
+        inner.active = if inner.active == source_idx {
+            target_idx
+        } else if inner.active == target_idx {
+            source_idx
+        } else {
+            inner.active
+        };
+        let source_recency = inner.recency.by_idx.remove(&source_idx);
+        let target_recency = inner.recency.by_idx.remove(&target_idx);
+        if let Some(score) = source_recency {
+            inner.recency.by_idx.insert(target_idx, score);
+        }
+        if let Some(score) = target_recency {
+            inner.recency.by_idx.insert(source_idx, score);
+        }
+        inner.resize_reference = None;
+        // As with a window resize, a held/offline PTY may reject the size. It
+        // still keeps its place and receives the correct size when reconnected.
+        apply_sizes_from_splits(
+            inner.pane.as_ref().unwrap(),
+            &inner.size,
+            inner.pane_header_rows,
+            inner.pane_content_padding,
+            &inner.pane_cell_sizes,
+        );
+        Ok(())
+    }
+
     /// Computes the size of the pane that would result if the specified
     /// pane was split in a particular direction.
     /// The intent is to call this prior to spawning the new pane so that
@@ -2975,6 +3040,45 @@ mod test {
 
     fn fake_size(pane: &Arc<dyn Pane>) -> TerminalSize {
         *pane.downcast_ref::<FakePane>().unwrap().size.lock()
+    }
+
+    #[test]
+    fn swapping_group_sessions_preserves_geometry_identity_and_focus() {
+        let tab = proportional_test_grid();
+        let panes = tab.iter_panes_ignoring_zoom();
+        let source = panes[0].pane.clone();
+        let target = panes[3].pane.clone();
+        let focused = panes[1].pane.clone();
+        tab.inner.lock().active = 1;
+        tab.set_pane_cell_size(source.pane_id(), Some((20, 30)));
+        let before = pane_layout(&tab);
+        tab.swap_panes_by_id(source.pane_id(), target.pane_id())
+            .unwrap();
+        let after = pane_layout(&tab);
+        for (old, new) in before.iter().zip(&after) {
+            assert_eq!((old.1, old.2, old.3, old.4), (new.1, new.2, new.3, new.4));
+        }
+        assert_eq!(after[0].0, target.pane_id());
+        assert_eq!(after[3].0, source.pane_id());
+        assert!(Arc::ptr_eq(
+            &tab.iter_panes_ignoring_zoom()[3].pane,
+            &source
+        ));
+        assert_eq!(tab.get_active_pane().unwrap().pane_id(), focused.pane_id());
+        assert_eq!(
+            tab.inner.lock().pane_cell_sizes.get(&source.pane_id()),
+            Some(&(20, 30))
+        );
+        assert!(tab.swap_panes_by_id(source.pane_id(), usize::MAX).is_err());
+        assert_eq!(pane_layout(&tab), after);
+        tab.swap_panes_by_id(source.pane_id(), source.pane_id())
+            .unwrap();
+        assert_eq!(pane_layout(&tab), after);
+        tab.set_zoomed(true);
+        assert!(tab
+            .swap_panes_by_id(source.pane_id(), target.pane_id())
+            .is_err());
+        assert_eq!(pane_layout(&tab), after);
     }
 
     #[test]

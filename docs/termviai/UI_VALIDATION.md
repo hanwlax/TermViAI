@@ -1,5 +1,65 @@
 # TermViAI UI 验证
 
+## 2026-10-22 Identities 与 Host 密码认证
+
+Keychain 增加 Keys / Identities 分区、身份卡片和新增/编辑抽屉；Host 增加遮蔽密码、Show/Hide、Remember password 和可滚动认证选择器。沿用现有矢量图标、卡片间距、圆角、低饱和紫色和抽屉动画。密码存储与兼容约定见 [IDENTITIES.md](IDENTITIES.md)。
+
+
+Windows 原生回归：SSH 18 项、GUI 101 项，共 119 项通过；Release 构建通过。验证了系统凭据的中文密码读写/替换/删除、进程内密码、旧库兼容、Identity 引用与留空保留密码、Host 记住开关双向迁移及 JSON 无明文密码。验证包 `releases/identities-20261022.zip`，SHA-256 `7b17a8db3762c167bce6108436e90a1117d53cbafb0906e97fd5ae3b9639ebf5`；日志与源码校验位于 `releases/verify-identities-20261022/`。16 个源文件/清单与 Windows 构建输入一致。真实 SSH 密码/MFA 认证和鼠标视觉未进行自动端到端验收。
+
+## 2026-10-22 移除低频侧栏区域与 Grid view 标识
+
+移除终端页侧栏 WORKSPACE 标题、Add SSH right、Add SSH below 与 Save group 按钮及其点击区域。清理只服务于该添加入口的待选主机状态和返回提示；拖动组合终端、标签右键保存组及 Ctrl+S 保留。移除 Hosts/Keychain 工具栏右侧静态 Grid view 图标文字，保留 Add Host / Add Key、搜索与主机网格布局。
+
+
+Windows GUI 97 项测试与 Release 构建通过；修改的 11 个 Rust 文件与构建源码一致。验证包 `releases/ui-trim-20261022.zip`，SHA-256 `5c75e7800cdb7d7aa169c4191cdd41b6a6514661b844d5fc2309da8023b52c63`。构建记录位于 `releases/verify-ui-trim-20261022/`；实际窗口视觉待人工验收。
+
+## 2026-10-22 精简提示与广播悬浮隔离
+
+移除 Host 三点按钮、广播总开关、广播底栏展开/收起按钮的悬浮提示。终端标题广播按钮使用独立的交互标识，底栏成员按钮继续使用原标识；hover 动画、按下反馈和提示锚点因此分别归属各自按钮。两处点击仍调用同一成员切换逻辑，实际广播选择和启用状态保持同步。
+
+
+Windows GUI 97 项测试与 Release 构建通过，11 个修改的 Rust 文件与 Windows 构建源码一致。验证包 `releases/hover-isolation-20261022.zip`，SHA-256 `db74858701de3c1344c8cf31cb15559ef5b52d8096a991119a7aff03cc448d6e`；日志与校验记录在 `releases/verify-hover-isolation-20261022/`。本次不新增镜像实现的 UI 单元测试；实际鼠标交互视觉仍需人工验收。
+
+## 2026-10-22 Host 菜单入口与终端标点连字
+
+Host 卡片省略号单击打开 Edit Host / Duplicate Host 菜单，菜单锚定按钮下方并限制在窗口内。单击菜单项执行操作，点击外部或 Esc 关闭；Host 卡片右键不再打开菜单。省略号悬浮提示改为 Host actions，任意菜单打开时不绘制悬浮提示，避免和菜单重叠。
+
+` ]# ` 粘连已用本机安装的 `JetBrainsMonoNerdFontMono-Medium.ttf` 实测定位为字体连字：HarfBuzz 默认特性产生 `SPC` + `bracketright_numbersign.liga`；关闭 `liga/clig/calt` 后产生独立 `bracketright` 和 `numbersign`，每个字符 advance 仍为 600 字体单位。产品默认特性改为 `kern, liga=0, clig=0, calt=0`，保留字偶距；显式用户配置可重新启用连字。这里不插入空格，也不修改远端 shell 提示符。实验输出保留于验证目录的 `termviai-prompt-shaping.jsonl`。
+
+
+Windows GUI 97 项测试通过，包含默认 `]#` 与单字符绘制结果一致、显式开启连字的旧快照、Host 菜单锚点及不直接打开编辑表单。Windows Release 构建通过，11 个修改的 Rust 源文件与构建目录逐字节一致。验证包 `releases/host-menu-20261022.zip`，SHA-256 `f8660cf895b55318d73fdf9a6c58832de2dece0e219bf00cb049c69c14c8019f`；测试、构建、字体实验及源文件校验保存在 `releases/verify-host-menu-20261022/`。未自动验收实际窗口鼠标交互视觉。
+
+## 2026-10-22 字体与 Host 编辑交互
+
+- 默认终端字体继续使用 Windows 的 JetBrainsMono NFM，默认字重改为 Medium (500)，增强笔画；显式用户字体配置仍优先。本机已确认存在该字体的 Medium 文件。截图不能证明渲染器与 VS Code 完全一致，实际字重视觉仍需对照验收。
+- 输入框不再将 `│` 插入字符串；使用与标题字体相同的 shaping advances 绘制独立、像素对齐的 1 px 光标。输入、搜索、选择高亮、鼠标定位和 IME 位置使用同一套文字度量，超长内容随光标横向滚动。
+- 添加/编辑 Host、Key、设置和重命名输入框支持鼠标拖动选区、Shift+方向键/Home/End、Ctrl+A/C/X/V。复制只取选区，输入/删除替换当前选区，支持中文；剪切无选区时不改变剪贴板或文本。
+- 短悬停提示按真实字体宽度分配空间，`Edit Host` 不再被估算字符列宽硬拆成两行。
+- Hosts 卡片（含省略号区域）右键打开 Edit Host / Duplicate Host 菜单。Duplicate 重新读取库，复制全部字段，label 使用 `xxx-copy`；重名追加 `-2`、`-3`。保存采用现有原子写入方式；原主机已被其他窗口修改时拒绝复制过期快照。菜单点击外部或 Esc 关闭。
+
+Windows GUI 95 项测试通过，包含选区复制/替换/删除、比例字宽命中、重复复制及全部配置字段/持久化/原主机保留等回归。最终 Windows Release 构建通过；本地验证包 `releases/host-editor-20261022.zip`，SHA-256 `07afc3261d82f592797d97ce8b40490bc1fcec0a93bf984466bab9d6521a6f0f`。构建与测试记录位于 Windows 构建目录 `releases/verify-host-editor-20261022/`。真实四路 SSH 与鼠标视觉没有自动端到端验收。
+
+
+## 2026-10-22 组内重排与错误提示
+
+广播全选修正：tab-bc 颜色与点击共用 `group_broadcasting`，只在运行且全部选中时紫色；部分选中为灰色，点击会全选并启用，全部启用时再次点击会全部关闭。排除的 pane 保持独立输入，其他成员继续广播，底部暂停/恢复开关语义保留。新增回归覆盖四成员中排除一个、重新全选、单独补齐、暂停后重新全选、全部关闭与其他组隔离。顶栏广播/关闭图标从 16 px 改为与 pane 标题一致的 18 px（100% DPI 笔画为 2 px）。Windows GUI 65 项及 Release 构建通过，验证包 `releases/broadcast-all-20261022.zip`，SHA-256 `92210eef7e759ad55a278af94cd93903f6d5f4fc391d928f9c7ee72abbfd08a8`；日志保存在 `releases/verify-broadcast-all-20261022/`。
+
+同日图标交互细化：静态无底色、广播紫/灰区分状态、悬停关闭 X 变红和广播背景淡入。GUI 64 项回归和 Release 构建通过，新验证包 `releases/icon-hover-20261022.zip`（包含组内重排等前述功能），SHA-256：`bf630d4874044771b48fd16a41ebb8514e5a84ce17e0a0a765d227e15672f11c`。日志保存在 Windows 构建目录 `releases/verify-icon-hover-20261022/`。
+
+- 从组内终端标题栏拖起，越过 6 个逻辑像素后显示小手；放到另一终端的整块区域交换位置。来源自身、组外、Esc、失焦、已关闭来源/目标或切换到其他组不会执行交换。放大单个 pane 时需先恢复组合视图。
+- 交换原有 pane 对象及活动位置索引，保留 SSH 连接、滚屏、广播成员、每终端字号、原焦点与布局比例；不临时切换焦点，不触发远端焦点报告。拖动后 Ctrl+S 可保存新布局。
+- 标签组网格和广播图标采用简化矢量线条；标签栏及终端标题栏的广播/关闭图标静态均无底色；广播开启为低饱和紫色、关闭为灰色，悬停时才淡入灰紫色圆角背景。关闭 X 悬停变红且保持透明背景。
+- 组内有任一可重连的 SSH 终端离线时，标签提供重连入口，只处理离线成员，在线与正在重连的成员不会被重启。
+- 广播失败/跳过离线终端、重连错误绑定 pane ID；对应终端标题栏右侧显示红色圆形叹号，悬停 400ms 查看折行详情、点击消除，关闭 pane 时清理。开始重连或下次广播投递成功会清理该 pane 的广播错误；未投递输入不会重放。其他终端操作错误绑定所属标签，不再跨标签悬浮整条横幅。
+- 窄终端优先保留错误与重连/广播按钮；宽度不足三个按钮时暂隐藏移除按钮。错误提示限制在窗口内。
+
+Windows 回归：mux 42 项、TermViAI GUI 64 项、广播 12 项，共 118 项通过；最后的窄栏布局修改另跑 GUI 64 项。Windows x64 Release 构建通过；最终构建源文件与本地 8 个已修改 Rust 文件逐字节一致。测试覆盖交换布局与对象/焦点/字号保留、关闭目标与放大拒绝、部分离线重连入口、错误随 pane 迁移及清理、Unicode 折行和窄栏按钮边界。实际四路 SSH 下的鼠标拖放、小手与红色圆点视觉仍需人工验收。
+
+验证包 SHA-256：`c972986317b285a5fc6be85b97ee9546d84c3fbe08c575e54b9bbaefa1f64094`。构建和测试日志保存在 Windows 构建目录 `releases/verify-group-ui-20261022/`。
+
+本地验证包为 `releases/group-ui-20261022.zip`，基于 beta.3，包含待提交的 SSH 空闲保活修复，不代表新发布版本。解压后运行其中的 TermViAI.exe；现有安装与已发布 beta.3 不被替换。
+
 ## 2026-10-12 应用图标重绘
 
 图标改为深色圆角底、紫色终端提示符、青色光标和小星芒。TermViAI = Terminal Via AI，表示通过 AI 制作的终端应用；星芒表达制作来源，当前产品没有内置 AI 功能。

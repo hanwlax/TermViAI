@@ -233,7 +233,10 @@ impl TermWindow {
             .unwrap_or(pane_id)
     }
 
-    pub(super) fn termviai_pane_font(&mut self, pane_id: PaneId) -> anyhow::Result<Option<PaneFont>> {
+    pub(super) fn termviai_pane_font(
+        &mut self,
+        pane_id: PaneId,
+    ) -> anyhow::Result<Option<PaneFont>> {
         let pane_id = self.termviai_font_source_pane(pane_id);
         if !self.config.termviai_ui {
             return Ok(None);
@@ -258,7 +261,9 @@ impl TermWindow {
             dpi,
             generation,
         };
-        self.termviai_fonts.contexts.insert(pane_id, context.clone());
+        self.termviai_fonts
+            .contexts
+            .insert(pane_id, context.clone());
         Ok(Some(context))
     }
 

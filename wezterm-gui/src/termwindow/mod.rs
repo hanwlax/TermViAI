@@ -510,9 +510,10 @@ impl TermWindow {
                 WindowCloseConfirmation::NeverPrompt
             ) || can_close
             {
-                if let Err(error) =
-                    self.termviai_close_target(termviai_confirm::CloseTarget::Window, self.mux_window_id)
-                {
+                if let Err(error) = self.termviai_close_target(
+                    termviai_confirm::CloseTarget::Window,
+                    self.mux_window_id,
+                ) {
                     log::error!("closing TermViAI window: {error:#}");
                 }
             } else {
@@ -1840,8 +1841,8 @@ impl TermWindow {
             _ => return,
         };
         if window.count_tabs() == 1 {
-            self.show_tab_bar =
-                config.termviai_ui || (config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab);
+            self.show_tab_bar = config.termviai_ui
+                || (config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab);
         } else {
             self.show_tab_bar = config.termviai_ui || config.enable_tab_bar;
         }
@@ -2111,7 +2112,9 @@ impl TermWindow {
         if tabs_count == 0 {
             drop(window);
             if self.config.termviai_ui {
-                if self.termviai_ui.page == termviai_ui::Page::Terminal && !self.termviai_ui.connecting {
+                if self.termviai_ui.page == termviai_ui::Page::Terminal
+                    && !self.termviai_ui.connecting
+                {
                     self.termviai_ui.page = termviai_ui::Page::Hosts;
                 }
                 if let Some(window) = self.window.as_ref() {
@@ -2241,17 +2244,18 @@ impl TermWindow {
         if let Some(win) = self.window.as_ref() {
             let cursor = pos.pane.get_cursor_position();
             let top = pos.pane.get_dimensions().physical_top;
-            let tab_bar_height =
-                if self.show_tab_bar && (self.config.termviai_ui || !self.config.tab_bar_at_bottom) {
-                    self.tab_bar_pixel_height().unwrap()
-                } else {
-                    0.0
-                };
+            let tab_bar_height = if self.show_tab_bar
+                && (self.config.termviai_ui || !self.config.tab_bar_at_bottom)
+            {
+                self.tab_bar_pixel_height().unwrap()
+            } else {
+                0.0
+            };
             let (padding_left, padding_top) = self.padding_left_top();
 
             let metrics = self.termviai_pane_metrics(pos.pane.pane_id());
-            let (dx, dy) =
-                self.termviai_pane_visual_offset(self.termviai_font_source_pane(pos.pane.pane_id()));
+            let (dx, dy) = self
+                .termviai_pane_visual_offset(self.termviai_font_source_pane(pos.pane.pane_id()));
             let r = Rect::new(
                 Point::new(
                     (pos.left as isize * self.render_metrics.cell_size.width)

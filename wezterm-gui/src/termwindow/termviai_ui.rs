@@ -1,13 +1,13 @@
 //! Native TermViAI application chrome and local SSH library.
 use super::box_model::*;
 use super::render::corners::*;
-use super::termviai_broadcast::pane_broadcasting;
+use super::termviai_broadcast::{group_broadcasting, pane_broadcasting};
 use super::termviai_icons::Icon;
 use super::termviai_layout::{BROADCAST_SURFACE_TOP_INSET, BROADCAST_TRAY_HEIGHT};
 use super::termviai_motion::{frame_interval, Tween};
 use super::termviai_workspace::WorkspaceUi;
 use super::{TermWindow, TermWindowNotif};
-use crate::hosts::{Host, HostStore, KeyFile};
+use crate::hosts::{new_credential_id, Host, HostStore, Identity, KeyFile};
 use crate::utilsprites::RenderMetrics;
 use crate::workspaces::{SavedLayout, WorkspaceStore};
 use anyhow::Context;
@@ -28,7 +28,9 @@ const CARD: &str = "#292a3c";
 const FIELD: &str = "#37394f";
 const INK: &str = "#f1f2fa";
 const MUTED: &str = "#9ca2ba";
-const ACCENT: &str = "#8d86f7";
+const ACCENT: &str = "#aaa7cb";
+const SIGNAL_BG: &str = "#414256";
+const SIGNAL_INK: &str = "#b5a2d8";
 const RECONNECT: &str = "#89b4fa";
 const SIDEBAR_WIDTH: f32 = 220.;
 const MIN_WINDOW_WIDTH: usize = 720;
@@ -76,11 +78,19 @@ enum Action {
     ConfirmAccept,
     AddHost,
     AddKey,
+    AddIdentity,
+    EditIdentity(usize),
+    DeleteIdentity,
+    ChooseAuth,
+    ManualAuth,
+    UseIdentity(usize),
+    RememberPassword,
+    RevealPassword,
     Cancel,
     Save,
     Connect(usize),
     QuickConnect,
-    Edit(usize),
+    HostMenu(usize),
     Field(usize),
     Search,
     Group(String),
@@ -96,38 +106,70 @@ enum Action {
     Close,
     Drag,
     Drawer,
-    AddSsh(bool),
-    CancelSplit,
     Broadcast,
     BroadcastAll,
     BroadcastNone,
     Member(usize),
+    // Separate interaction identity from the tray member button for the same pane.
+    PaneBroadcast(usize),
     ReconnectPane(usize),
     ReconnectGroup(usize),
     RemovePane(usize),
     FocusPane(usize),
+    PaneError(usize),
+    EditMenuHost,
+    DuplicateHost,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Input {
     value: String,
     cursor: usize,
-    selected: bool,
+    anchor: Option<usize>,
 }
 impl Input {
     fn new(value: String) -> Self {
-        let cursor = value.chars().count();
         Self {
+            cursor: value.chars().count(),
             value,
-            cursor,
-            selected: false,
+            anchor: None,
+        }
+    }
+    fn selection(&self) -> Option<std::ops::Range<usize>> {
+        self.anchor
+            .filter(|a| *a != self.cursor)
+            .map(|a| a.min(self.cursor)..a.max(self.cursor))
+    }
+    fn selected_text(&self) -> Option<String> {
+        self.selection()
+            .map(|r| self.value.chars().skip(r.start).take(r.len()).collect())
+    }
+    fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.cursor = self.value.chars().count();
+    }
+    fn move_to(&mut self, position: usize, extend: bool) {
+        if extend {
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = None;
+        }
+        self.cursor = position.min(self.value.chars().count());
+    }
+    fn remove_selection(&mut self) -> bool {
+        let range = self.selection();
+        self.anchor = None;
+        if let Some(range) = range {
+            let mut chars: Vec<char> = self.value.chars().collect();
+            self.cursor = range.start;
+            chars.drain(range);
+            self.value = chars.into_iter().collect();
+            true
+        } else {
+            false
         }
     }
     fn insert(&mut self, text: &str) {
-        if self.selected {
-            self.value.clear();
-            self.cursor = 0;
-            self.selected = false;
-        }
+        self.remove_selection();
         let mut chars: Vec<char> = self.value.chars().collect();
         let added: Vec<char> = text
             .chars()
@@ -140,10 +182,7 @@ impl Input {
         self.value = chars.into_iter().collect();
     }
     fn delete(&mut self, back: bool) {
-        if self.selected {
-            self.value.clear();
-            self.cursor = 0;
-            self.selected = false;
+        if self.remove_selection() {
             return;
         }
         let mut chars: Vec<char> = self.value.chars().collect();
@@ -155,26 +194,99 @@ impl Input {
         }
         self.value = chars.into_iter().collect();
     }
-    fn display(&self, focused: bool, capacity: usize) -> String {
-        let chars: Vec<char> = self.value.chars().collect();
-        let start = if focused {
-            self.cursor.saturating_sub(capacity.saturating_sub(2))
-        } else {
-            0
-        };
-        let mut text: String = chars.iter().skip(start).take(capacity).collect();
-        if focused {
-            let byte = text
-                .char_indices()
-                .nth(self.cursor.saturating_sub(start))
-                .map(|(i, _)| i)
-                .unwrap_or(text.len());
-            text.insert(byte, '│');
-        }
-        text
+    fn display(&self, _focused: bool, capacity: usize) -> String {
+        self.value.chars().take(capacity).collect()
     }
 }
+
+#[derive(Clone)]
+struct InputPaint {
+    masked: bool,
+    input: Input,
+    focused: bool,
+}
+impl InputPaint {
+    fn rendered_value(&self) -> String {
+        if self.masked {
+            "•".repeat(self.input.value.chars().count())
+        } else {
+            self.input.value.clone()
+        }
+    }
+}
+struct InputHit {
+    action: Action,
+    x: f32,
+    start: usize,
+    positions: Vec<f32>,
+}
+impl InputHit {
+    fn position(&self, x: f32) -> usize {
+        let offset = x - self.x;
+        self.start
+            + self
+                .positions
+                .windows(2)
+                .position(|pair| offset < (pair[0] + pair[1]) / 2.)
+                .unwrap_or(self.positions.len().saturating_sub(1))
+    }
+}
+
+// Shape with the same font and advances as the field renderer; no guessed
+// eight-pixel character widths and no visible cursor glyph in the text.
+fn text_positions(
+    font: &wezterm_font::LoadedFont,
+    text: &str,
+    scale: f32,
+) -> anyhow::Result<Vec<f32>> {
+    let chars: Vec<usize> = text
+        .char_indices()
+        .map(|(byte, _)| byte)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let glyphs = font.shape(
+        text,
+        || {},
+        crate::customglyph::BlockKey::filter_out_synthetic,
+        None,
+        wezterm_bidi::Direction::LeftToRight,
+        None,
+        None,
+    )?;
+    let mut advances = std::collections::BTreeMap::<usize, f32>::new();
+    for glyph in glyphs {
+        *advances.entry(glyph.cluster as usize).or_default() +=
+            glyph.x_advance.get() as f32 / scale;
+    }
+    let clusters: Vec<_> = advances.into_iter().collect();
+    let mut positions = vec![0.; chars.len()];
+    let mut x = 0.;
+    for (index, (byte, advance)) in clusters.iter().enumerate() {
+        let end = clusters.get(index + 1).map(|c| c.0).unwrap_or(text.len());
+        let first = chars.partition_point(|b| b < byte);
+        let last = chars.partition_point(|b| *b < end);
+        for n in first..=last {
+            positions[n] = x + advance * (n - first) as f32 / (last - first).max(1) as f32;
+        }
+        x += advance;
+    }
+    Ok(positions)
+}
+#[derive(Default)]
+struct AuthForm {
+    editing_identity: bool,
+    original_identity: Option<Identity>,
+    selected_identity: String,
+    remember: bool,
+    reveal: bool,
+    picker: bool,
+    picker_scroll: usize,
+    confirm_delete: bool,
+    reset_password: bool,
+}
+
 struct Form {
+    auth: AuthForm,
     fields: Vec<Input>,
     focus: usize,
     key: bool,
@@ -224,6 +336,22 @@ impl DrawerLayout {
     }
 }
 impl Form {
+    fn is_host(&self) -> bool {
+        !self.key && !self.settings && self.rename_tab.is_none() && !self.auth.editing_identity
+    }
+    fn password_index(&self) -> Option<usize> {
+        if self.auth.editing_identity {
+            Some(2)
+        } else if self.is_host() && self.auth.selected_identity.is_empty() {
+            Some(4)
+        } else {
+            None
+        }
+    }
+    fn masked_password(&self) -> bool {
+        self.password_index() == Some(self.focus) && !self.auth.reveal
+    }
+
     fn visible_rows(&mut self, count: usize) -> std::ops::Range<usize> {
         let count = count.max(1);
         let max = self.fields.len().saturating_sub(count);
@@ -270,6 +398,7 @@ struct Tile {
     opacity: f32,
     transparent: bool,
     zindex: i8,
+    input: Option<InputPaint>,
 }
 
 pub struct TermviaiUi {
@@ -290,8 +419,12 @@ pub struct TermviaiUi {
     painted_page: Page,
     hover_motion: HashMap<Action, Tween>,
     pub(super) error: String,
+    pub(super) terminal_errors: HashMap<usize, String>,
     pub(super) tab_drag: Option<super::termviai_tab_drag::TabDrag>,
     hits: Vec<Hit>,
+    input_hits: Vec<InputHit>,
+    input_drag: Option<Action>,
+    host_menu: Option<(Host, f32, f32)>,
     scroll: usize,
     max_scroll: usize,
     tab_scroll: usize,
@@ -300,7 +433,6 @@ pub struct TermviaiUi {
     hover: Option<Action>,
     hover_started: Instant,
     pressed: Option<Action>,
-    split_target: Option<(usize, usize, bool)>,
     pub(super) connecting: bool,
     pub(super) workspace: WorkspaceUi,
     pub(super) new_tab_open: bool,
@@ -340,8 +472,12 @@ impl TermviaiUi {
             painted_page: Page::Hosts,
             hover_motion: HashMap::new(),
             error,
+            terminal_errors: HashMap::new(),
             tab_drag: None,
             hits: vec![],
+            input_hits: vec![],
+            input_drag: None,
+            host_menu: None,
             scroll: 0,
             max_scroll: 0,
             tab_scroll: 0,
@@ -350,7 +486,6 @@ impl TermviaiUi {
             hover: None,
             hover_started: Instant::now(),
             pressed: None,
-            split_target: None,
             connecting: false,
             workspace: WorkspaceUi::default(),
             new_tab_open: false,
@@ -399,8 +534,9 @@ impl TermviaiUi {
             settings: false,
             first_row: 0,
             reveal_focus: true,
+            auth: AuthForm::default(),
         });
-        self.form.as_mut().unwrap().fields[0].selected = true;
+        self.form.as_mut().unwrap().fields[0].select_all();
         self.drawer_motion
             .set_target(1., Instant::now(), Duration::from_millis(220));
         self.tab_menu = None;
@@ -420,8 +556,9 @@ impl TermviaiUi {
             settings: true,
             first_row: 0,
             reveal_focus: true,
+            auth: AuthForm::default(),
         });
-        self.form.as_mut().unwrap().fields[0].selected = true;
+        self.form.as_mut().unwrap().fields[0].select_all();
         self.drawer_motion
             .set_target(1., Instant::now(), Duration::from_millis(220));
         self.tab_menu = None;
@@ -437,12 +574,15 @@ impl TermviaiUi {
         }
     }
     fn discard_form(&mut self) {
+        self.input_drag = None;
+        self.input_hits.clear();
         self.form = None;
         self.closing_form = None;
         self.drawer_motion = Tween::new(0.);
         self.generation += 1;
     }
     fn close_form(&mut self) {
+        self.input_drag = None;
         if let Some(form) = self.form.take() {
             self.closing_form = Some(form);
             self.drawer_motion
@@ -456,6 +596,11 @@ impl TermviaiUi {
             return None;
         }
         if let Some(f) = &mut self.form {
+            if f.auth.picker
+                || (!f.auth.selected_identity.is_empty() && matches!(f.focus, 3 | 4 | 5))
+            {
+                return None;
+            }
             f.reveal_focus = true;
             Some(&mut f.fields[f.focus])
         } else if self.search_focus {
@@ -464,7 +609,29 @@ impl TermviaiUi {
             None
         }
     }
+    fn open_host_menu(&mut self, index: usize) -> anyhow::Result<()> {
+        let host = self
+            .store
+            .hosts
+            .get(index)
+            .context("Host no longer exists")?
+            .clone();
+        let anchor = self
+            .hits
+            .iter()
+            .find(|hit| hit.action == Action::HostMenu(index))
+            .context("Host actions button is no longer visible")?;
+        self.host_menu = Some((host, anchor.x, anchor.y + anchor.h + 6.));
+        self.tab_menu = None;
+        self.hover = None;
+        self.pressed = None;
+        Ok(())
+    }
+
     fn open_form(&mut self, key: bool, host: Option<Host>) {
+        self.input_drag = None;
+        self.input_hits.clear();
+        self.host_menu = None;
         let h = host.clone().unwrap_or(Host {
             port: 22,
             ..Default::default()
@@ -477,8 +644,9 @@ impl TermviaiUi {
                 h.address,
                 h.port.to_string(),
                 h.username,
-                h.group,
+                String::new(),
                 h.identity_file,
+                h.group,
             ]
         };
         self.closing_form = None;
@@ -493,19 +661,100 @@ impl TermviaiUi {
             settings: false,
             first_row: 0,
             reveal_focus: true,
+            auth: AuthForm::default(),
         });
+        if let Some(form) = &mut self.form {
+            if let Some(host) = &form.original {
+                form.auth.selected_identity = host.identity_id.clone();
+                form.auth.remember = !host.credential_id.is_empty();
+            }
+        }
         self.error.clear();
         self.generation += 1;
     }
+    fn open_identity(&mut self, identity: Option<Identity>) {
+        self.open_form(true, None);
+        let f = self.form.as_mut().unwrap();
+        f.key = false;
+        f.auth.editing_identity = true;
+        f.fields = vec![
+            Input::new(
+                identity
+                    .as_ref()
+                    .map(|i| i.label.clone())
+                    .unwrap_or_default(),
+            ),
+            Input::new(
+                identity
+                    .as_ref()
+                    .map(|i| i.username.clone())
+                    .unwrap_or_default(),
+            ),
+            Input::default(),
+        ];
+        f.auth.original_identity = identity;
+    }
     fn save_form(&mut self) -> anyhow::Result<()> {
+        self.save_form_at(&HostStore::path())
+    }
+    fn save_form_at(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         let f = self.form.as_ref().context("No form")?;
         anyhow::ensure!(
             f.rename_tab.is_none() && !f.settings,
             "Use the form-specific save action."
         );
-        // Re-read before merging so another window's additions are retained.
-        let mut store = HostStore::load()?;
-        if f.key {
+        // Validate a fresh snapshot before touching credentials or the library.
+        let mut store = HostStore::load_from(path)?;
+        let mut pending_password: Option<(String, String, bool)> = None;
+        if f.auth.editing_identity {
+            let label = f.fields[0].value.trim().to_string();
+            let username = f.fields[1].value.trim().to_string();
+            anyhow::ensure!(
+                !label.is_empty() && !username.is_empty() && !label.chars().any(char::is_control),
+                "Enter an identity name and username."
+            );
+            anyhow::ensure!(
+                !username
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control()),
+                "Username cannot contain spaces or control characters."
+            );
+            let id = f
+                .auth
+                .original_identity
+                .as_ref()
+                .map(|i| i.id.clone())
+                .unwrap_or_else(new_credential_id);
+            anyhow::ensure!(
+                !store
+                    .identities
+                    .iter()
+                    .any(|i| i.label == label && i.id != id),
+                "An identity with this name already exists."
+            );
+            let identity = Identity {
+                id: id.clone(),
+                label,
+                username,
+            };
+            if let Some(original) = &f.auth.original_identity {
+                let index = store
+                    .identities
+                    .iter()
+                    .position(|i| i == original)
+                    .context("This identity changed. Reopen it and try again.")?;
+                store.identities[index] = identity;
+            } else {
+                anyhow::ensure!(
+                    !f.fields[2].value.is_empty(),
+                    "Enter a password for this identity."
+                );
+                store.identities.push(identity);
+            }
+            if !f.fields[2].value.is_empty() {
+                pending_password = Some((id, f.fields[2].value.clone(), true));
+            }
+        } else if f.key {
             let label = f.fields[0].value.trim();
             let path = f.fields[1].value.trim();
             anyhow::ensure!(!label.is_empty(), "Enter a key name.");
@@ -531,9 +780,49 @@ impl TermviaiUi {
                     .parse()
                     .context("Port must be between 1 and 65535.")?,
                 username: v[3].clone(),
-                group: v[4].clone(),
+                group: v[6].clone(),
                 identity_file: v[5].clone(),
+                identity_id: f.auth.selected_identity.clone(),
+                ..Default::default()
             };
+            if !host.identity_id.is_empty() {
+                host.resolve_identity(&store)?;
+            } else if !v[4].is_empty() {
+                let id = if f.auth.remember {
+                    new_credential_id()
+                } else {
+                    format!("session-{}", new_credential_id())
+                };
+                if f.auth.remember {
+                    host.credential_id = id.clone();
+                } else {
+                    host.session_credential = id.clone();
+                }
+                pending_password = Some((id, v[4].clone(), f.auth.remember));
+            } else if let Some(original) = &f.original {
+                if original.identity_id.is_empty() && !f.auth.reset_password {
+                    if f.auth.remember == !original.credential_id.is_empty() {
+                        host.credential_id = original.credential_id.clone();
+                        host.session_credential = original.session_credential.clone();
+                    } else if let Some(password) =
+                        wezterm_ssh::credentials::load(original.credential_ref())?
+                    {
+                        let id = if f.auth.remember {
+                            new_credential_id()
+                        } else {
+                            format!("session-{}", new_credential_id())
+                        };
+                        if f.auth.remember {
+                            host.credential_id = id.clone();
+                        } else {
+                            host.session_credential = id.clone();
+                        }
+                        pending_password = Some((id, password, f.auth.remember));
+                    } else if f.auth.remember {
+                        anyhow::bail!("The temporary password is no longer available. Enter it again to remember it.");
+                    }
+                }
+            }
             host.validate()?;
             if let Some(original) = &f.original {
                 let idx = store
@@ -546,7 +835,34 @@ impl TermviaiUi {
                 store.hosts.push(host);
             }
         }
-        store.save()?;
+        // Roll back the credential if metadata could not be committed.
+        let previous = if let Some((id, password, persistent)) = &pending_password {
+            let old = wezterm_ssh::credentials::load(id)?;
+            wezterm_ssh::credentials::save(id, password, *persistent)?;
+            old
+        } else {
+            None
+        };
+        if let Err(error) = store.save_to(path) {
+            if let Some((id, _, persistent)) = &pending_password {
+                if let Some(old) = previous {
+                    let _ = wezterm_ssh::credentials::save(id, &old, *persistent);
+                } else {
+                    let _ = wezterm_ssh::credentials::delete(id);
+                }
+            }
+            return Err(error);
+        }
+        if let Some(original) = &f.original {
+            let old = original.credential_ref();
+            if original.identity_id.is_empty()
+                && !old.is_empty()
+                && !store.hosts.iter().any(|h| h.credential_ref() == old)
+            {
+                // No saved host owns the replaced credential any longer.
+                wezterm_ssh::credentials::delete(old)?;
+            }
+        }
         self.store = store;
         self.query = Input::default();
         self.group.clear();
@@ -588,6 +904,7 @@ fn tile(
             opacity: 1.,
             transparent: false,
             zindex: 30,
+            input: None,
         });
     }
 }
@@ -609,9 +926,12 @@ fn button(
         Action::Hosts => Some(Icon::Hosts),
         Action::Keys | Action::UseKey(_) => Some(Icon::Key),
         Action::Settings => Some(Icon::Settings),
+        Action::ChooseAuth => Some(Icon::Key),
+        Action::RememberPassword => Some(Icon::Check),
+        Action::EditIdentity(_) | Action::UseIdentity(_) => Some(Icon::Identity),
         Action::NewTab if text.is_empty() => Some(Icon::Plus),
         Action::NewTab | Action::Tab(_) | Action::FocusPane(_) => Some(Icon::Terminal),
-        Action::AddHost | Action::AddKey => Some(Icon::Plus),
+        Action::AddHost | Action::AddKey | Action::AddIdentity => Some(Icon::Plus),
         Action::CloseTab(_) | Action::CloseNewTab | Action::Close | Action::RemovePane(_) => {
             Some(Icon::Close)
         }
@@ -619,14 +939,11 @@ fn button(
         Action::NextTab | Action::NextGroup => Some(Icon::ChevronRight),
         Action::Minimize => Some(Icon::Minimize),
         Action::Maximize => Some(Icon::Maximize),
-        Action::Edit(_) => Some(Icon::More),
+        Action::HostMenu(_) => Some(Icon::More),
         Action::Search => Some(Icon::Search),
         Action::QuickConnect => Some(Icon::ArrowRight),
         Action::Save => Some(Icon::Check),
         Action::Cancel if text.is_empty() => Some(Icon::ArrowRight),
-        Action::CancelSplit => Some(Icon::ArrowLeft),
-        Action::AddSsh(false) => Some(Icon::SplitRight),
-        Action::AddSsh(true) => Some(Icon::SplitDown),
         Action::Broadcast | Action::TabBroadcast(_) => Some(Icon::Broadcast),
         Action::ReconnectPane(_) | Action::ReconnectGroup(_) => Some(Icon::Refresh),
         Action::ToggleTray => Some(Icon::ChevronDown),
@@ -636,14 +953,14 @@ fn button(
         Action::ConnectRecent(_) => Some(Icon::Hosts),
         Action::PrevMember => Some(Icon::ChevronLeft),
         Action::NextMember => Some(Icon::ChevronRight),
-        Action::Member(_) => Some(if text == "member" {
+        Action::Member(_) | Action::PaneBroadcast(_) => Some(if text == "member" {
             Icon::CheckboxChecked
         } else {
             Icon::Checkbox
         }),
         _ => None,
     };
-    let text = if matches!(action, Action::Member(_)) {
+    let text = if matches!(action, Action::Member(_) | Action::PaneBroadcast(_)) {
         String::new()
     } else {
         text
@@ -665,8 +982,7 @@ fn action_hint(
     broadcast: Option<&termviai_broadcast::BroadcastState<usize>>,
 ) -> Option<&'static str> {
     Some(match action {
-        Action::Edit(_) => "Edit host",
-        Action::Member(id) => match broadcast {
+        Action::Member(id) | Action::PaneBroadcast(id) => match broadcast {
             Some(state) if pane_broadcasting(state, *id) => {
                 "Broadcast ON · Click to use independent input"
             }
@@ -676,18 +992,26 @@ fn action_hint(
             }
             _ => "Broadcast OFF · Click to select this session",
         },
-        Action::TabBroadcast(_) => "Turn broadcast on / off for every session in this tab",
-        Action::ToggleTray => "Show / hide broadcast controls",
-        Action::Broadcast => match broadcast {
-            Some(state) if state.enabled() => "Pause broadcast · Keep selected hosts",
-            Some(state) if state.member_count() == 0 => "Select hosts to enable broadcast",
-            _ => "Start broadcast to selected hosts",
-        },
+        Action::TabBroadcast(_) => {
+            "Select all sessions for broadcast / Turn all off when fully selected"
+        }
         Action::ReconnectPane(_) => "Reconnect this SSH session",
-        Action::ReconnectGroup(_) => "Reconnect all SSH sessions in this tab",
+        Action::ReconnectGroup(_) => "Reconnect offline SSH sessions in this tab",
+        Action::FocusPane(_) => "Drag onto another session to swap positions",
         Action::Tab(_) => "Drag to reorder tabs",
         _ => return None,
     })
+}
+
+fn wrap_hint(text: &str, columns: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.lines() {
+        let chars: Vec<char> = paragraph.chars().collect();
+        for chunk in chars.chunks(columns.max(1)) {
+            lines.push(chunk.iter().collect());
+        }
+    }
+    lines
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -695,14 +1019,19 @@ struct PaneHeaderControls {
     broadcast_x: f32,
     remove_x: Option<f32>,
     label_right_inset: f32,
+    error_x: Option<f32>,
 }
 
-fn pane_header_controls(x: f32, width: f32, grouped: bool) -> PaneHeaderControls {
-    let remove_x = grouped.then_some(x + width - 34.);
+fn pane_header_controls(x: f32, width: f32, grouped: bool, has_error: bool) -> PaneHeaderControls {
+    // On narrow panes prioritize the error and reconnect controls. Closing is
+    // still available through the group when there isn't room for three buttons.
+    let show_remove = grouped && (!has_error || width >= 104.);
+    let broadcast_x = x + width - if show_remove { 66. } else { 34. };
     PaneHeaderControls {
-        broadcast_x: x + width - if grouped { 66. } else { 34. },
-        remove_x,
-        label_right_inset: if grouped { 72. } else { 40. },
+        broadcast_x,
+        remove_x: show_remove.then_some(x + width - 34.),
+        label_right_inset: (if show_remove { 72. } else { 40. }) + if has_error { 28. } else { 0. },
+        error_x: has_error.then_some(broadcast_x - 28.),
     }
 }
 
@@ -1273,7 +1602,8 @@ impl TermWindow {
                 || self.termviai_library_active()
                 || self.termviai_ui.form.is_some()
                 || self.termviai_ui.closing_form.is_some()
-                || self.termviai_ui.tab_menu.is_some())
+                || self.termviai_ui.tab_menu.is_some()
+                || self.termviai_ui.host_menu.is_some())
     }
 
     fn termviai_save_form(&mut self) -> anyhow::Result<()> {
@@ -1312,9 +1642,7 @@ impl TermWindow {
 
     fn termviai_connect(&mut self, mut host: Host) -> anyhow::Result<()> {
         host.validate()?;
-        let target = self.termviai_ui.split_target;
-        self.termviai_open_workspace(SavedLayout::Pane { host }, None, None, target)?;
-        self.termviai_ui.split_target = None;
+        self.termviai_open_workspace(SavedLayout::Pane { host }, None, None, None)?;
         self.termviai_ui.new_tab_open = false;
         self.termviai_ui.discard_form();
         Ok(())
@@ -1322,6 +1650,8 @@ impl TermWindow {
 
     pub(super) fn reset_termviai_interaction(&mut self) {
         self.cancel_termviai_tab_drag();
+        self.termviai_ui.input_drag = None;
+        self.termviai_ui.host_menu = None;
         self.termviai_ui.pressed = None;
         self.termviai_ui.hover = None;
         self.termviai_ui.tab_menu = None;
@@ -1351,7 +1681,6 @@ impl TermWindow {
             Action::ConfirmCancel | Action::ConfirmDismiss => self.termviai_cancel_close(),
             Action::ConfirmCard => {}
             Action::Hosts | Action::Keys => {
-                self.termviai_ui.split_target = None;
                 self.termviai_ui.page = if action == Action::Hosts {
                     Page::Hosts
                 } else {
@@ -1366,7 +1695,6 @@ impl TermWindow {
             }
             Action::NewTab => {
                 self.termviai_ui.discard_form();
-                self.termviai_ui.split_target = None;
                 self.termviai_ui.new_tab_open = true;
                 self.termviai_ui.page = Page::NewTab;
                 self.termviai_ui.query = Input::default();
@@ -1395,7 +1723,23 @@ impl TermWindow {
                 self.termviai_ui.tab_menu = None;
                 self.termviai_save_workspace(id)?;
             }
-            Action::DismissMenu => self.termviai_ui.tab_menu = None,
+            Action::DismissMenu => {
+                self.termviai_ui.tab_menu = None;
+                self.termviai_ui.host_menu = None;
+            }
+            Action::EditMenuHost => {
+                if let Some((host, _, _)) = self.termviai_ui.host_menu.take() {
+                    self.termviai_ui.open_form(false, Some(host));
+                }
+            }
+            Action::DuplicateHost => {
+                if let Some((host, _, _)) = self.termviai_ui.host_menu.take() {
+                    let mut store = HostStore::load()?;
+                    store.duplicate_host(&host)?;
+                    store.save()?;
+                    self.termviai_ui.store = store;
+                }
+            }
             Action::OpenSaved(id) => {
                 let group = self
                     .termviai_ui
@@ -1441,7 +1785,6 @@ impl TermWindow {
             Action::TabBroadcast(id) => {
                 self.termviai_sync_broadcast();
                 self.termviai_broadcast.toggle_group(id);
-                self.termviai_broadcast.error.clear();
                 self.termviai_ui.error.clear();
             }
             Action::Settings => {
@@ -1451,21 +1794,102 @@ impl TermWindow {
             }
             Action::AddHost => self.termviai_ui.open_form(false, None),
             Action::AddKey => self.termviai_ui.open_form(true, None),
+            Action::AddIdentity => self.termviai_ui.open_identity(None),
+            Action::EditIdentity(index) => {
+                let identity = self
+                    .termviai_ui
+                    .store
+                    .identities
+                    .get(index)
+                    .context("Identity no longer exists")?
+                    .clone();
+                self.termviai_ui.open_identity(Some(identity));
+            }
+            Action::ChooseAuth => {
+                if let Some(f) = &mut self.termviai_ui.form {
+                    f.auth.picker = !f.auth.picker;
+                    f.auth.picker_scroll = 0;
+                }
+            }
+            Action::ManualAuth => {
+                if let Some(f) = &mut self.termviai_ui.form {
+                    f.auth.selected_identity.clear();
+                    f.auth.picker = false;
+                }
+            }
+            Action::UseIdentity(index) => {
+                let identity = self
+                    .termviai_ui
+                    .store
+                    .identities
+                    .get(index)
+                    .context("Identity no longer exists")?
+                    .clone();
+                if let Some(f) = &mut self.termviai_ui.form {
+                    f.auth.selected_identity = identity.id;
+                    f.fields[3] = Input::new(identity.username);
+                    f.fields[5] = Input::default();
+                    f.fields[4] = Input::default();
+                    f.auth.picker = false;
+                    f.auth.reveal = false;
+                }
+            }
+            Action::RememberPassword => {
+                if let Some(f) = &mut self.termviai_ui.form {
+                    f.auth.remember = !f.auth.remember;
+                }
+            }
+            Action::RevealPassword => {
+                if let Some(f) = &mut self.termviai_ui.form {
+                    f.auth.reveal = !f.auth.reveal;
+                }
+            }
+            Action::DeleteIdentity => {
+                let f = self.termviai_ui.form.as_mut().context("No identity open")?;
+                if !f.auth.confirm_delete {
+                    f.auth.confirm_delete = true;
+                } else if let Some(original) = &f.auth.original_identity {
+                    let mut store = HostStore::load()?;
+                    anyhow::ensure!(
+                        !store.hosts.iter().any(|h| h.identity_id == original.id),
+                        "This identity is used by a Host. Change that host's authentication first."
+                    );
+                    let index = store
+                        .identities
+                        .iter()
+                        .position(|i| i == original)
+                        .context("This identity changed. Reopen it.")?;
+                    store.identities.remove(index);
+                    store.save()?;
+                    wezterm_ssh::credentials::delete(&original.id)?;
+                    self.termviai_ui.store = store;
+                    self.termviai_ui.close_form();
+                }
+            }
+
             Action::Cancel => {
+                if let Some(f) = &mut self.termviai_ui.form {
+                    if f.auth.picker {
+                        f.auth.picker = false;
+                        return Ok(());
+                    }
+                }
                 self.termviai_ui.close_form();
                 self.termviai_ui.error.clear();
             }
-            Action::Save => self.termviai_save_form()?,
-            Action::Edit(i) => {
-                let h = self
+            Action::Save => {
+                if self
                     .termviai_ui
-                    .store
-                    .hosts
-                    .get(i)
-                    .context("Host no longer exists")?
-                    .clone();
-                self.termviai_ui.open_form(false, Some(h));
+                    .form
+                    .as_ref()
+                    .is_some_and(|f| f.auth.picker)
+                {
+                    self.termviai_ui.form.as_mut().unwrap().auth.picker = false;
+                } else {
+                    self.termviai_save_form()?;
+                }
             }
+            Action::HostMenu(i) => self.termviai_ui.open_host_menu(i)?,
             Action::Connect(i) => {
                 let h = self
                     .termviai_ui
@@ -1493,7 +1917,12 @@ impl TermWindow {
             }
             Action::UseKey(i) => {
                 if let Some(f) = &mut self.termviai_ui.form {
-                    if !f.key && !f.settings && f.rename_tab.is_none() {
+                    if f.is_host() {
+                        f.auth.selected_identity.clear();
+                        f.auth.picker = false;
+                        f.fields[4] = Input::default();
+                        f.auth.remember = false;
+                        f.auth.reset_password = true;
                         f.fields[5] = Input::new(self.termviai_ui.store.keys[i].path.clone());
                         f.focus = 5;
                         f.reveal_focus = true;
@@ -1511,7 +1940,6 @@ impl TermWindow {
                         self.close_specific_tab(i, true);
                     } else {
                         self.termviai_ui.page = Page::Terminal;
-                        self.termviai_ui.split_target = None;
                         self.termviai_ui.discard_form();
                         self.activate_tab(i as isize)?;
                     }
@@ -1544,27 +1972,11 @@ impl TermWindow {
                     self.close_requested(&w);
                 }
             }
-            Action::AddSsh(vertical) => {
-                anyhow::ensure!(
-                    !self.termviai_ui.connecting,
-                    "An SSH connection is still opening"
-                );
-                let mux = Mux::get();
-                let tab = mux
-                    .get_active_tab_for_window(self.mux_window_id)
-                    .context("No active tab")?;
-                let pane = tab.get_active_pane().context("No active pane")?;
-                self.termviai_action(Action::Hosts)?;
-                self.termviai_ui.split_target = Some((tab.tab_id(), pane.pane_id(), vertical));
-            }
-            Action::CancelSplit => {
-                self.termviai_ui.split_target = None;
-                self.termviai_ui.page = Page::Terminal;
-            }
             Action::Broadcast
             | Action::BroadcastAll
             | Action::BroadcastNone
-            | Action::Member(_) => {
+            | Action::Member(_)
+            | Action::PaneBroadcast(_) => {
                 self.termviai_sync_broadcast();
                 let mux = Mux::get();
                 let tab = mux
@@ -1575,11 +1987,12 @@ impl TermWindow {
                         Action::Broadcast => state.toggle_enabled(),
                         Action::BroadcastAll => state.select_all(),
                         Action::BroadcastNone => state.select_none(),
-                        Action::Member(id) => state.toggle_member(id)?,
+                        Action::Member(id) | Action::PaneBroadcast(id) => {
+                            state.toggle_member(id)?
+                        }
                         _ => unreachable!(),
                     }
                 }
-                self.termviai_broadcast.error.clear();
                 self.termviai_ui.error.clear();
             }
             Action::FocusPane(id) => {
@@ -1597,6 +2010,13 @@ impl TermWindow {
             Action::ReconnectPane(id) => self.termviai_reconnect_pane(id),
             Action::ReconnectGroup(id) => self.termviai_reconnect_group(id),
             Action::RemovePane(id) => self.close_specific_pane(id, true),
+            Action::PaneError(id) => {
+                self.termviai_broadcast.pane_errors.remove(&id);
+                self.termviai_ui.workspace.reconnect_errors.remove(&id);
+                if let Some((_, _, tab)) = Mux::get().resolve_pane_id(id) {
+                    self.termviai_ui.terminal_errors.remove(&tab);
+                }
+            }
             Action::Drag | Action::Drawer => {}
         }
         self.update_title();
@@ -1678,6 +2098,7 @@ impl TermWindow {
             || x < self.termviai_ui.sidebar_width(Instant::now())
             || y < 52.
             || self.termviai_ui.pressed.is_some()
+            || self.termviai_ui.input_drag.is_some()
             || self.termviai_ui.tab_drag.is_some();
         if !capture {
             if matches!(event.kind, MouseEventKind::Move) && self.termviai_ui.hover.take().is_some()
@@ -1687,6 +2108,66 @@ impl TermWindow {
             return false;
         }
         self.current_mouse_event = Some(event.clone());
+        if matches!(
+            event.kind,
+            MouseEventKind::Move | MouseEventKind::Release(MousePress::Left)
+        ) {
+            if let Some(action) = self.termviai_ui.input_drag.clone() {
+                if event.mouse_buttons.contains(window::MouseButtons::LEFT)
+                    || matches!(event.kind, MouseEventKind::Release(MousePress::Left))
+                {
+                    let position = self
+                        .termviai_ui
+                        .input_hits
+                        .iter()
+                        .find(|hit| hit.action == action)
+                        .map(|hit| {
+                            let position = hit.position(x);
+                            if x > hit.x + hit.positions.last().copied().unwrap_or(0.) + 4. {
+                                position + 1
+                            } else if x < hit.x - 4. {
+                                position.saturating_sub(1)
+                            } else {
+                                position
+                            }
+                        });
+                    if let (Some(position), Some(input)) = (position, self.termviai_ui.input()) {
+                        input.move_to(position, true);
+                        self.termviai_ui.generation += 1;
+                    }
+                }
+                if !event.mouse_buttons.contains(window::MouseButtons::LEFT)
+                    || matches!(event.kind, MouseEventKind::Release(MousePress::Left))
+                {
+                    self.termviai_ui.input_drag = None;
+                }
+                context.set_cursor(Some(CursorIcon::Text));
+                context.invalidate();
+                return true;
+            }
+        }
+        if matches!(event.kind, MouseEventKind::Press(MousePress::Left))
+            && matches!(over, Some(Action::Field(_) | Action::Search))
+        {
+            let action = over.clone().unwrap();
+            let position = self
+                .termviai_ui
+                .input_hits
+                .iter()
+                .find(|hit| hit.action == action)
+                .map(|hit| hit.position(x))
+                .unwrap_or(0);
+            let _ = self.termviai_action(action.clone());
+            if let Some(input) = self.termviai_ui.input() {
+                input.move_to(position, event.modifiers.contains(Modifiers::SHIFT));
+                input.anchor.get_or_insert(input.cursor);
+            }
+            self.termviai_ui.input_drag = Some(action);
+            self.termviai_ui.pressed = None;
+            context.set_cursor(Some(CursorIcon::Text));
+            context.invalidate();
+            return true;
+        }
         match event.kind {
             MouseEventKind::Move => {
                 if self.termviai_ui.tab_drag.is_some() {
@@ -1709,7 +2190,9 @@ impl TermWindow {
                     context.invalidate();
                 }
                 context.set_cursor(Some(
-                    if over.is_some()
+                    if matches!(over, Some(Action::Field(_) | Action::Search)) {
+                        CursorIcon::Text
+                    } else if over.is_some()
                         && !matches!(over, Some(Action::Drag | Action::Drawer | Action::Cancel))
                     {
                         CursorIcon::Pointer
@@ -1744,6 +2227,8 @@ impl TermWindow {
                 } else {
                     if let Some(Action::Tab(id)) = &over {
                         self.begin_termviai_tab_drag(*id, x, y);
+                    } else if let Some(Action::FocusPane(id)) = &over {
+                        self.begin_termviai_pane_drag(*id, x, y);
                     }
                     self.termviai_ui.pressed = over;
                     context.invalidate();
@@ -1815,6 +2300,20 @@ impl TermWindow {
                         / scale,
                 );
                 if let Some(form) = &mut self.termviai_ui.form {
+                    if form.auth.picker {
+                        form.auth.picker_scroll = if amount > 0 {
+                            form.auth
+                                .picker_scroll
+                                .saturating_sub(amount.unsigned_abs() as usize)
+                        } else {
+                            form.auth
+                                .picker_scroll
+                                .saturating_add(amount.unsigned_abs() as usize)
+                        };
+                        context.invalidate();
+                        return true;
+                    }
+
                     if x >= layout.x
                         + (1. - self.termviai_ui.drawer_motion.value(Instant::now())) * layout.width
                         && y >= 148.
@@ -1894,9 +2393,10 @@ impl TermWindow {
             context.invalidate();
             return true;
         }
-        if self.termviai_ui.tab_menu.is_some() {
+        if self.termviai_ui.tab_menu.is_some() || self.termviai_ui.host_menu.is_some() {
             if event.key_is_down && event.key == KeyCode::Char('\u{1b}') {
                 self.termviai_ui.tab_menu = None;
+                self.termviai_ui.host_menu = None;
                 context.invalidate();
             }
             return true;
@@ -1923,6 +2423,33 @@ impl TermWindow {
             return true;
         }
         let ctrl = event.modifiers.contains(Modifiers::CTRL);
+        if ctrl && matches!(event.key, KeyCode::Char('c' | 'C' | 'x' | 'X')) {
+            if self
+                .termviai_ui
+                .form
+                .as_ref()
+                .is_some_and(Form::masked_password)
+            {
+                return true;
+            }
+            if let Some(text) = self
+                .termviai_ui
+                .input()
+                .and_then(|input| input.selected_text())
+            {
+                if let Some(window) = &self.window {
+                    window.set_clipboard(Clipboard::Clipboard, text);
+                    if matches!(event.key, KeyCode::Char('x' | 'X')) {
+                        if let Some(input) = self.termviai_ui.input() {
+                            input.remove_selection();
+                        }
+                        self.termviai_ui.generation += 1;
+                    }
+                }
+            }
+            context.invalidate();
+            return true;
+        }
         if ctrl && matches!(event.key, KeyCode::Char('v' | 'V')) {
             let generation = self.termviai_ui.generation;
             if let Some(w) = self.window.clone() {
@@ -1948,6 +2475,15 @@ impl TermWindow {
             }
             return true;
         }
+        if let Some(f) = &mut self.termviai_ui.form {
+            if f.auth.picker {
+                if event.key == KeyCode::Char('\u{1b}') {
+                    f.auth.picker = false;
+                    context.invalidate();
+                }
+                return true;
+            }
+        }
         self.termviai_ui.generation += 1;
         match &event.key {
             KeyCode::Char('\u{1b}') => {
@@ -1955,7 +2491,6 @@ impl TermWindow {
                     self.termviai_ui.close_form();
                     self.termviai_ui.error.clear();
                 } else {
-                    self.termviai_ui.split_target = None;
                     self.termviai_ui.page = if Mux::get()
                         .get_active_tab_for_window(self.mux_window_id)
                         .is_some()
@@ -1997,16 +2532,25 @@ impl TermWindow {
                     } else {
                         (f.focus + 1) % n
                     };
+                    if !f.auth.selected_identity.is_empty() {
+                        while matches!(f.focus, 3 | 4 | 5) {
+                            f.focus = if event.modifiers.contains(Modifiers::SHIFT) {
+                                (f.focus + n - 1) % n
+                            } else {
+                                (f.focus + 1) % n
+                            };
+                        }
+                    }
                     f.reveal_focus = true;
                 }
             }
             KeyCode::Char('f' | 'F') if ctrl && self.termviai_ui.form.is_none() => {
                 self.termviai_ui.search_focus = true;
-                self.termviai_ui.query.selected = true;
+                self.termviai_ui.query.select_all();
             }
             KeyCode::Char('a' | 'A') if ctrl => {
                 if let Some(i) = self.termviai_ui.input() {
-                    i.selected = true;
+                    i.select_all();
                 }
             }
             KeyCode::Char('\u{8}') => {
@@ -2021,26 +2565,39 @@ impl TermWindow {
             }
             KeyCode::LeftArrow => {
                 if let Some(i) = self.termviai_ui.input() {
-                    i.cursor = i.cursor.saturating_sub(1);
-                    i.selected = false;
+                    let extend = event.modifiers.contains(Modifiers::SHIFT);
+                    let position = if !extend {
+                        i.selection()
+                            .map(|r| r.start)
+                            .unwrap_or(i.cursor.saturating_sub(1))
+                    } else {
+                        i.cursor.saturating_sub(1)
+                    };
+                    i.move_to(position, extend);
                 }
             }
             KeyCode::RightArrow => {
                 if let Some(i) = self.termviai_ui.input() {
-                    i.cursor = (i.cursor + 1).min(i.value.chars().count());
-                    i.selected = false;
+                    let extend = event.modifiers.contains(Modifiers::SHIFT);
+                    let position = if !extend {
+                        i.selection().map(|r| r.end).unwrap_or(i.cursor + 1)
+                    } else {
+                        i.cursor + 1
+                    };
+                    i.move_to(position, extend);
                 }
             }
             KeyCode::Home => {
                 if let Some(i) = self.termviai_ui.input() {
-                    i.cursor = 0;
-                    i.selected = false;
+                    i.move_to(0, event.modifiers.contains(Modifiers::SHIFT));
                 }
             }
             KeyCode::End => {
                 if let Some(i) = self.termviai_ui.input() {
-                    i.cursor = i.value.chars().count();
-                    i.selected = false;
+                    i.move_to(
+                        i.value.chars().count(),
+                        event.modifiers.contains(Modifiers::SHIFT),
+                    );
                 }
             }
             KeyCode::Char(c)
@@ -2078,6 +2635,7 @@ impl TermWindow {
         let confirmation_progress = self.termviai_confirm.motion.value(now);
         let confirmation_focus = self.termviai_confirm.focused_confirm;
         let scale = self.dimensions.dpi as f32 / 96.;
+        let ui_font = self.fonts.title_font()?;
         let w = self.dimensions.pixel_width as f32 / scale;
         let border = self.get_os_border();
         let top = border.top.get() as f32;
@@ -2155,17 +2713,49 @@ impl TermWindow {
             .termviai_broadcast
             .tabs
             .iter()
-            .map(|(id, state)| (*id, state.enabled()))
+            .map(|(id, state)| (*id, group_broadcasting(state)))
             .collect();
         let broadcast = active_tab
             .as_ref()
             .and_then(|tab| self.termviai_broadcast.tabs.get(&tab.tab_id()))
             .cloned();
-        let broadcast_error = if self.termviai_broadcast.error.is_empty() {
-            self.termviai_ui.error.clone()
-        } else {
-            self.termviai_broadcast.error.clone()
-        };
+        // Store terminal notices with their owning tab, never in a global banner.
+        self.termviai_ui
+            .terminal_errors
+            .retain(|id, _| current_tabs.iter().any(|t| t.tab_id() == *id));
+        if self.termviai_ui.page == Page::Terminal
+            && self.termviai_ui.form.is_none()
+            && !self.termviai_ui.error.is_empty()
+        {
+            if let Some(id) = active_id {
+                let error = std::mem::take(&mut self.termviai_ui.error);
+                self.termviai_ui.terminal_errors.insert(id, error);
+            }
+        }
+        let mut pane_errors = self.termviai_broadcast.pane_errors.clone();
+        for (id, error) in &self.termviai_ui.workspace.reconnect_errors {
+            pane_errors
+                .entry(*id)
+                .and_modify(|message| {
+                    message.push('\n');
+                    message.push_str(error);
+                })
+                .or_insert_with(|| error.clone());
+        }
+        if let Some(tab) = &active_tab {
+            if let (Some(pane), Some(error)) = (
+                tab.get_active_pane(),
+                self.termviai_ui.terminal_errors.get(&tab.tab_id()),
+            ) {
+                pane_errors
+                    .entry(pane.pane_id())
+                    .and_modify(|message| {
+                        message.push('\n');
+                        message.push_str(error);
+                    })
+                    .or_insert_with(|| error.clone());
+            }
+        }
         let drag_visuals = self.termviai_tab_drag_visuals();
         let mut tiles = vec![];
         let mut hits = vec![];
@@ -2248,11 +2838,7 @@ impl TermWindow {
                     26.,
                     28.,
                     "",
-                    if !reconnect && group_states.get(id) == Some(&true) {
-                        "#625bcc"
-                    } else {
-                        TOP
-                    },
+                    TOP,
                     if reconnect {
                         Action::ReconnectGroup(*id)
                     } else {
@@ -2262,17 +2848,17 @@ impl TermWindow {
                 );
                 let t = tiles.last_mut().unwrap();
                 let broadcasting = !reconnect && group_states.get(id) == Some(&true);
-                t.transparent = !broadcasting;
+                t.transparent = true;
                 t.fg = if reconnect {
                     RECONNECT
                 } else if broadcasting {
-                    INK
+                    SIGNAL_INK
                 } else {
                     MUTED
                 };
-                if reconnect {
-                    t.icon_size = 16.;
-                }
+                // Match pane-header icons: 18 px also keeps a clear 2 px stroke at 100% DPI.
+                t.icon_size = if reconnect { 16. } else { 18. };
+                t.corner_radius = 7.;
             }
             button(
                 &mut tiles,
@@ -2282,11 +2868,7 @@ impl TermWindow {
                 24.,
                 28.,
                 "",
-                if *active && (ui.page == Page::Terminal || *id == usize::MAX) {
-                    FIELD
-                } else {
-                    TOP
-                },
+                TOP,
                 if *id == usize::MAX {
                     Action::CloseNewTab
                 } else {
@@ -2294,6 +2876,10 @@ impl TermWindow {
                 },
                 &hover,
             );
+            let close = tiles.last_mut().unwrap();
+            close.transparent = true;
+            close.fg = MUTED;
+            close.icon_size = 18.;
             tx += tw;
         }
         button(
@@ -2433,66 +3019,7 @@ impl TermWindow {
         for hit in &mut hits[sidebar_hit_start..] {
             hit.x += sidebar_shift;
         }
-        let terminal_sidebar_tile_start = tiles.len();
-        let terminal_sidebar_hit_start = hits.len();
         if ui.page == Page::Terminal {
-            tile(
-                &mut tiles,
-                16.,
-                226.,
-                192.,
-                28.,
-                "WORKSPACE",
-                SIDE,
-                MUTED,
-                false,
-            );
-            button(
-                &mut tiles,
-                &mut hits,
-                12.,
-                262.,
-                196.,
-                36.,
-                "Add SSH right",
-                CARD,
-                Action::AddSsh(false),
-                &hover,
-            );
-            button(
-                &mut tiles,
-                &mut hits,
-                12.,
-                306.,
-                196.,
-                36.,
-                "Add SSH below",
-                CARD,
-                Action::AddSsh(true),
-                &hover,
-            );
-            if let Some(tab) = &active_tab {
-                if pane_list.len() > 1 {
-                    button(
-                        &mut tiles,
-                        &mut hits,
-                        12.,
-                        358.,
-                        196.,
-                        36.,
-                        "Save group · Ctrl+S",
-                        SIDE,
-                        Action::SaveWorkspace(tab.tab_id()),
-                        &hover,
-                    );
-                }
-            }
-            for tile in &mut tiles[terminal_sidebar_tile_start..] {
-                tile.x += sidebar_shift;
-            }
-            for hit in &mut hits[terminal_sidebar_hit_start..] {
-                hit.x += sidebar_shift;
-            }
             if ui.connecting {
                 tile(
                     &mut tiles,
@@ -2545,13 +3072,14 @@ impl TermWindow {
                 );
                 let t = tiles.last_mut().unwrap();
                 let grouped = pane_list.len() > 1;
-                let controls = pane_header_controls(rect.x, rect.w, grouped);
+                let has_error = pane_errors.contains_key(&header.pane_id);
+                let controls = pane_header_controls(rect.x, rect.w, grouped, has_error);
                 t.right_inset = controls.label_right_inset;
                 t.transparent = true;
                 t.fg = if header.is_active { ACCENT } else { MUTED };
                 t.icon = Some(Icon::Hosts);
                 t.rounded = false;
-                if rect.w < 76. || rect.h < 24. {
+                if rect.w < controls.label_right_inset + 52. || rect.h < 24. {
                     t.text.clear();
                     t.icon = None;
                 }
@@ -2596,14 +3124,15 @@ impl TermWindow {
                             28.,
                             rect.h.min(28.),
                             if member { "member" } else { "solo" },
-                            if broadcasting { "#383453" } else { BG },
-                            Action::Member(header.pane_id),
+                            BG,
+                            Action::PaneBroadcast(header.pane_id),
                             &hover,
                         );
                         let t = tiles.last_mut().unwrap();
                         t.icon = Some(Icon::Broadcast);
-                        t.transparent = !broadcasting;
-                        t.fg = if broadcasting { ACCENT } else { MUTED };
+                        t.corner_radius = 7.;
+                        t.transparent = true;
+                        t.fg = if broadcasting { SIGNAL_INK } else { MUTED };
                     }
                     if let Some(remove_x) = controls.remove_x {
                         button(
@@ -2620,24 +3149,30 @@ impl TermWindow {
                         );
                         let t = tiles.last_mut().unwrap();
                         t.fg = MUTED;
+                        t.transparent = true;
                     }
                 }
-                if let Some(error) = ui.workspace.reconnect_errors.get(&header.pane_id) {
-                    let error_height = 28_f32.min((frame.h - rect.h - 12.).max(0.));
-                    tile(
+                if has_error && rect.w >= 76. && rect.h >= 20. {
+                    // Keep the alert in the pane chrome, clear of terminal text and controls.
+                    let alert_x = controls.error_x.unwrap();
+                    button(
                         &mut tiles,
-                        frame.x + 8.,
-                        rect.y + rect.h + 4.,
-                        (frame.w - 16.).max(0.),
-                        error_height,
-                        error.clone(),
-                        "#59333f",
-                        INK,
-                        true,
+                        &mut hits,
+                        alert_x,
+                        rect.y + (rect.h - 24.).max(0.) / 2.,
+                        24.,
+                        24.,
+                        "",
+                        "#ad4f60",
+                        Action::PaneError(header.pane_id),
+                        &hover,
                     );
-                    if let Some(tile) = tiles.last_mut() {
-                        tile.zindex = 34;
-                    }
+                    let t = tiles.last_mut().unwrap();
+                    t.icon = Some(Icon::Alert);
+                    t.icon_size = 16.;
+                    t.corner_radius = 12.;
+                    t.fg = "#fff2f3";
+                    t.zindex = 34;
                 }
             }
             let enabled = broadcast.as_ref().map(|s| s.enabled()).unwrap_or(false);
@@ -3027,20 +3562,6 @@ impl TermWindow {
             } else {
                 Icon::ChevronUp
             });
-            if !broadcast_error.is_empty() {
-                tile(
-                    &mut tiles,
-                    content_left + 16.,
-                    104.,
-                    (w - content_left - 40.).max(1.),
-                    34.,
-                    broadcast_error.clone(),
-                    "#59333f",
-                    INK,
-                    true,
-                );
-                tiles.last_mut().unwrap().zindex = 34;
-            }
         }
         if ui.page == Page::NewTab {
             tile(
@@ -3075,6 +3596,11 @@ impl TermWindow {
                 Action::Search,
                 &hover,
             );
+            tiles.last_mut().unwrap().input = Some(InputPaint {
+                masked: false,
+                input: ui.query.clone(),
+                focused: ui.search_focus && ui.form.is_none(),
+            });
             let q = ui.query.value.to_lowercase();
             let mut entries: Vec<(String, String, Option<Action>)> = vec![];
             let matches = |name: &str, layout: &SavedLayout| {
@@ -3158,7 +3684,7 @@ impl TermWindow {
                     156.,
                     40.,
                     "Browse Hosts",
-                    "#625bcc",
+                    SIGNAL_BG,
                     Action::Hosts,
                     &hover,
                 );
@@ -3236,7 +3762,7 @@ impl TermWindow {
                 if ui.page == Page::Hosts {
                     "Find a host or ssh user@hostname…".into()
                 } else {
-                    "Find a private key…".into()
+                    "Find a key or identity…".into()
                 }
             } else {
                 ui.query.display(
@@ -3256,6 +3782,11 @@ impl TermWindow {
                 Action::Search,
                 &hover,
             );
+            tiles.last_mut().unwrap().input = Some(InputPaint {
+                masked: false,
+                input: ui.query.clone(),
+                focused: ui.search_focus && ui.form.is_none(),
+            });
             if ui.query.value.is_empty() {
                 tiles.last_mut().unwrap().fg = MUTED;
             }
@@ -3286,7 +3817,7 @@ impl TermWindow {
                 } else {
                     "Add Key"
                 },
-                "#625bcc",
+                SIGNAL_BG,
                 if ui.page == Page::Hosts {
                     Action::AddHost
                 } else {
@@ -3294,48 +3825,20 @@ impl TermWindow {
                 },
                 &hover,
             );
-            if cw >= 420. {
-                tile(
-                    &mut tiles,
-                    cx + cw - 140.,
-                    132.,
-                    140.,
-                    30.,
-                    if ui.split_target.is_some() {
-                        "Pick SSH host"
-                    } else {
-                        "Grid view"
-                    },
-                    SIDE,
-                    MUTED,
-                    false,
-                );
-                tiles.last_mut().unwrap().icon = Some(Icon::Grid);
-            }
-            if ui.split_target.is_some() {
+            if ui.page == Page::Keys {
                 button(
                     &mut tiles,
                     &mut hits,
-                    12.,
-                    238.,
-                    196.,
-                    36.,
-                    "Back to current tab",
+                    cx + 144.,
+                    130.,
+                    (cw - 144.).min(154.).max(1.),
+                    34.,
+                    "Add Identity",
                     CARD,
-                    Action::CancelSplit,
+                    Action::AddIdentity,
                     &hover,
                 );
-                tile(
-                    &mut tiles,
-                    12.,
-                    284.,
-                    196.,
-                    28.,
-                    "Add SSH to this tab",
-                    SIDE,
-                    INK,
-                    false,
-                );
+                tiles.last_mut().unwrap().icon = Some(Icon::Identity);
             }
             let query = ui.query.value.to_lowercase();
             let mut y = 194.;
@@ -3440,7 +3943,7 @@ impl TermWindow {
                             46.,
                             46.,
                             "",
-                            "#383453",
+                            SIGNAL_BG,
                             INK,
                             true,
                         );
@@ -3565,7 +4068,7 @@ impl TermWindow {
                         46.,
                         46.,
                         "",
-                        "#383453",
+                        SIGNAL_BG,
                         INK,
                         true,
                     );
@@ -3610,15 +4113,11 @@ impl TermWindow {
                         26.,
                         "",
                         CARD,
-                        Action::Edit(*id),
+                        Action::HostMenu(*id),
                         &hover,
                     );
                 }
             } else {
-                tile(&mut tiles, cx, y, cw, 30., "Keychain", BG, INK, false);
-                y += 38.;
-                tile(&mut tiles,cx,y,cw,30.,"Private keys stay in their original files. Add a reference to use with your hosts.",BG,MUTED,false);
-                y += 48.;
                 let keys: Vec<_> = ui
                     .store
                     .keys
@@ -3629,59 +4128,122 @@ impl TermWindow {
                             .contains(&query)
                     })
                     .collect();
-                let rows = ((h - y - 28.) / 80.).floor().max(1.) as usize;
-                ui.max_scroll = keys.len().saturating_sub(rows);
+                let identities: Vec<_> = ui
+                    .store
+                    .identities
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, i)| {
+                        format!("{} {}", i.label, i.username)
+                            .to_lowercase()
+                            .contains(&query)
+                    })
+                    .collect();
+                let key_rows = ((keys.len() + columns - 1) / columns).max(1);
+                let identity_rows = ((identities.len() + columns - 1) / columns).max(1);
+                let total_rows = key_rows + identity_rows + 2;
+                let visible_rows = ((h - y - 20.) / 88.).floor().max(1.) as usize;
+                ui.max_scroll = total_rows.saturating_sub(visible_rows);
                 ui.scroll = ui.scroll.min(ui.max_scroll);
-                if keys.is_empty() {
-                    tile(
-                        &mut tiles,
-                        cx,
-                        y + 25.,
-                        cw,
-                        48.,
-                        "No keys yet. Add an existing SSH private key.",
-                        BG,
-                        MUTED,
-                        false,
-                    );
-                }
-                for (i, key) in keys.iter().skip(ui.scroll).take(rows).enumerate() {
-                    tile(
-                        &mut tiles,
-                        cx,
-                        y + i as f32 * 80.,
-                        cw,
-                        66.,
-                        "",
-                        CARD,
-                        INK,
-                        true,
-                    );
-                    tile(
-                        &mut tiles,
-                        cx + 12.,
-                        y + i as f32 * 80. + 8.,
-                        cw - 24.,
-                        24.,
-                        key.label.clone(),
-                        CARD,
-                        INK,
-                        false,
-                    );
-                    tiles.last_mut().unwrap().icon = Some(Icon::Key);
-                    tiles.last_mut().unwrap().transparent = true;
-                    tile(
-                        &mut tiles,
-                        cx + 12.,
-                        y + i as f32 * 80. + 36.,
-                        cw - 24.,
-                        22.,
-                        key.path.clone(),
-                        CARD,
-                        MUTED,
-                        false,
-                    );
-                    tiles.last_mut().unwrap().transparent = true;
+                for row in ui.scroll..(ui.scroll + visible_rows).min(total_rows) {
+                    let cy = y + (row - ui.scroll) as f32 * 88.;
+                    if row == 0 || row == key_rows + 1 {
+                        tile(
+                            &mut tiles,
+                            cx,
+                            cy + 20.,
+                            cw,
+                            32.,
+                            if row == 0 { "Keys" } else { "Identities" },
+                            BG,
+                            INK,
+                            false,
+                        );
+                        continue;
+                    }
+                    let is_key = row <= key_rows;
+                    let item_row = if is_key { row - 1 } else { row - key_rows - 2 };
+                    if (is_key && keys.is_empty()) || (!is_key && identities.is_empty()) {
+                        tile(
+                            &mut tiles,
+                            cx,
+                            cy,
+                            cw,
+                            48.,
+                            if is_key {
+                                "Add a private key file to use with your hosts."
+                            } else {
+                                "Save a username and password to reuse across hosts."
+                            },
+                            BG,
+                            MUTED,
+                            false,
+                        );
+                        continue;
+                    }
+                    for col in 0..columns {
+                        let index = item_row * columns + col;
+                        let (label, detail, icon, action) = if is_key {
+                            match keys.get(index) {
+                                Some(k) => (k.label.clone(), k.path.clone(), Icon::Key, None),
+                                None => continue,
+                            }
+                        } else {
+                            match identities.get(index) {
+                                Some((id, i)) => (
+                                    i.label.clone(),
+                                    format!("{} · Password", i.username),
+                                    Icon::Identity,
+                                    Some(Action::EditIdentity(*id)),
+                                ),
+                                None => continue,
+                            }
+                        };
+                        let x = cx + col as f32 * (cardw + 16.);
+                        if let Some(action) = action {
+                            button(
+                                &mut tiles, &mut hits, x, cy, cardw, 72., "", CARD, action, &hover,
+                            );
+                        } else {
+                            tile(&mut tiles, x, cy, cardw, 72., "", CARD, INK, true);
+                        }
+                        tile(
+                            &mut tiles,
+                            x + 12.,
+                            cy + 13.,
+                            46.,
+                            46.,
+                            "",
+                            SIGNAL_BG,
+                            INK,
+                            true,
+                        );
+                        tiles.last_mut().unwrap().icon = Some(icon);
+                        tile(
+                            &mut tiles,
+                            x + 60.,
+                            cy + 9.,
+                            cardw - 72.,
+                            25.,
+                            label,
+                            CARD,
+                            INK,
+                            false,
+                        );
+                        tiles.last_mut().unwrap().transparent = true;
+                        tile(
+                            &mut tiles,
+                            x + 60.,
+                            cy + 37.,
+                            cardw - 72.,
+                            22.,
+                            detail,
+                            CARD,
+                            MUTED,
+                            false,
+                        );
+                        tiles.last_mut().unwrap().transparent = true;
+                    }
                 }
             }
             if ui.max_scroll > 0 {
@@ -3757,7 +4319,15 @@ impl TermWindow {
             );
             let fx = layout.x + 20.;
             let fw = (layout.width - 40.).max(1.);
-            let title = if form.settings {
+            let title = if form.auth.picker {
+                "Choose authentication"
+            } else if form.auth.editing_identity {
+                if form.auth.original_identity.is_some() {
+                    "Edit Identity"
+                } else {
+                    "Add Identity"
+                }
+            } else if form.settings {
                 "Terminal settings"
             } else if form.rename_tab.is_some() {
                 "Rename tab"
@@ -3787,7 +4357,11 @@ impl TermWindow {
                 110.,
                 fw,
                 26.,
-                if form.settings {
+                if form.auth.picker {
+                    "Use manual credentials or choose from Keychain"
+                } else if form.auth.editing_identity {
+                    "Username & password · Windows protected"
+                } else if form.settings {
                     "Terminal & SSH · saved on this device"
                 } else if form.rename_tab.is_some() {
                     "A stable name for this tab or group"
@@ -3800,7 +4374,9 @@ impl TermWindow {
                 MUTED,
                 false,
             );
-            let labels = if form.settings {
+            let labels = if form.auth.editing_identity {
+                vec!["Label", "Username", "Password"]
+            } else if form.settings {
                 vec![
                     "Global font size · 6–48 pt",
                     "SSH keepalive interval · seconds · 0 disables",
@@ -3815,16 +4391,27 @@ impl TermWindow {
                     "Address",
                     "Port",
                     "Username (optional)",
-                    "Group (optional)",
+                    "Password (optional)",
                     "Private key file path (optional)",
+                    "Group (optional)",
                 ]
             };
-            let visible = form.visible_rows(layout.rows);
+            let visible = if form.auth.picker {
+                0..0
+            } else {
+                form.visible_rows(layout.rows)
+            };
             for (row, i) in visible.enumerate() {
                 let y = 148. + row as f32 * 70.;
                 tile(&mut tiles, fx, y, fw, 20., labels[i], SIDE, MUTED, false);
                 let focused = form.focus == i;
-                let text = form.fields[i].display(focused, ((fw - 30.) / 8.).max(1.) as usize);
+                let password = form.password_index() == Some(i);
+                let linked = !form.auth.selected_identity.is_empty() && matches!(i, 3 | 4 | 5);
+                let text = if password && !form.auth.reveal {
+                    "•".repeat(form.fields[i].value.chars().count())
+                } else {
+                    form.fields[i].display(focused, ((fw - 30.) / 8.).max(1.) as usize)
+                };
                 if focused {
                     tile(
                         &mut tiles,
@@ -3846,17 +4433,79 @@ impl TermWindow {
                     fw,
                     34.,
                     text,
-                    if focused && form.fields[i].selected {
-                        "#474066"
+                    FIELD,
+                    if linked {
+                        Action::ChooseAuth
                     } else {
-                        FIELD
+                        Action::Field(i)
                     },
-                    Action::Field(i),
                     &hover,
                 );
+                if linked {
+                    let t = tiles.last_mut().unwrap();
+                    t.text = if i == 3 {
+                        form.fields[3].value.clone()
+                    } else {
+                        "Managed by Identity".into()
+                    };
+                    t.fg = MUTED;
+                } else {
+                    tiles.last_mut().unwrap().input = Some(InputPaint {
+                        masked: password && !form.auth.reveal,
+                        input: form.fields[i].clone(),
+                        focused: focused && interactive_drawer,
+                    });
+                }
+                if password {
+                    tiles.last_mut().unwrap().right_inset = 58.;
+                    if form.fields[i].value.is_empty() {
+                        tiles.last_mut().unwrap().text = if form.auth.original_identity.is_some()
+                            || form
+                                .original
+                                .as_ref()
+                                .is_some_and(|h| !h.credential_ref().is_empty())
+                        {
+                            "Unchanged · enter to replace".into()
+                        } else {
+                            "Enter password".into()
+                        };
+                    }
+                    button(
+                        &mut tiles,
+                        &mut hits,
+                        fx + fw - 60.,
+                        y + 26.,
+                        58.,
+                        30.,
+                        if form.auth.reveal { "Hide" } else { "Show" },
+                        FIELD,
+                        Action::RevealPassword,
+                        &hover,
+                    );
+                    if form.is_host() {
+                        button(
+                            &mut tiles,
+                            &mut hits,
+                            fx + fw - 168.,
+                            y - 2.,
+                            168.,
+                            22.,
+                            "Remember password",
+                            if form.auth.remember { SIGNAL_BG } else { SIDE },
+                            Action::RememberPassword,
+                            &hover,
+                        );
+                        tiles.last_mut().unwrap().icon = Some(if form.auth.remember {
+                            Icon::CheckboxChecked
+                        } else {
+                            Icon::Checkbox
+                        });
+                        tiles.last_mut().unwrap().icon_size = 14.;
+                    }
+                }
             }
             let max_scroll = form.fields.len().saturating_sub(layout.rows);
-            if max_scroll > 0 {
+            if max_scroll > 0 && !form.auth.picker {
                 let track = layout.rows as f32 * 70. - 12.;
                 tile(&mut tiles, w - 7., 148., 3., track, "", FIELD, MUTED, true);
                 let thumb = (track * layout.rows as f32 / form.fields.len() as f32).max(16.);
@@ -3887,28 +4536,110 @@ impl TermWindow {
                     false,
                 );
             }
-            if !form.settings && !form.key && form.rename_tab.is_none() && !ui.store.keys.is_empty()
-            {
-                let mut kx = fx;
-                for (i, k) in ui.store.keys.iter().enumerate() {
-                    let kw = (k.label.chars().count() as f32 * 8. + 40.).min(170.);
-                    if kx + kw > fx + fw {
-                        break;
-                    }
+            if form.is_host() && !form.auth.picker {
+                let label = ui
+                    .store
+                    .identities
+                    .iter()
+                    .find(|i| i.id == form.auth.selected_identity)
+                    .map(|i| format!("Identity · {}", i.label))
+                    .unwrap_or({
+                        ui.store
+                            .keys
+                            .iter()
+                            .find(|k| k.path == form.fields[5].value)
+                            .map(|k| format!("Key · {}", k.label))
+                            .unwrap_or_else(|| "Authentication · Manual / Keychain".into())
+                    });
+                button(
+                    &mut tiles,
+                    &mut hits,
+                    fx,
+                    layout.footer,
+                    fw,
+                    32.,
+                    label,
+                    CARD,
+                    Action::ChooseAuth,
+                    &hover,
+                );
+                tiles.last_mut().unwrap().icon = Some(Icon::Key);
+            }
+            if form.auth.picker {
+                let mut choices = vec![(
+                    "Manual credentials".to_string(),
+                    Action::ManualAuth,
+                    Icon::Terminal,
+                )];
+                choices.extend(
+                    ui.store
+                        .keys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, k)| (format!("Key · {}", k.label), Action::UseKey(i), Icon::Key)),
+                );
+                choices.extend(ui.store.identities.iter().enumerate().map(|(i, k)| {
+                    (
+                        format!("Identity · {} · {}", k.label, k.username),
+                        Action::UseIdentity(i),
+                        Icon::Identity,
+                    )
+                }));
+                let count = ((layout.footer - 148.) / 52.).floor().max(1.) as usize;
+                form.auth.picker_scroll = form
+                    .auth
+                    .picker_scroll
+                    .min(choices.len().saturating_sub(count));
+                for (row, (label, action, icon)) in choices
+                    .into_iter()
+                    .skip(form.auth.picker_scroll)
+                    .take(count)
+                    .enumerate()
+                {
                     button(
                         &mut tiles,
                         &mut hits,
-                        kx,
-                        layout.footer,
-                        kw,
-                        28.,
-                        k.label.clone(),
+                        fx,
+                        148. + row as f32 * 52.,
+                        fw,
+                        42.,
+                        label,
                         CARD,
-                        Action::UseKey(i),
+                        action,
                         &hover,
                     );
-                    kx += kw + 8.;
+                    tiles.last_mut().unwrap().icon = Some(icon);
                 }
+                tile(
+                    &mut tiles,
+                    fx,
+                    layout.footer,
+                    fw,
+                    28.,
+                    "Scroll to browse · Esc to go back",
+                    SIDE,
+                    MUTED,
+                    false,
+                );
+            }
+            if form.auth.editing_identity && form.auth.original_identity.is_some() {
+                button(
+                    &mut tiles,
+                    &mut hits,
+                    fx,
+                    layout.footer,
+                    fw,
+                    30.,
+                    if form.auth.confirm_delete {
+                        "Confirm delete identity"
+                    } else {
+                        "Delete identity"
+                    },
+                    CARD,
+                    Action::DeleteIdentity,
+                    &hover,
+                );
+                tiles.last_mut().unwrap().fg = "#ed8193";
             }
             if !ui.error.is_empty() {
                 tile(
@@ -3943,8 +4674,8 @@ impl TermWindow {
                 h - 52.,
                 bw,
                 36.,
-                "Save",
-                "#625bcc",
+                if form.auth.picker { "Back" } else { "Save" },
+                SIGNAL_BG,
                 Action::Save,
                 &hover,
             );
@@ -3960,24 +4691,44 @@ impl TermWindow {
                 hits.truncate(drawer_hit_start);
             }
         }
-        if ui.page != Page::Terminal || ui.form.is_some() {
-            let target = if let Some(f) = &ui.form {
-                Action::Field(f.focus)
-            } else {
-                Action::Search
-            };
-            if let (Some(hit), Some(win)) = (
-                hits.iter().find(|hit| hit.action == target),
-                self.window.as_ref(),
-            ) {
-                win.set_text_cursor_position(window::Rect::new(
-                    window::Point::new(
-                        ((hit.x + if target == Action::Search { 38. } else { 12. }) * scale)
-                            as isize,
-                        ((hit.y + hit.h) * scale + top) as isize,
-                    ),
-                    window::Size::new((12. * scale) as isize, (22. * scale) as isize),
-                ));
+        if let Some((_, mx, my)) = &ui.host_menu {
+            let x = mx.min(w - 208.).max(8.);
+            let y = my.min(h - 96.).max(52.);
+            hits.push(Hit {
+                x: 0.,
+                y: 0.,
+                w,
+                h,
+                action: Action::DismissMenu,
+            });
+            let start = tiles.len();
+            tile(&mut tiles, x, y, 200., 88., "", SIDE, INK, true);
+            button(
+                &mut tiles,
+                &mut hits,
+                x + 6.,
+                y + 6.,
+                188.,
+                36.,
+                "Edit Host",
+                SIDE,
+                Action::EditMenuHost,
+                &hover,
+            );
+            button(
+                &mut tiles,
+                &mut hits,
+                x + 6.,
+                y + 46.,
+                188.,
+                36.,
+                "Duplicate Host",
+                SIDE,
+                Action::DuplicateHost,
+                &hover,
+            );
+            for tile in &mut tiles[start..] {
+                tile.zindex = 60;
             }
         }
         if let Some((id, mx, my)) = ui.tab_menu {
@@ -4096,14 +4847,22 @@ impl TermWindow {
                     rect.y + 12.,
                     (rect.w - 24.).clamp(1., 240.),
                     32.,
-                    "Release to place session",
+                    if drag.swapping {
+                        "Release to swap sessions"
+                    } else {
+                        "Release to place session"
+                    },
                     "#285d53",
                     INK,
                     true,
                 );
                 if let Some(t) = tiles.last_mut() {
                     t.zindex = 51;
-                    t.icon = Some(Icon::Plus);
+                    t.icon = Some(if drag.swapping {
+                        Icon::Grid
+                    } else {
+                        Icon::Plus
+                    });
                 }
             }
             let label_width = 210_f32.min(w - 16.);
@@ -4126,27 +4885,67 @@ impl TermWindow {
         let mut hint_due = None;
         if confirmation.is_none()
             && ui.pressed.is_none()
+            && ui.host_menu.is_none()
+            && ui.tab_menu.is_none()
             && ui.form.is_none()
             && ui.closing_form.is_none()
         {
-            if let Some((action, hint)) = hover
-                .as_ref()
-                .and_then(|a| action_hint(a, broadcast.as_ref()).map(|hint| (a, hint)))
-            {
-                let due = ui.hover_started + Duration::from_millis(550);
+            if let Some((action, hint)) = hover.as_ref().and_then(|action| {
+                let hint = match action {
+                    Action::PaneError(id) => pane_errors
+                        .get(id)
+                        .map(|error| format!("{error}\nClick to dismiss")),
+                    _ => action_hint(action, broadcast.as_ref()).map(str::to_owned),
+                };
+                hint.map(|hint| (action, hint))
+            }) {
+                let due = ui.hover_started + Duration::from_millis(400);
                 if now >= due {
                     if let Some(hit) = hits.iter().find(|h| &h.action == action) {
-                        let width = (hint.len() as f32 * 7. + 24.).min(w - 16.);
+                        let mut natural_width = 0_f32;
+                        for line in hint.lines() {
+                            natural_width = natural_width
+                                .max(*text_positions(&ui_font, line, scale)?.last().unwrap_or(&0.));
+                        }
+                        let width = (natural_width + 40.).min(480.).min(w - 16.);
+                        let mut lines = if natural_width + 40. <= width {
+                            hint.lines().map(str::to_owned).collect::<Vec<_>>()
+                        } else {
+                            wrap_hint(&hint, ((width - 40.) / 8.).max(1.) as usize)
+                        };
+                        let max_lines = ((h - 48.) / 22.).max(1.) as usize;
+                        if lines.len() > max_lines {
+                            lines.truncate(max_lines);
+                            if let Some(line) = lines.last_mut() {
+                                line.push('…');
+                            }
+                        }
+                        let height = lines.len() as f32 * 22. + 16.;
                         let x = hit.x.min(w - width - 8.).max(8.);
-                        let y = (hit.y + hit.h + 8.).min(h - 36.);
-                        tile(&mut tiles, x, y, width, 30., hint, FIELD, INK, true);
+                        let y = (hit.y + hit.h + 8.).min(h - height - 8.).max(8.);
+                        tile(&mut tiles, x, y, width, height, "", FIELD, INK, true);
                         tiles.last_mut().unwrap().zindex = 60;
+                        for (index, line) in lines.iter().enumerate() {
+                            tile(
+                                &mut tiles,
+                                x + 4.,
+                                y + 8. + index as f32 * 22.,
+                                width - 8.,
+                                22.,
+                                line,
+                                FIELD,
+                                INK,
+                                false,
+                            );
+                            tiles.last_mut().unwrap().zindex = 61;
+                        }
                     }
                 } else {
                     hint_due = Some(due);
                 }
             }
         }
+
         if let Some(prompt) = &confirmation {
             paint_close_dialog(
                 &mut tiles,
@@ -4214,7 +5013,8 @@ impl TermWindow {
             .render_state
             .as_ref()
             .context("Renderer not initialized")?;
-        for t in tiles {
+        let mut input_hits = Vec::new();
+        for mut t in tiles {
             let hover = t
                 .action
                 .as_ref()
@@ -4240,10 +5040,30 @@ impl TermWindow {
                 bg = mix_color(bg, color(ACCENT), 0.28);
             }
             if t.transparent {
-                bg.3 = 0.;
+                // Header broadcast controls are bare icons at rest. Only the
+                // hovered control gains a subdued surface; color carries state.
+                bg = if t.icon == Some(Icon::Broadcast) {
+                    color(SIGNAL_BG).mul_alpha(if pressed { 0.95 } else { hover * 0.8 })
+                } else {
+                    bg.mul_alpha(0.)
+                };
             }
             bg = bg.mul_alpha(t.opacity);
-            let fg = color(t.fg).mul_alpha(t.opacity);
+            let close_icon = t.text.is_empty()
+                && matches!(
+                    t.action,
+                    Some(Action::CloseTab(_) | Action::CloseNewTab | Action::RemovePane(_))
+                );
+            let fg = if close_icon {
+                mix_color(
+                    color(t.fg),
+                    color("#ed8193"),
+                    if pressed { 1. } else { hover },
+                )
+            } else {
+                color(t.fg)
+            }
+            .mul_alpha(t.opacity);
             if t.outline_width > 0. {
                 let layer = gl_state
                     .layer_for_zindex(t.zindex)
@@ -4269,9 +5089,91 @@ impl TermWindow {
                 bg,
                 t.rounded,
             )];
+            if let Some(paint) = &t.input {
+                let input = &paint.input;
+                let left = if t.icon.is_some() { 38. } else { 12. };
+                let available = (t.w - left - 12. - t.right_inset - 2.).max(1.);
+                let display_value = paint.rendered_value();
+                let positions = text_positions(&font, &display_value, scale)?;
+                let cursor = input.cursor.min(positions.len() - 1);
+                let start = if paint.focused {
+                    positions
+                        .iter()
+                        .position(|x| positions[cursor] - *x <= available)
+                        .unwrap_or(cursor)
+                } else {
+                    0
+                };
+                let end = positions
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take_while(|(_, x)| **x - positions[start] <= available)
+                    .last()
+                    .map(|(index, _)| index)
+                    .unwrap_or(start);
+                if !input.value.is_empty() || paint.focused {
+                    t.text = display_value
+                        .chars()
+                        .skip(start)
+                        .take(end - start)
+                        .collect();
+                }
+                let text_x = t.x + left;
+                let text_height = metrics.cell_size.height as f32 / scale;
+                let text_y = t.y + (t.h - text_height).max(0.) / 2.;
+                if paint.focused {
+                    if let Some(selection) = input.selection() {
+                        let a = selection.start.clamp(start, end);
+                        let b = selection.end.clamp(start, end);
+                        if a < b {
+                            parts.push((
+                                text_x + positions[a] - positions[start],
+                                text_y,
+                                positions[b] - positions[a],
+                                text_height,
+                                ElementContent::Children(vec![]),
+                                color("#575078"),
+                                false,
+                            ));
+                        }
+                    }
+                    let caret_x =
+                        ((text_x + positions[cursor] - positions[start]) * scale).round() / scale;
+                    parts.push((
+                        caret_x,
+                        text_y,
+                        1. / scale,
+                        text_height,
+                        ElementContent::Children(vec![]),
+                        color(INK),
+                        false,
+                    ));
+                    if let Some(window) = &self.window {
+                        window.set_text_cursor_position(window::Rect::new(
+                            window::Point::new(
+                                (caret_x * scale) as isize,
+                                ((text_y + text_height) * scale + top) as isize,
+                            ),
+                            window::Size::new(1, (text_height * scale) as isize),
+                        ));
+                    }
+                }
+                if let Some(action) = &t.action {
+                    input_hits.push(InputHit {
+                        action: action.clone(),
+                        x: text_x,
+                        start,
+                        positions: positions[start..=end]
+                            .iter()
+                            .map(|x| x - positions[start])
+                            .collect(),
+                    });
+                }
+            }
             if let Some(icon) = t.icon {
                 let size = t.icon_size.min(t.h - 4.).min(t.w - 4.).max(1.);
-                let ix = if t.text.is_empty() {
+                let ix = if t.text.is_empty() && t.input.is_none() {
                     t.x + (t.w - size) / 2.
                 } else {
                     t.x + 12.
@@ -4354,6 +5256,7 @@ impl TermWindow {
                 self.render_element(&computed, gl_state, None)?;
             }
         }
+        self.termviai_ui.input_hits = input_hits;
         Ok(())
     }
 }
@@ -4362,18 +5265,228 @@ impl TermWindow {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn host_password_can_switch_between_session_and_remembered_without_retyping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        let mut ui = TermviaiUi::with_store(HostStore::default(), String::new());
+        ui.open_form(false, None);
+        let f = ui.form.as_mut().unwrap();
+        f.fields[1] = Input::new("example.invalid".into());
+        f.fields[4] = Input::new("synthetic-only password".into());
+        ui.save_form_at(&path).unwrap();
+        let first = ui.store.hosts[0].clone();
+        assert!(first.credential_id.is_empty());
+        assert_eq!(
+            wezterm_ssh::credentials::load(first.credential_ref())
+                .unwrap()
+                .as_deref(),
+            Some("synthetic-only password")
+        );
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("synthetic-only password"));
+        ui.open_form(false, Some(first.clone()));
+        ui.form.as_mut().unwrap().auth.remember = true;
+        ui.save_form_at(&path).unwrap();
+        let remembered = ui.store.hosts[0].clone();
+        assert!(!remembered.credential_id.is_empty());
+        assert!(remembered.session_credential.is_empty());
+        assert_eq!(
+            wezterm_ssh::credentials::load(remembered.credential_ref())
+                .unwrap()
+                .as_deref(),
+            Some("synthetic-only password")
+        );
+        ui.open_form(false, Some(remembered.clone()));
+        ui.form.as_mut().unwrap().auth.remember = false;
+        ui.save_form_at(&path).unwrap();
+        assert!(wezterm_ssh::credentials::load(&remembered.credential_id)
+            .unwrap()
+            .is_none());
+        let session = ui.store.hosts[0].credential_ref().to_string();
+        assert_eq!(
+            wezterm_ssh::credentials::load(&session).unwrap().as_deref(),
+            Some("synthetic-only password")
+        );
+        wezterm_ssh::credentials::delete(&session).unwrap();
+        // A restored host can retain a reference after the process password expires.
+        let before = std::fs::read(&path).unwrap();
+        ui.open_form(false, Some(ui.store.hosts[0].clone()));
+        ui.form.as_mut().unwrap().auth.remember = true;
+        assert!(ui
+            .save_form_at(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("Enter it again"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identity_edit_preserves_blank_password_and_host_uses_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        let mut ui = TermviaiUi::with_store(HostStore::default(), String::new());
+        ui.open_identity(None);
+        let f = ui.form.as_mut().unwrap();
+        f.fields[0] = Input::new("Test identity".into());
+        f.fields[1] = Input::new("deploy".into());
+        f.fields[2] = Input::new("synthetic identity secret".into());
+        ui.save_form_at(&path).unwrap();
+        let original = ui.store.identities[0].clone();
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = wezterm_ssh::credentials::delete(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(original.id.clone());
+        ui.open_identity(Some(original.clone()));
+        ui.form.as_mut().unwrap().fields[0] = Input::new("Renamed identity".into());
+        ui.save_form_at(&path).unwrap();
+        assert_eq!(
+            wezterm_ssh::credentials::load(&original.id)
+                .unwrap()
+                .as_deref(),
+            Some("synthetic identity secret")
+        );
+        ui.open_form(false, None);
+        let f = ui.form.as_mut().unwrap();
+        f.fields[1] = Input::new("example.invalid".into());
+        f.auth.selected_identity = original.id.clone();
+        ui.save_form_at(&path).unwrap();
+        assert_eq!(ui.store.hosts[0].username, "deploy");
+        assert_eq!(ui.store.hosts[0].identity_id, original.id);
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(!json.contains("synthetic identity secret"));
+        let saved = HostStore::load_from(&path).unwrap();
+        assert_eq!(saved.hosts[0].credential_ref(), original.id);
+    }
+
+    #[test]
+    fn password_fields_mask_unicode_and_identity_edit_never_prefills_secrets() {
+        let paint = InputPaint {
+            masked: true,
+            input: Input::new("密碼ab".into()),
+            focused: true,
+        };
+        assert_eq!(paint.rendered_value(), "••••");
+        let mut ui = TermviaiUi::with_store(HostStore::default(), String::new());
+        ui.open_identity(Some(Identity {
+            id: "opaque".into(),
+            label: "Ops".into(),
+            username: "root".into(),
+        }));
+        let form = ui.form.as_ref().unwrap();
+        assert_eq!(form.password_index(), Some(2));
+        assert!(form.fields[2].value.is_empty());
+        assert!(!form.auth.reveal);
+        assert_eq!(form.fields[1].value, "root");
+    }
+
+    #[test]
+    fn host_actions_open_a_menu_below_the_button_without_editing() {
+        let host = Host {
+            label: "Production".into(),
+            address: "192.0.2.1".into(),
+            port: 22,
+            ..Default::default()
+        };
+        let mut ui = TermviaiUi::with_store(
+            HostStore {
+                hosts: vec![host.clone()],
+                ..Default::default()
+            },
+            String::new(),
+        );
+        ui.hits.push(Hit {
+            x: 300.,
+            y: 100.,
+            w: 28.,
+            h: 28.,
+            action: Action::HostMenu(0),
+        });
+        ui.hover = Some(Action::HostMenu(0));
+        ui.open_host_menu(0).unwrap();
+        assert_eq!(ui.host_menu, Some((host, 300., 134.)));
+        assert!(ui.form.is_none());
+        assert!(ui.hover.is_none());
+        assert!(ui.open_host_menu(1).is_err());
+    }
+
+    #[test]
+    fn input_range_selection_copies_replaces_and_deletes_unicode() {
+        let mut input = Input::new("ab开发cd".into());
+        input.move_to(4, false);
+        input.move_to(2, true);
+        assert_eq!(input.selected_text().as_deref(), Some("开发"));
+        input.insert("xy");
+        assert_eq!(input.value, "abxycd");
+        assert_eq!(input.cursor, 4);
+        assert!(input.selection().is_none());
+        input.move_to(2, false);
+        input.move_to(4, true);
+        input.delete(false);
+        assert_eq!(input.value, "abcd");
+        assert_eq!(input.cursor, 2);
+        input.select_all();
+        assert_eq!(input.selected_text().as_deref(), Some("abcd"));
+        assert!(input.remove_selection());
+        assert_eq!(input.value, "");
+        input.insert("123213");
+        assert_eq!(input.display(true, 20), "123213");
+        assert!(!input.display(true, 20).contains('│'));
+    }
+
+    #[test]
+    fn proportional_input_hit_testing_uses_glyph_midpoints() {
+        let hit = InputHit {
+            action: Action::Field(1),
+            x: 100.,
+            start: 2,
+            positions: vec![0., 4., 14., 20.],
+        };
+        assert_eq!(hit.position(90.), 2);
+        assert_eq!(hit.position(101.), 2);
+        assert_eq!(hit.position(103.), 3);
+        assert_eq!(hit.position(110.), 4);
+        assert_eq!(hit.position(121.), 5);
+    }
+
+    #[test]
+    fn error_hints_wrap_unicode_and_preserve_separate_messages() {
+        assert_eq!(
+            wrap_hint("离线终端\nRetry", 2),
+            vec!["离线", "终端", "Re", "tr", "y"]
+        );
+        assert_eq!(wrap_hint("ABC", 0), vec!["A", "B", "C"]);
+    }
+
     #[test]
     fn grouped_pane_header_places_remove_after_broadcast() {
-        let grouped = pane_header_controls(100., 500., true);
+        let grouped = pane_header_controls(100., 500., true, false);
         assert_eq!(grouped.broadcast_x, 534.);
         assert_eq!(grouped.remove_x, Some(566.));
         assert_eq!(grouped.label_right_inset, 72.);
         assert_eq!(grouped.remove_x.unwrap() - (grouped.broadcast_x + 28.), 4.);
 
-        let single = pane_header_controls(100., 500., false);
+        let single = pane_header_controls(100., 500., false, false);
         assert_eq!(single.broadcast_x, 566.);
         assert_eq!(single.remove_x, None);
         assert_eq!(single.label_right_inset, 40.);
+        for width in [76., 100., 104., 240., 500.] {
+            for grouped in [false, true] {
+                let c = pane_header_controls(100., width, grouped, true);
+                assert!(c.error_x.unwrap() >= 100.);
+                assert!(c.error_x.unwrap() + 24. <= c.broadcast_x);
+                assert!(c.broadcast_x + 28. <= 100. + width);
+                if let Some(remove) = c.remove_x {
+                    assert!(c.broadcast_x + 28. <= remove);
+                }
+            }
+        }
     }
     #[test]
     fn close_dialog_shields_background_and_tracks_animated_card() {
@@ -4726,6 +5839,7 @@ mod tests {
                 settings: false,
                 first_row: 0,
                 reveal_focus: true,
+                auth: AuthForm::default(),
             };
             let n = form.fields.len();
             assert_eq!(form.visible_rows(2), 0..2);
@@ -4745,7 +5859,7 @@ mod tests {
     #[test]
     fn palette_and_unicode_editing() {
         for c in [
-            BG, SIDE, TOP, CARD, FIELD, INK, MUTED, ACCENT, "#383453", "#59333f", "#625bcc",
+            BG, SIDE, TOP, CARD, FIELD, INK, MUTED, ACCENT, SIGNAL_BG, SIGNAL_INK, "#ad4f60",
         ] {
             color(c);
         }
@@ -4755,7 +5869,7 @@ mod tests {
         assert_eq!(input.value, "开发服务器host");
         input.delete(true);
         assert_eq!(input.value, "开发服务host");
-        input.selected = true;
+        input.select_all();
         input.insert("new\nname");
         assert_eq!(input.value, "newname");
         input.cursor = 0;

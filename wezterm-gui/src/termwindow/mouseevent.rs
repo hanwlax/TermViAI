@@ -71,7 +71,11 @@ impl super::TermWindow {
         {
             if let WMEK::VertWheel(delta) = event.kind {
                 if let Err(err) = self.termviai_adjust_session_font(delta) {
-                    self.termviai_broadcast.error = format!("{:#}", err);
+                    if let Some(pane) = self.get_active_pane_or_overlay() {
+                        self.termviai_broadcast
+                            .pane_errors
+                            .insert(pane.pane_id(), format!("{:#}", err));
+                    }
                 }
                 context.invalidate();
                 return;
@@ -723,21 +727,15 @@ impl super::TermWindow {
                 } else {
                     0.0
                 };
-                let (dx, dy) =
-                    self.termviai_pane_visual_offset(self.termviai_font_source_pane(pos.pane.pane_id()));
+                let (dx, dy) = self.termviai_pane_visual_offset(
+                    self.termviai_font_source_pane(pos.pane.pane_id()),
+                );
                 let content_padding = self.termviai_pane_content_padding_pixels(
                     self.termviai_font_source_pane(pos.pane.pane_id()),
                 );
-                let left = padding_left
-                    + border.left.get() as f32
-                    + dx
-                    - content_padding
+                let left = padding_left + border.left.get() as f32 + dx - content_padding
                     + pos.left as f32 * self.render_metrics.cell_size.width as f32;
-                let top = padding_top
-                    + border.top.get() as f32
-                    + tab_height
-                    + dy
-                    - content_padding
+                let top = padding_top + border.top.get() as f32 + tab_height + dy - content_padding
                     + pos.top as f32 * self.render_metrics.cell_size.height as f32;
                 let pane_dimensions = pos.pane.get_dimensions();
                 let width = pane_dimensions.pixel_width as f32 + content_padding * 2.;
@@ -821,8 +819,9 @@ impl super::TermWindow {
                 } else {
                     0.0
                 };
-                let (dx, dy) =
-                    self.termviai_pane_visual_offset(self.termviai_font_source_pane(pos.pane.pane_id()));
+                let (dx, dy) = self.termviai_pane_visual_offset(
+                    self.termviai_font_source_pane(pos.pane.pane_id()),
+                );
                 let px = event.coords.x
                     - (padding_left + border.left.get() as f32 + dx).round() as isize
                     - pos.left as isize * self.render_metrics.cell_size.width;

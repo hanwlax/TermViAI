@@ -14,6 +14,12 @@ pub(super) fn pane_broadcasting(state: &BroadcastState<usize>, pane: usize) -> b
     state.enabled() && state.is_member(pane)
 }
 
+/// A group is active only when broadcast is running for every member.
+/// Use the same predicate for the tab indicator and its select-all action.
+pub(super) fn group_broadcasting(state: &BroadcastState<usize>) -> bool {
+    state.enabled() && state.pane_count() > 0 && state.member_count() == state.pane_count()
+}
+
 fn pane_accepts_input(pane: &Arc<dyn Pane>) -> bool {
     !pane.is_dead()
         && !pane
@@ -24,14 +30,14 @@ fn pane_accepts_input(pane: &Arc<dyn Pane>) -> bool {
 #[derive(Default)]
 pub(super) struct TabBroadcasts {
     pub tabs: HashMap<usize, BroadcastState<usize>>,
-    pub error: String,
+    pub pane_errors: HashMap<usize, String>,
 }
 impl TabBroadcasts {
     /// The tab button acts on the entire group, including excluded or zoom-hidden
     /// panes. The tray switch remains a pause/resume control for selected members.
     pub(super) fn toggle_group(&mut self, tab: usize) {
         if let Some(state) = self.tabs.get_mut(&tab) {
-            if state.enabled() {
+            if group_broadcasting(state) {
                 state.select_none();
             } else {
                 state.select_all();
@@ -42,11 +48,14 @@ impl TabBroadcasts {
 
     fn sync(&mut self, snapshots: impl IntoIterator<Item = (usize, Vec<usize>)>) {
         let mut live = HashSet::new();
+        let mut live_panes = HashSet::new();
         for (tab, panes) in snapshots {
             live.insert(tab);
+            live_panes.extend(panes.iter().copied());
             self.tabs.entry(tab).or_default().sync_panes(panes);
         }
         self.tabs.retain(|tab, _| live.contains(tab));
+        self.pane_errors.retain(|pane, _| live_panes.contains(pane));
     }
 }
 impl TermWindow {
@@ -167,18 +176,21 @@ impl TermWindow {
                     target.send_raw_input(data)
                 },
             )?;
-            for (id, error) in &report.failures {
-                log::error!("Broadcast input failed for pane {id}: {error:#}");
-            }
-            anyhow::ensure!(
-                report.failures.is_empty() && report.disconnected.is_empty(),
-                "Broadcast: {} sent, {} disconnected, {} failed. Input was not replayed.",
-                report.delivered.len(),
-                report.disconnected.len(),
-                report.failures.len()
-            );
-            if !bytes.is_empty() && !self.termviai_broadcast.error.is_empty() {
-                self.termviai_broadcast.error.clear();
+            if !bytes.is_empty() {
+                for id in &report.delivered {
+                    self.termviai_broadcast.pane_errors.remove(id);
+                }
+                for id in &report.disconnected {
+                    self.termviai_broadcast.pane_errors.insert(*id,
+                        "Broadcast skipped: this session is offline. Reconnect to send new input. Skipped input will not be replayed.".into());
+                }
+                for (id, error) in &report.failures {
+                    log::error!("Broadcast input failed for pane {id}: {error:#}");
+                    self.termviai_broadcast.pane_errors.insert(
+                        *id,
+                        format!("Broadcast failed: {error:#}. Input was not replayed."),
+                    );
+                }
                 if let Some(window) = &self.window {
                     window.invalidate();
                 }
@@ -186,8 +198,10 @@ impl TermWindow {
             Ok(())
         })();
         if let Err(error) = &result {
-            self.termviai_broadcast.error = format!("{error:#}");
-            log::error!("{}", self.termviai_broadcast.error);
+            log::error!("Broadcast input failed for pane {source}: {error:#}");
+            self.termviai_broadcast
+                .pane_errors
+                .insert(source, format!("{error:#}"));
             if let Some(window) = &self.window {
                 window.invalidate();
             }
@@ -201,6 +215,21 @@ impl TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pane_errors_follow_identity_and_are_pruned_when_closed() {
+        let mut all = TabBroadcasts::default();
+        all.sync([(10, vec![1, 2]), (20, vec![3, 4])]);
+        all.pane_errors.insert(2, "Offline".into());
+        all.pane_errors.insert(4, "Write failed".into());
+        all.sync([(10, vec![2, 1]), (20, vec![3, 4])]);
+        assert_eq!(all.pane_errors.len(), 2);
+        assert!(!all.pane_errors.contains_key(&1));
+        // Moving a pane carries its error; closing it removes the stale alert.
+        all.sync([(10, vec![1]), (20, vec![3, 2])]);
+        assert_eq!(all.pane_errors.len(), 1);
+        assert_eq!(all.pane_errors[&2], "Offline");
+    }
+
     #[test]
     fn new_groups_and_paused_selections_do_not_show_active_broadcast() {
         let mut all = TabBroadcasts::default();
@@ -263,12 +292,44 @@ mod tests {
     }
 
     #[test]
+    fn tab_indicator_and_select_all_follow_partial_selection() {
+        let mut all = TabBroadcasts::default();
+        all.sync([(10, vec![1, 2, 3, 4]), (20, vec![5, 6])]);
+        assert!(!group_broadcasting(&all.tabs[&10]));
+        all.toggle_group(10);
+        assert!(group_broadcasting(&all.tabs[&10]));
+        all.tabs.get_mut(&10).unwrap().set_member(3, false).unwrap();
+        assert!(!group_broadcasting(&all.tabs[&10]));
+        assert!(pane_broadcasting(&all.tabs[&10], 1));
+        assert_eq!(all.tabs[&10].targets_for(1).unwrap(), vec![1, 2, 4]);
+        assert_eq!(all.tabs[&10].targets_for(3).unwrap(), vec![3]);
+        // A gray partial selection must select all, not disable the others.
+        all.toggle_group(10);
+        assert!(group_broadcasting(&all.tabs[&10]));
+        for pane in [1, 2, 3, 4] {
+            assert_eq!(all.tabs[&10].targets_for(pane).unwrap(), vec![1, 2, 3, 4]);
+        }
+        assert!(!group_broadcasting(&all.tabs[&20]));
+        // Completing the selection individually updates the indicator too.
+        all.tabs.get_mut(&10).unwrap().set_member(3, false).unwrap();
+        all.tabs.get_mut(&10).unwrap().set_member(3, true).unwrap();
+        assert!(group_broadcasting(&all.tabs[&10]));
+        all.tabs.get_mut(&10).unwrap().set_enabled(false);
+        assert!(!group_broadcasting(&all.tabs[&10]));
+        all.toggle_group(10);
+        assert!(group_broadcasting(&all.tabs[&10]));
+        all.toggle_group(10);
+        assert!(!group_broadcasting(&all.tabs[&10]));
+        assert_eq!(all.tabs[&10].member_count(), 0);
+        assert!(!group_broadcasting(&BroadcastState::default()));
+    }
+
+    #[test]
     fn group_button_disables_all_members_without_touching_other_tabs() {
         let mut all = TabBroadcasts::default();
         all.sync([(10, vec![1, 2, 3]), (20, vec![4, 5])]);
         all.toggle_group(10);
         all.toggle_group(20);
-        all.tabs.get_mut(&10).unwrap().set_member(3, false).unwrap();
         all.toggle_group(10);
         assert!(!all.tabs[&10].enabled());
         assert_eq!(all.tabs[&10].member_count(), 0);
