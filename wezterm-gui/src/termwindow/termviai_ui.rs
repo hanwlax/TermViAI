@@ -7,7 +7,9 @@ use super::termviai_layout::{BROADCAST_SURFACE_TOP_INSET, BROADCAST_TRAY_HEIGHT}
 use super::termviai_motion::{frame_interval, Tween};
 use super::termviai_workspace::WorkspaceUi;
 use super::{TermWindow, TermWindowNotif};
-use crate::hosts::{new_credential_id, Host, HostStore, Identity, KeyFile};
+use crate::hosts::{
+    new_credential_id, Authentication, Host, HostGroup, HostStore, Identity, KeyFile,
+};
 use crate::utilsprites::RenderMetrics;
 use crate::workspaces::{SavedLayout, WorkspaceStore};
 use anyhow::Context;
@@ -30,6 +32,7 @@ const INK: &str = "#f1f2fa";
 const MUTED: &str = "#9ca2ba";
 const ACCENT: &str = "#aaa7cb";
 const SIGNAL_BG: &str = "#414256";
+const ICON_HOVER_BG: &str = "#5a5c76";
 const SIGNAL_INK: &str = "#b5a2d8";
 const RECONNECT: &str = "#89b4fa";
 const SIDEBAR_WIDTH: f32 = 220.;
@@ -71,20 +74,31 @@ enum Action {
     SaveWorkspace(usize),
     OpenSaved(String),
     ConnectRecent(usize),
+    RemoveRecent(usize, u64),
     DismissMenu,
     ConfirmDismiss,
     ConfirmCard,
     ConfirmCancel,
     ConfirmAccept,
     AddHost,
+    AddGroup,
+    AddHostMenu,
+    GroupMenu(String),
+    NewGroupHost,
+    ExistingGroupHosts,
+    DeleteGroup,
+    PickHost(usize),
+    AcceptHostPicker,
+    CancelHostPicker,
     AddKey,
     AddIdentity,
     EditIdentity(usize),
     DeleteIdentity,
-    ChooseAuth,
-    ManualAuth,
+    AuthMode(Authentication),
+    KeySource(bool),
+    AuthPicker,
+    CloseAuthPicker,
     UseIdentity(usize),
-    RememberPassword,
     RevealPassword,
     Cancel,
     Save,
@@ -119,6 +133,7 @@ enum Action {
     PaneError(usize),
     EditMenuHost,
     DuplicateHost,
+    DeleteHost,
 }
 #[derive(Clone, Default)]
 struct Input {
@@ -277,15 +292,18 @@ struct AuthForm {
     editing_identity: bool,
     original_identity: Option<Identity>,
     selected_identity: String,
-    remember: bool,
-    reveal: bool,
-    picker: bool,
+    selected_key: String,
+    mode: Authentication,
+    keychain_key: bool,
+    picker_open: bool,
     picker_scroll: usize,
+    reveal: bool,
     confirm_delete: bool,
-    reset_password: bool,
 }
 
 struct Form {
+    new_group_parent: Option<String>,
+    host_group_target: Option<(String, String)>,
     auth: AuthForm,
     fields: Vec<Input>,
     focus: usize,
@@ -316,6 +334,14 @@ impl DrawerLayout {
             footer,
         }
     }
+    fn for_form(width: f32, height: f32, host: bool) -> Self {
+        let mut layout = Self::new(width, height);
+        if host {
+            layout.width = 440_f32.min(width.max(0.));
+            layout.x = width - layout.width;
+        }
+        layout
+    }
     fn capture_hits(&self, hits: &mut Vec<Hit>, width: f32) {
         // One outside click only dismisses the form, never activates a host below it.
         hits.retain(|hit| hit.y < 52.);
@@ -337,12 +363,16 @@ impl DrawerLayout {
 }
 impl Form {
     fn is_host(&self) -> bool {
-        !self.key && !self.settings && self.rename_tab.is_none() && !self.auth.editing_identity
+        !self.key
+            && !self.settings
+            && self.rename_tab.is_none()
+            && !self.auth.editing_identity
+            && self.new_group_parent.is_none()
     }
     fn password_index(&self) -> Option<usize> {
         if self.auth.editing_identity {
             Some(2)
-        } else if self.is_host() && self.auth.selected_identity.is_empty() {
+        } else if self.is_host() && self.auth.mode == Authentication::Password {
             Some(4)
         } else {
             None
@@ -367,6 +397,1670 @@ impl Form {
         self.first_row..(self.first_row + count).min(self.fields.len())
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FormRow {
+    Field(usize),
+    Endpoint,
+    AuthMode,
+    KeySource,
+    KeyInput,
+    KeyPicker,
+    Picker,
+    KeyDetail,
+    IdentitySummary,
+    Hint,
+    Gap,
+}
+impl FormRow {
+    fn height(&self) -> f32 {
+        match self {
+            Self::Field(_) | Self::Endpoint | Self::Picker => 78.,
+            Self::AuthMode => 100.,
+            Self::KeySource => 62.,
+            Self::KeyInput | Self::KeyPicker => 54.,
+            Self::KeyDetail => 38.,
+            Self::IdentitySummary => 96.,
+            Self::Hint => 30.,
+            Self::Gap => 18.,
+        }
+    }
+    fn contains_field(&self, index: usize) -> bool {
+        matches!(self, Self::Field(i) if *i == index)
+            || (*self == Self::Endpoint && matches!(index, 1 | 2))
+            || (*self == Self::KeyInput && index == 5)
+    }
+}
+impl Form {
+    fn set_auth_mode(&mut self, mode: Authentication) {
+        self.auth.mode = mode;
+        self.auth.picker_open = false;
+        self.auth.reveal = false;
+        self.reveal_focus = false;
+        if !self.focusable_fields().contains(&self.focus) {
+            self.focus = match mode {
+                Authentication::Password => 3,
+                Authentication::Key => 7,
+                Authentication::Identity => 6,
+            };
+        }
+    }
+    fn focusable_fields(&self) -> Vec<usize> {
+        if !self.is_host() {
+            return (0..self.fields.len()).collect();
+        }
+        let mut fields = vec![0, 1, 2];
+        match self.auth.mode {
+            Authentication::Password => fields.extend([3, 4]),
+            Authentication::Key => {
+                fields.push(7);
+                if !self.auth.keychain_key {
+                    fields.push(5);
+                }
+            }
+            Authentication::Identity => {}
+        }
+        fields.push(6);
+        fields
+    }
+    fn has_saved_password(&self) -> bool {
+        self.auth.original_identity.is_some()
+            || self
+                .original
+                .as_ref()
+                .is_some_and(|h| !h.own_credential_ref().is_empty())
+    }
+    fn drawer_rows(&self, _store: &HostStore) -> Vec<FormRow> {
+        if !self.is_host() {
+            return (0..self.fields.len()).map(FormRow::Field).collect();
+        }
+        let mut rows = vec![FormRow::Field(0), FormRow::Endpoint, FormRow::AuthMode];
+        match self.auth.mode {
+            Authentication::Password => rows.extend([
+                FormRow::Field(3),
+                FormRow::Field(4),
+                FormRow::Hint,
+                FormRow::Gap,
+            ]),
+            Authentication::Key => {
+                rows.extend([FormRow::Field(7), FormRow::KeySource]);
+                if self.auth.keychain_key {
+                    rows.extend([FormRow::KeyPicker, FormRow::KeyDetail]);
+                } else {
+                    rows.extend([FormRow::KeyInput, FormRow::Gap]);
+                }
+            }
+            Authentication::Identity => {
+                rows.extend([FormRow::Picker, FormRow::IdentitySummary, FormRow::Hint])
+            }
+        }
+        rows.push(FormRow::Field(6));
+        rows
+    }
+    fn visible_drawer_rows(&mut self, rows: &[FormRow], height: f32) -> std::ops::Range<usize> {
+        if !self.is_host() {
+            return self.visible_rows((height / 78.).floor().max(1.) as usize);
+        }
+        let mut last_start = rows.len();
+        let mut used = 0.;
+        while last_start > 0 && used + rows[last_start - 1].height() <= height {
+            last_start -= 1;
+            used += rows[last_start].height();
+        }
+        self.first_row = self.first_row.min(last_start);
+        if self.reveal_focus {
+            if let Some(focus_row) = rows.iter().position(|row| row.contains_field(self.focus)) {
+                if focus_row < self.first_row {
+                    self.first_row = focus_row;
+                }
+                while rows[self.first_row..=focus_row]
+                    .iter()
+                    .map(FormRow::height)
+                    .sum::<f32>()
+                    > height
+                {
+                    self.first_row += 1;
+                }
+            }
+            self.reveal_focus = false;
+        }
+        let mut end = self.first_row;
+        let mut used = 0.;
+        while end < rows.len() && used + rows[end].height() <= height {
+            used += rows[end].height();
+            end += 1;
+        }
+        self.first_row..end
+    }
+}
+
+fn draw_form_field(
+    tiles: &mut Vec<Tile>,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: f32,
+    width: f32,
+    index: usize,
+    label: &str,
+    form: &Form,
+    interactive: bool,
+    hover: &Option<Action>,
+) {
+    let y = if label.is_empty() {
+        y - 24.
+    } else {
+        tile(tiles, x, y, width, 20., label, SIDE, MUTED, false);
+        y
+    };
+    let focused = form.focus == index;
+    let password = form.password_index() == Some(index);
+    if focused {
+        tile(
+            tiles,
+            x - 1.,
+            y + 23.,
+            width + 2.,
+            42.,
+            "",
+            ACCENT,
+            INK,
+            true,
+        );
+    }
+    let input = &form.fields[index];
+    let placeholder = if password {
+        if form.has_saved_password() {
+            "••••••••"
+        } else {
+            "Enter password"
+        }
+    } else if form.new_group_parent.is_some() && index == 0 {
+        "e.g. Production"
+    } else if form.is_host() && index == 5 {
+        "C:\\Users\\you\\.ssh\\id_ed25519"
+    } else if form.is_host() && index == 6 {
+        "e.g. Development"
+    } else {
+        ""
+    };
+    button(
+        tiles,
+        hits,
+        x,
+        y + 24.,
+        width,
+        40.,
+        placeholder,
+        FIELD,
+        Action::Field(index),
+        hover,
+    );
+    let t = tiles.last_mut().unwrap();
+    t.input = Some(InputPaint {
+        masked: password && !form.auth.reveal,
+        input: input.clone(),
+        focused: focused && interactive,
+    });
+    if password {
+        t.right_inset = 38.;
+        if !input.value.is_empty() {
+            button(
+                tiles,
+                hits,
+                x + width - 40.,
+                y + 27.,
+                36.,
+                34.,
+                "",
+                FIELD,
+                Action::RevealPassword,
+                hover,
+            );
+            let t = tiles.last_mut().unwrap();
+            t.icon = Some(if form.auth.reveal {
+                Icon::EyeOff
+            } else {
+                Icon::Eye
+            });
+            t.icon_size = 16.;
+        }
+    }
+}
+
+fn draw_auth_row(
+    tiles: &mut Vec<Tile>,
+    hits: &mut Vec<Hit>,
+    x: f32,
+    y: f32,
+    width: f32,
+    row: FormRow,
+    form: &Form,
+    store: &HostStore,
+    hover: &Option<Action>,
+) -> Option<(f32, f32, f32, f32)> {
+    match row {
+        FormRow::AuthMode => {
+            tile(tiles, x, y + 2., width, 1., "", FIELD, MUTED, false);
+            tile(
+                tiles,
+                x,
+                y + 20.,
+                width,
+                20.,
+                "Authentication",
+                SIDE,
+                MUTED,
+                false,
+            );
+            tile(tiles, x, y + 44., width, 48., "", TOP, INK, true);
+            let step = (width - 8.) / 3.;
+            for (i, (mode, label, icon)) in [
+                (Authentication::Password, "Password", Icon::Lock),
+                (Authentication::Key, "SSH Key", Icon::Key),
+                (Authentication::Identity, "Identity", Icon::Identity),
+            ]
+            .iter()
+            .copied()
+            .enumerate()
+            {
+                let active = form.auth.mode == mode;
+                button(
+                    tiles,
+                    hits,
+                    x + 4. + i as f32 * step,
+                    y + 48.,
+                    step - 2.,
+                    40.,
+                    label,
+                    if active { "#474159" } else { TOP },
+                    Action::AuthMode(mode),
+                    hover,
+                );
+                let t = tiles.last_mut().unwrap();
+                t.icon = Some(icon);
+                t.icon_size = 15.;
+                t.fg = if active { SIGNAL_INK } else { MUTED };
+            }
+        }
+        FormRow::KeySource => {
+            tile(tiles, x, y, width, 20., "Private key", SIDE, MUTED, false);
+            for (i, (keychain, label)) in [(false, "File path"), (true, "Keychain")]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                button(
+                    tiles,
+                    hits,
+                    x + i as f32 * 130.,
+                    y + 24.,
+                    126.,
+                    34.,
+                    label,
+                    SIDE,
+                    Action::KeySource(keychain),
+                    hover,
+                );
+                let t = tiles.last_mut().unwrap();
+                t.icon = Some(if keychain == form.auth.keychain_key {
+                    Icon::RadioChecked
+                } else {
+                    Icon::Radio
+                });
+                t.icon_size = 15.;
+                t.fg = if keychain == form.auth.keychain_key {
+                    SIGNAL_INK
+                } else {
+                    MUTED
+                };
+            }
+        }
+        FormRow::Picker | FormRow::KeyPicker => {
+            let identity = form.auth.mode == Authentication::Identity;
+            let label = if identity {
+                "Identity from Keychain"
+            } else {
+                "Private key"
+            };
+            let y = if identity {
+                tile(tiles, x, y, width, 20., label, SIDE, MUTED, false);
+                y
+            } else {
+                y - 24.
+            };
+            let text = if identity {
+                store
+                    .identities
+                    .iter()
+                    .find(|i| i.id == form.auth.selected_identity)
+                    .map(|i| i.label.as_str())
+                    .unwrap_or(if form.auth.selected_identity.is_empty() {
+                        "Select an identity…"
+                    } else {
+                        "Identity unavailable"
+                    })
+            } else {
+                store
+                    .keys
+                    .iter()
+                    .find(|k| k.label == form.auth.selected_key)
+                    .map(|k| k.label.as_str())
+                    .unwrap_or(if form.auth.selected_key.is_empty() {
+                        "Select a key…"
+                    } else {
+                        "Key unavailable"
+                    })
+            };
+            button(
+                tiles,
+                hits,
+                x,
+                y + 24.,
+                width,
+                40.,
+                text,
+                FIELD,
+                Action::AuthPicker,
+                hover,
+            );
+            tiles.last_mut().unwrap().right_inset = 28.;
+            tile(
+                tiles,
+                x + width - 32.,
+                y + 32.,
+                24.,
+                24.,
+                "",
+                FIELD,
+                MUTED,
+                false,
+            );
+            let t = tiles.last_mut().unwrap();
+            t.icon = Some(Icon::ChevronDown);
+            t.icon_size = 14.;
+            t.transparent = true;
+            return Some((x, y + 24., width, 40.));
+        }
+        FormRow::IdentitySummary => {
+            if let Some(identity) = store
+                .identities
+                .iter()
+                .find(|i| i.id == form.auth.selected_identity)
+            {
+                tile(tiles, x, y, width, 84., "", SIDE, INK, true);
+                let t = tiles.last_mut().unwrap();
+                t.outline_width = 1.;
+                t.fg = FIELD;
+                for (n, (label, value)) in [
+                    ("Username", identity.username.as_str()),
+                    ("Password", "••••••••"),
+                ]
+                .iter()
+                .copied()
+                .enumerate()
+                {
+                    tile(
+                        tiles,
+                        x + 2.,
+                        y + 8. + n as f32 * 32.,
+                        110.,
+                        28.,
+                        label,
+                        SIDE,
+                        MUTED,
+                        false,
+                    );
+                    tile(
+                        tiles,
+                        x + 120.,
+                        y + 8. + n as f32 * 32.,
+                        width - 134.,
+                        28.,
+                        value,
+                        SIDE,
+                        INK,
+                        false,
+                    );
+                }
+            }
+        }
+        FormRow::Hint => {
+            let hint = if form.auth.mode == Authentication::Identity {
+                "Uses this identity's username and password."
+            } else if form.has_saved_password() {
+                "Leave unchanged to keep the saved password."
+            } else {
+                "Password is saved with this host."
+            };
+            tile(tiles, x, y, width, 24., hint, SIDE, MUTED, false);
+        }
+        FormRow::KeyDetail => {
+            if let Some(key) = store
+                .keys
+                .iter()
+                .find(|k| k.label == form.auth.selected_key)
+            {
+                tile(tiles, x, y, width, 28., &key.path, SIDE, MUTED, false);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn draw_auth_picker(
+    tiles: &mut Vec<Tile>,
+    hits: &mut Vec<Hit>,
+    anchor: (f32, f32, f32, f32),
+    bottom: f32,
+    form: &mut Form,
+    store: &HostStore,
+    hover: &Option<Action>,
+) {
+    let (x, y, width, height) = anchor;
+    let identity = form.auth.mode == Authentication::Identity;
+    let count = if identity {
+        store.identities.len()
+    } else {
+        store.keys.len()
+    };
+    let capacity = (((bottom - y - height - 8.).max(y - 148.) - 8.) / 40.)
+        .floor()
+        .clamp(1., 6.) as usize;
+    let visible = count.max(1).min(capacity);
+    let popup_height = visible as f32 * 40. + 8.;
+    let top = if y + height + 4. + popup_height <= bottom {
+        y + height + 4.
+    } else {
+        (y - popup_height - 4.).max(148.)
+    };
+    let start = tiles.len();
+    hits.push(Hit {
+        x: x - 24.,
+        y: 52.,
+        w: width + 48.,
+        h: bottom,
+        action: Action::CloseAuthPicker,
+    });
+    tile(tiles, x, top, width, popup_height, "", CARD, INK, true);
+    form.auth.picker_scroll = form.auth.picker_scroll.min(count.saturating_sub(visible));
+    if count == 0 {
+        tile(
+            tiles,
+            x + 4.,
+            top + 4.,
+            width - 8.,
+            40.,
+            if identity {
+                "No identities in Keychain"
+            } else {
+                "No keys in Keychain"
+            },
+            CARD,
+            MUTED,
+            false,
+        );
+    }
+    for (row, i) in (form.auth.picker_scroll..count).take(visible).enumerate() {
+        let (text, selected, action) = if identity {
+            let item = &store.identities[i];
+            (
+                format!("{} · {}", item.label, item.username),
+                item.id == form.auth.selected_identity,
+                Action::UseIdentity(i),
+            )
+        } else {
+            let item = &store.keys[i];
+            (
+                item.label.clone(),
+                item.label == form.auth.selected_key,
+                Action::UseKey(i),
+            )
+        };
+        button(
+            tiles,
+            hits,
+            x + 4.,
+            top + 4. + row as f32 * 40.,
+            width - 8.,
+            38.,
+            text,
+            if selected { "#474159" } else { CARD },
+            action,
+            hover,
+        );
+        if selected {
+            tiles.last_mut().unwrap().fg = SIGNAL_INK;
+        }
+    }
+    if count > visible {
+        let track = popup_height - 12.;
+        let thumb = (track * visible as f32 / count as f32).max(12.);
+        let sy =
+            top + 6. + (track - thumb) * form.auth.picker_scroll as f32 / (count - visible) as f32;
+        tile(tiles, x + width - 5., sy, 2., thumb, "", MUTED, MUTED, true);
+    }
+    for t in &mut tiles[start..] {
+        t.zindex = 44;
+    }
+}
+
+#[derive(Clone)]
+enum HostLibraryRow {
+    Heading(&'static str, usize),
+    Groups(Vec<crate::hosts::HostGroup>),
+    Hosts(Vec<(usize, Host)>),
+    Empty,
+}
+impl HostLibraryRow {
+    fn height(&self) -> f32 {
+        match self {
+            Self::Heading(..) => 36.,
+            Self::Groups(_) => 90.,
+            Self::Hosts(_) => 100.,
+            Self::Empty => 140.,
+        }
+    }
+}
+fn host_library_rows(
+    store: &HostStore,
+    group: &str,
+    query: &str,
+    columns: usize,
+) -> Vec<HostLibraryRow> {
+    let mut rows = vec![];
+    let columns = columns.max(1);
+    if query.is_empty() {
+        let groups: Vec<_> = store.child_groups(group).into_iter().cloned().collect();
+        if !groups.is_empty() {
+            rows.push(HostLibraryRow::Heading("Groups", groups.len()));
+            rows.extend(
+                groups
+                    .chunks(columns)
+                    .map(|chunk| HostLibraryRow::Groups(chunk.to_vec())),
+            );
+        }
+    }
+    let query = query.to_lowercase();
+    let hosts: Vec<_> = store
+        .hosts
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| {
+            store.host_in_group(h, group)
+                && format!(
+                    "{} {} {} {}",
+                    h.label,
+                    h.address,
+                    h.username,
+                    store.group_path(store.host_group_id(h))
+                )
+                .to_lowercase()
+                .contains(&query)
+        })
+        .map(|(i, h)| (i, h.clone()))
+        .collect();
+    rows.push(HostLibraryRow::Heading(
+        if query.is_empty() {
+            "Hosts"
+        } else {
+            "Search results"
+        },
+        hosts.len(),
+    ));
+    rows.extend(
+        hosts
+            .chunks(columns)
+            .map(|chunk| HostLibraryRow::Hosts(chunk.to_vec())),
+    );
+    if hosts.is_empty() {
+        rows.push(HostLibraryRow::Empty);
+    }
+    rows
+}
+fn host_library_visible(
+    rows: &[HostLibraryRow],
+    first: usize,
+    height: f32,
+) -> (std::ops::Range<usize>, usize) {
+    let mut max = rows.len();
+    let mut used = 0.;
+    while max > 0 && used + rows[max - 1].height() <= height {
+        max -= 1;
+        used += rows[max].height();
+    }
+    let start = first.min(max.min(rows.len().saturating_sub(1)));
+    let mut end = start;
+    used = 0.;
+    while end < rows.len() && used + rows[end].height() <= height {
+        used += rows[end].height();
+        end += 1;
+    }
+    (start..end, max)
+}
+
+fn draw_group_breadcrumbs(
+    tiles: &mut Vec<Tile>,
+    hits: &mut Vec<Hit>,
+    ui: &mut TermviaiUi,
+    x: f32,
+    y: f32,
+    width: f32,
+    hover: &Option<Action>,
+) {
+    let trail = ui.store.group_trail(&ui.group);
+    if trail.is_empty() {
+        tile(tiles, x - 12., y, width, 30., "All Hosts", BG, INK, false);
+        return;
+    }
+    let root_width = tray_label_width("All Hosts") + 12.;
+    let root_end = root_width - 6.;
+    button(
+        tiles,
+        hits,
+        x - 6.,
+        y,
+        root_width,
+        30.,
+        "All Hosts",
+        BG,
+        Action::Group(String::new()),
+        hover,
+    );
+    let t = tiles.last_mut().unwrap();
+    t.fg = RECONNECT;
+    t.text_padding = 6.;
+    let widths: Vec<f32> = trail
+        .iter()
+        .map(|g| (tray_label_width(&g.name) + 34.).clamp(48., 200.))
+        .collect();
+    let overflow = widths.iter().sum::<f32>() > width - root_end;
+    let budget = (width - root_end - if overflow { 64. } else { 0. }).max(60.);
+    let mut max_start = trail.len();
+    let mut used = 0.;
+    while max_start > 0 && used + widths[max_start - 1].min(budget) <= budget {
+        max_start -= 1;
+        used += widths[max_start].min(budget);
+    }
+    ui.group_scroll = ui.group_scroll.min(max_start);
+    let mut offset = root_end;
+    let mut end = ui.group_scroll;
+    for (i, group) in trail.iter().enumerate().skip(ui.group_scroll) {
+        let w = widths[i].min(budget);
+        if offset - root_end + w > budget {
+            break;
+        }
+        tile(tiles, x + offset, y, 22., 30., "", BG, "#b4b8cd", false);
+        tiles.last_mut().unwrap().icon = Some(Icon::ChevronRight);
+        tiles.last_mut().unwrap().icon_size = 18.;
+        let label = tray_label(&group.name, (w - 34.).max(16.));
+        if group.id == ui.group {
+            tile(
+                tiles,
+                x + offset + 22.,
+                y,
+                w - 22.,
+                30.,
+                label,
+                BG,
+                INK,
+                false,
+            );
+        } else {
+            button(
+                tiles,
+                hits,
+                x + offset + 22.,
+                y,
+                w - 22.,
+                30.,
+                label,
+                BG,
+                Action::Group(group.id.clone()),
+                hover,
+            );
+            let t = tiles.last_mut().unwrap();
+            t.fg = RECONNECT;
+        }
+        tiles.last_mut().unwrap().text_padding = 6.;
+        offset += w;
+        end = i + 1;
+    }
+    if overflow {
+        if ui.group_scroll > 0 {
+            button(
+                tiles,
+                hits,
+                x + width - 60.,
+                y,
+                28.,
+                30.,
+                "",
+                CARD,
+                Action::PrevGroup,
+                hover,
+            );
+        }
+        if end < trail.len() {
+            button(
+                tiles,
+                hits,
+                x + width - 28.,
+                y,
+                28.,
+                30.,
+                "",
+                CARD,
+                Action::NextGroup,
+                hover,
+            );
+        }
+    }
+}
+
+fn draw_host_library(
+    tiles: &mut Vec<Tile>,
+    hits: &mut Vec<Hit>,
+    ui: &mut TermviaiUi,
+    x: f32,
+    y: f32,
+    width: f32,
+    bottom: f32,
+    columns: usize,
+    hover: &Option<Action>,
+) {
+    if !ui.group.is_empty() && ui.store.group(&ui.group).is_none() {
+        ui.navigate_group(String::new());
+    }
+    draw_group_breadcrumbs(
+        tiles,
+        hits,
+        ui,
+        x,
+        y,
+        width - if ui.group.is_empty() { 0. } else { 40. },
+        hover,
+    );
+    if !ui.group.is_empty() {
+        button(
+            tiles,
+            hits,
+            x + width - 30.,
+            y,
+            30.,
+            30.,
+            "",
+            BG,
+            Action::GroupMenu(ui.group.clone()),
+            hover,
+        );
+        let t = tiles.last_mut().unwrap();
+        t.transparent = true;
+        t.fg = MUTED;
+    }
+    let top = y + 48.;
+    let rows = host_library_rows(&ui.store, &ui.group, &ui.query.value, columns);
+    let (visible, max) = host_library_visible(&rows, ui.scroll, bottom - top);
+    ui.scroll = visible.start;
+    ui.max_scroll = max;
+    let cardw = (width - 12. * (columns - 1) as f32) / columns as f32;
+    let mut cy = top;
+    for row in &rows[visible] {
+        match row {
+            HostLibraryRow::Heading(label, count) => tile(
+                tiles,
+                x - 12.,
+                cy,
+                width,
+                24.,
+                format!("{label}  {count}"),
+                BG,
+                MUTED,
+                false,
+            ),
+            HostLibraryRow::Groups(groups) => {
+                for (column, group) in groups.iter().enumerate() {
+                    let gx = x + column as f32 * (cardw + 12.);
+                    button(
+                        tiles,
+                        hits,
+                        gx,
+                        cy,
+                        cardw,
+                        78.,
+                        "",
+                        CARD,
+                        Action::Group(group.id.clone()),
+                        hover,
+                    );
+                    tile(
+                        tiles,
+                        gx + 12.,
+                        cy + 24.,
+                        28.,
+                        28.,
+                        "",
+                        CARD,
+                        SIGNAL_INK,
+                        false,
+                    );
+                    let t = tiles.last_mut().unwrap();
+                    t.icon = Some(Icon::Folder);
+                    t.icon_size = 24.;
+                    t.transparent = true;
+                    let count = ui
+                        .store
+                        .hosts
+                        .iter()
+                        .filter(|h| ui.store.host_in_group(h, &group.id))
+                        .count();
+                    let subgroups = ui.store.child_groups(&group.id).len();
+                    tile(
+                        tiles,
+                        gx + 40.,
+                        cy + 14.,
+                        cardw - 80.,
+                        24.,
+                        &group.name,
+                        CARD,
+                        INK,
+                        false,
+                    );
+                    tiles.last_mut().unwrap().transparent = true;
+                    tile(
+                        tiles,
+                        gx + 40.,
+                        cy + 40.,
+                        cardw - 80.,
+                        24.,
+                        if subgroups > 0 {
+                            format!(
+                                "{count} {} · {subgroups} {}",
+                                if count == 1 { "host" } else { "hosts" },
+                                if subgroups == 1 { "group" } else { "groups" }
+                            )
+                        } else {
+                            format!("{count} {}", if count == 1 { "host" } else { "hosts" })
+                        },
+                        CARD,
+                        MUTED,
+                        false,
+                    );
+                    tiles.last_mut().unwrap().transparent = true;
+                    button(
+                        tiles,
+                        hits,
+                        gx + cardw - 36.,
+                        cy + 24.,
+                        30.,
+                        30.,
+                        "",
+                        CARD,
+                        Action::GroupMenu(group.id.clone()),
+                        hover,
+                    );
+                    let t = tiles.last_mut().unwrap();
+                    t.transparent = true;
+                    t.fg = MUTED;
+                }
+            }
+            HostLibraryRow::Hosts(hosts) => {
+                for (column, (index, host)) in hosts.iter().enumerate() {
+                    let hx = x + column as f32 * (cardw + 12.);
+                    button(
+                        tiles,
+                        hits,
+                        hx,
+                        cy,
+                        cardw,
+                        88.,
+                        "",
+                        CARD,
+                        Action::Connect(*index),
+                        hover,
+                    );
+                    tile(tiles, hx + 12., cy + 29., 28., 28., "", CARD, MUTED, false);
+                    let t = tiles.last_mut().unwrap();
+                    t.icon = Some(Icon::Hosts);
+                    t.icon_size = 23.;
+                    t.transparent = true;
+                    for (line, text) in [
+                        host.label.clone(),
+                        host.endpoint(),
+                        format!(
+                            "ssh · {}",
+                            if host.username.is_empty() {
+                                "default user"
+                            } else {
+                                &host.username
+                            }
+                        ),
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        tile(
+                            tiles,
+                            hx + 40.,
+                            cy + 9. + line as f32 * 23.,
+                            cardw - 78.,
+                            24.,
+                            text,
+                            CARD,
+                            if line == 0 { INK } else { MUTED },
+                            false,
+                        );
+                        tiles.last_mut().unwrap().transparent = true;
+                    }
+                    button(
+                        tiles,
+                        hits,
+                        hx + cardw - 34.,
+                        cy + 29.,
+                        26.,
+                        30.,
+                        "",
+                        CARD,
+                        Action::HostMenu(*index),
+                        hover,
+                    );
+                    tiles.last_mut().unwrap().transparent = true;
+                }
+            }
+            HostLibraryRow::Empty => {
+                let text = if !ui.query.value.is_empty() {
+                    "No matching hosts"
+                } else if !ui.group.is_empty() {
+                    "No hosts in this group"
+                } else {
+                    "Add your first SSH host to get started."
+                };
+                tile(tiles, x, cy + 12., width, 36., text, BG, MUTED, false);
+                if !ui.group.is_empty() && ui.query.value.is_empty() {
+                    tile(
+                        tiles,
+                        x,
+                        cy + 44.,
+                        width,
+                        28.,
+                        "Create a host or add one from your library.",
+                        BG,
+                        MUTED,
+                        false,
+                    );
+                    button(
+                        tiles,
+                        hits,
+                        x,
+                        cy + 84.,
+                        130.,
+                        38.,
+                        "New Host",
+                        FIELD,
+                        Action::NewGroupHost,
+                        hover,
+                    );
+                    button(
+                        tiles,
+                        hits,
+                        x + 142.,
+                        cy + 84.,
+                        (width - 142.).min(220.),
+                        38.,
+                        "Add Existing Hosts",
+                        FIELD,
+                        Action::ExistingGroupHosts,
+                        hover,
+                    );
+                }
+            }
+        }
+        cy += row.height();
+    }
+}
+
+fn draw_new_group(
+    tiles: &mut Vec<Tile>,
+    hits: &mut Vec<Hit>,
+    form: &Form,
+    store: &HostStore,
+    width: f32,
+    height: f32,
+    error: &str,
+    interactive: bool,
+    progress: f32,
+    hover: &Option<Action>,
+) {
+    let w = 440_f32.min(width - 32.);
+    let h = if error.is_empty() { 278_f32 } else { 328_f32 }.min(height - 84.);
+    let x = (width - w) / 2.;
+    let y = 52. + (height - 52. - h) / 2. + 10. * (1. - progress);
+    let fw = w - 48.;
+    hits.retain(|hit| hit.y < 52.);
+    hits.push(Hit {
+        x: 0.,
+        y: 52.,
+        w: width,
+        h: height - 52.,
+        action: Action::Cancel,
+    });
+    hits.push(Hit {
+        x,
+        y,
+        w,
+        h,
+        action: Action::Drawer,
+    });
+    tile(tiles, 0., 52., width, height - 52., "", TOP, INK, false);
+    tiles.last_mut().unwrap().opacity = 0.78 * progress;
+    tile(tiles, x, y, w, h, "", SIDE, INK, true);
+    tile(
+        tiles,
+        x + 12.,
+        y + 20.,
+        fw,
+        32.,
+        "New Group",
+        SIDE,
+        INK,
+        false,
+    );
+    tiles.last_mut().unwrap().icon = Some(Icon::FolderPlus);
+    button(
+        tiles,
+        hits,
+        x + w - 48.,
+        y + 20.,
+        24.,
+        28.,
+        "",
+        SIDE,
+        Action::Cancel,
+        hover,
+    );
+    let t = tiles.last_mut().unwrap();
+    t.icon = Some(Icon::Close);
+    t.transparent = true;
+    t.fg = MUTED;
+    let parent = form.new_group_parent.as_deref().unwrap_or("");
+    let full = if parent.is_empty() {
+        "All Hosts".into()
+    } else {
+        format!("All Hosts / {}", store.group_path(parent))
+    };
+    tile(
+        tiles,
+        x + 12.,
+        y + 62.,
+        fw + 24.,
+        24.,
+        tray_label(&full, fw),
+        SIDE,
+        MUTED,
+        false,
+    );
+    draw_form_field(
+        tiles,
+        hits,
+        x + 24.,
+        y + 104.,
+        fw,
+        0,
+        "Name",
+        form,
+        interactive,
+        hover,
+    );
+    if !error.is_empty() {
+        for (i, line) in dialog_lines(error, (fw / 8.) as usize)
+            .into_iter()
+            .take(2)
+            .enumerate()
+        {
+            tile(
+                tiles,
+                x + 12.,
+                y + 186. + i as f32 * 22.,
+                fw + 24.,
+                22.,
+                line,
+                SIDE,
+                "#ed8193",
+                false,
+            );
+        }
+    }
+    button(
+        tiles,
+        hits,
+        x + w - 224.,
+        y + h - 62.,
+        94.,
+        38.,
+        "Cancel",
+        FIELD,
+        Action::Cancel,
+        hover,
+    );
+    tiles.last_mut().unwrap().icon = None;
+    button(
+        tiles,
+        hits,
+        x + w - 120.,
+        y + h - 62.,
+        96.,
+        38.,
+        "Save",
+        FIELD,
+        Action::Save,
+        hover,
+    );
+    tiles.last_mut().unwrap().icon = None;
+}
+
+fn draw_group_actions(
+    tiles: &mut Vec<Tile>,
+    hits: &mut Vec<Hit>,
+    menu: &GroupMenu,
+    width: f32,
+    height: f32,
+    hover: &Option<Action>,
+) {
+    let w = 228_f32.min(width - 16.);
+    let h = if menu.add_only { 92. } else { 144. };
+    let x = (menu.x - w).clamp(8., (width - w - 8.).max(8.));
+    let y = menu.y.min(height - h - 8.).max(52.);
+    hits.clear();
+    hits.push(Hit {
+        x: 0.,
+        y: 0.,
+        w: width,
+        h: height,
+        action: Action::DismissMenu,
+    });
+    hits.push(Hit {
+        x,
+        y,
+        w,
+        h,
+        action: Action::Drawer,
+    });
+    let start = tiles.len();
+    tile(tiles, x, y, w, h, "", SIDE, INK, true);
+    button(
+        tiles,
+        hits,
+        x + 6.,
+        y + 6.,
+        w - 12.,
+        36.,
+        "New Host",
+        SIDE,
+        Action::NewGroupHost,
+        hover,
+    );
+    button(
+        tiles,
+        hits,
+        x + 6.,
+        y + 46.,
+        w - 12.,
+        36.,
+        "Add Existing Hosts",
+        SIDE,
+        Action::ExistingGroupHosts,
+        hover,
+    );
+    if !menu.add_only {
+        tile(
+            tiles,
+            x + 12.,
+            y + 89.,
+            w - 24.,
+            1.,
+            "",
+            FIELD,
+            MUTED,
+            false,
+        );
+        button(
+            tiles,
+            hits,
+            x + 6.,
+            y + 100.,
+            w - 12.,
+            36.,
+            "Delete Group",
+            SIDE,
+            Action::DeleteGroup,
+            hover,
+        );
+        tiles.last_mut().unwrap().fg = "#ed8193";
+    }
+    for t in &mut tiles[start..] {
+        t.zindex = 60;
+    }
+}
+
+fn draw_host_picker(
+    tiles: &mut Vec<Tile>,
+    hits: &mut Vec<Hit>,
+    picker: &mut HostPicker,
+    store: &HostStore,
+    width: f32,
+    height: f32,
+    error: &str,
+    hover: &Option<Action>,
+) {
+    let w = 440_f32.min(width - 32.);
+    let h = (260. + picker.candidates.len().min(6) as f32 * 64.).min(height - 84.);
+    let x = (width - w) / 2.;
+    let y = 52. + (height - 52. - h) / 2.;
+    let inner = w - 48.;
+    let footer = y + h - 62.;
+    let list_top = y + 148.;
+    let list_bottom = footer - if error.is_empty() { 14. } else { 58. };
+    let rows = ((list_bottom - list_top) / 64.).floor().max(1.) as usize;
+    picker.scroll = picker
+        .scroll
+        .min(picker.candidates.len().saturating_sub(rows));
+    let start = tiles.len();
+    hits.clear();
+    hits.push(Hit {
+        x: 0.,
+        y: 52.,
+        w: width,
+        h: height - 52.,
+        action: Action::CancelHostPicker,
+    });
+    hits.push(Hit {
+        x,
+        y,
+        w,
+        h,
+        action: Action::Drawer,
+    });
+    tile(tiles, 0., 52., width, height - 52., "", TOP, INK, false);
+    tiles.last_mut().unwrap().opacity = 0.78;
+    tile(tiles, x, y, w, h, "", SIDE, INK, true);
+    tile(
+        tiles,
+        x + 12.,
+        y + 20.,
+        inner,
+        32.,
+        "Add Existing Hosts",
+        SIDE,
+        INK,
+        false,
+    );
+    tiles.last_mut().unwrap().icon = Some(Icon::ListPlus);
+    button(
+        tiles,
+        hits,
+        x + w - 48.,
+        y + 20.,
+        24.,
+        28.,
+        "",
+        SIDE,
+        Action::CancelHostPicker,
+        hover,
+    );
+    let t = tiles.last_mut().unwrap();
+    t.transparent = true;
+    t.fg = MUTED;
+    let path = if picker.target.is_empty() {
+        "All Hosts".into()
+    } else {
+        format!("All Hosts / {}", store.group_path(&picker.target))
+    };
+    tile(
+        tiles,
+        x + 12.,
+        y + 62.,
+        inner + 24.,
+        24.,
+        tray_label(&format!("To · {path}"), inner),
+        SIDE,
+        MUTED,
+        false,
+    );
+    for (i, text) in ["Hosts in another group will be moved", "to this group."]
+        .iter()
+        .enumerate()
+    {
+        tile(
+            tiles,
+            x + 12.,
+            y + 96. + i as f32 * 20.,
+            inner + 24.,
+            22.,
+            *text,
+            SIDE,
+            MUTED,
+            false,
+        );
+    }
+    if picker.candidates.is_empty() {
+        tile(
+            tiles,
+            x + 12.,
+            list_top,
+            inner + 24.,
+            32.,
+            "All hosts are already in this group.",
+            SIDE,
+            MUTED,
+            false,
+        );
+    }
+    for (row, (index, (host, path))) in picker
+        .candidates
+        .iter()
+        .enumerate()
+        .skip(picker.scroll)
+        .take(rows)
+        .enumerate()
+    {
+        let cy = list_top + row as f32 * 64.;
+        let selected = picker.selected.contains(&index);
+        button(
+            tiles,
+            hits,
+            x + 24.,
+            cy,
+            inner,
+            56.,
+            "",
+            if picker.focus == index { FIELD } else { CARD },
+            Action::PickHost(index),
+            hover,
+        );
+        let t = tiles.last_mut().unwrap();
+        t.icon = None;
+        tile(
+            tiles,
+            x + 34.,
+            cy + 17.,
+            22.,
+            22.,
+            "",
+            CARD,
+            if selected { SIGNAL_INK } else { MUTED },
+            false,
+        );
+        let t = tiles.last_mut().unwrap();
+        t.transparent = true;
+        t.icon = Some(if selected {
+            Icon::CheckboxChecked
+        } else {
+            Icon::Checkbox
+        });
+        tile(
+            tiles,
+            x + 58.,
+            cy + 4.,
+            inner - 44.,
+            24.,
+            &host.label,
+            CARD,
+            INK,
+            false,
+        );
+        tiles.last_mut().unwrap().transparent = true;
+        let path = if path.is_empty() { "Ungrouped" } else { path };
+        tile(
+            tiles,
+            x + 58.,
+            cy + 29.,
+            inner - 44.,
+            22.,
+            format!("{path} · {}", host.endpoint()),
+            CARD,
+            MUTED,
+            false,
+        );
+        tiles.last_mut().unwrap().transparent = true;
+    }
+    if picker.candidates.len() > rows {
+        let track = rows as f32 * 64. - 8.;
+        let thumb = (track * rows as f32 / picker.candidates.len() as f32).max(12.);
+        let offset =
+            (track - thumb) * picker.scroll as f32 / (picker.candidates.len() - rows) as f32;
+        tile(
+            tiles,
+            x + w - 16.,
+            list_top + offset,
+            3.,
+            thumb,
+            "",
+            MUTED,
+            MUTED,
+            true,
+        );
+    }
+    if !error.is_empty() {
+        for (i, line) in dialog_lines(error, (inner / 8.) as usize)
+            .into_iter()
+            .take(2)
+            .enumerate()
+        {
+            tile(
+                tiles,
+                x + 12.,
+                footer - 50. + i as f32 * 22.,
+                inner + 24.,
+                22.,
+                line,
+                SIDE,
+                "#ed8193",
+                false,
+            );
+        }
+    }
+    button(
+        tiles,
+        hits,
+        x + w - 252.,
+        footer,
+        94.,
+        38.,
+        "Cancel",
+        FIELD,
+        Action::CancelHostPicker,
+        hover,
+    );
+    tiles.last_mut().unwrap().icon = None;
+    let label = if picker.selected.is_empty() {
+        "Add Hosts".into()
+    } else {
+        format!("Add Hosts ({})", picker.selected.len())
+    };
+    if picker.selected.is_empty() {
+        tile(
+            tiles,
+            x + w - 148.,
+            footer,
+            124.,
+            38.,
+            label,
+            FIELD,
+            MUTED,
+            true,
+        );
+    } else {
+        button(
+            tiles,
+            hits,
+            x + w - 148.,
+            footer,
+            124.,
+            38.,
+            label,
+            FIELD,
+            Action::AcceptHostPicker,
+            hover,
+        );
+        tiles.last_mut().unwrap().icon = None;
+    }
+    // Keyboard focus remains visible on the two footer controls.
+    if picker.focus >= picker.candidates.len() {
+        let focus_x = if picker.focus == picker.candidates.len() {
+            x + w - 252.
+        } else {
+            x + w - 148.
+        };
+        tile(
+            tiles,
+            focus_x,
+            footer + 36.,
+            if picker.focus == picker.candidates.len() {
+                94.
+            } else {
+                124.
+            },
+            2.,
+            "",
+            ACCENT,
+            ACCENT,
+            false,
+        );
+    }
+    for t in &mut tiles[start..] {
+        t.zindex = 68;
+    }
+}
+
+fn draw_group_delete(
+    tiles: &mut Vec<Tile>,
+    hits: &mut Vec<Hit>,
+    prompt: &super::termviai_confirm::ClosePrompt,
+    width: f32,
+    height: f32,
+    progress: f32,
+    focused_confirm: bool,
+    hover: &Option<Action>,
+) {
+    let w = 440_f32.min(width - 32.);
+    let h = 348_f32.min(height - 84.);
+    let x = (width - w) / 2.;
+    let y = 52. + (height - 52. - h) / 2. + 10. * (1. - progress);
+    let start = tiles.len();
+    hits.clear();
+    hits.push(Hit {
+        x: 0.,
+        y: 0.,
+        w: width,
+        h: height,
+        action: Action::ConfirmDismiss,
+    });
+    hits.push(Hit {
+        x,
+        y,
+        w,
+        h,
+        action: Action::ConfirmCard,
+    });
+    tile(tiles, 0., 52., width, height - 52., "", TOP, INK, false);
+    tiles.last_mut().unwrap().opacity = 0.78;
+    tile(tiles, x, y, w, h, "", SIDE, INK, true);
+    tile(
+        tiles,
+        x + 12.,
+        y + 20.,
+        w - 72.,
+        32.,
+        "Delete Group",
+        SIDE,
+        INK,
+        false,
+    );
+    tiles.last_mut().unwrap().icon = Some(Icon::Trash);
+    button(
+        tiles,
+        hits,
+        x + w - 48.,
+        y + 20.,
+        24.,
+        28.,
+        "",
+        SIDE,
+        Action::ConfirmCancel,
+        hover,
+    );
+    let t = tiles.last_mut().unwrap();
+    t.icon = Some(Icon::Close);
+    t.transparent = true;
+    t.fg = MUTED;
+    tile(
+        tiles,
+        x + 12.,
+        y + 70.,
+        w - 24.,
+        28.,
+        format!("Delete {}?", prompt.summary),
+        SIDE,
+        INK,
+        false,
+    );
+    tile(
+        tiles,
+        x + 24.,
+        y + 112.,
+        w - 48.,
+        132.,
+        "",
+        CARD,
+        MUTED,
+        true,
+    );
+    for (i, line) in prompt
+        .detail
+        .lines()
+        .flat_map(|line| dialog_lines(line, ((w - 72.) / 8.) as usize))
+        .take(5)
+        .enumerate()
+    {
+        tile(
+            tiles,
+            x + 26.,
+            y + 120. + i as f32 * 23.,
+            w - 52.,
+            24.,
+            line,
+            CARD,
+            if i == 0 { INK } else { MUTED },
+            false,
+        );
+    }
+    let fy = y + h - 62.;
+    for (bx, bw, label, action, focused) in [
+        (
+            x + w - 270.,
+            94.,
+            "Cancel",
+            Action::ConfirmCancel,
+            !focused_confirm,
+        ),
+        (
+            x + w - 166.,
+            142.,
+            "Delete Group",
+            Action::ConfirmAccept,
+            focused_confirm,
+        ),
+    ] {
+        if focused {
+            tile(tiles, bx - 2., fy - 2., bw + 4., 42., "", ACCENT, INK, true);
+        }
+        button(tiles, hits, bx, fy, bw, 38., label, FIELD, action, hover);
+    }
+    for t in &mut tiles[start..] {
+        t.zindex = 72;
+        t.opacity *= progress;
+    }
+}
+
 fn hit_action(hits: &[Hit], x: f32, y: f32) -> Option<Action> {
     hits.iter()
         .rev()
@@ -395,10 +2089,72 @@ struct Tile {
     outline_width: f32,
     action: Option<Action>,
     right_inset: f32,
+    text_padding: f32,
     opacity: f32,
     transparent: bool,
     zindex: i8,
     input: Option<InputPaint>,
+}
+
+type HoverKey = (Action, [u32; 4]);
+
+impl Tile {
+    fn hover_key(&self) -> Option<HoverKey> {
+        self.action.clone().map(|action| {
+            (
+                action,
+                [
+                    self.x.to_bits(),
+                    self.y.to_bits(),
+                    self.w.to_bits(),
+                    self.h.to_bits(),
+                ],
+            )
+        })
+    }
+
+    fn hovered_by(&self, hit: Option<&Hit>) -> bool {
+        let Some(hit) = hit else {
+            return false;
+        };
+        // Only actual child controls retain the container's visual hover.
+        // Matching IDs alone would also light up a separate breadcrumb/menu.
+        if hit.x < self.x
+            || hit.y < self.y
+            || hit.x + hit.w > self.x + self.w
+            || hit.y + hit.h > self.y + self.h
+        {
+            return false;
+        }
+        match (&self.action, &hit.action) {
+            (Some(parent), child) if parent == child => true,
+            (
+                Some(Action::Tab(parent)),
+                Action::CloseTab(child)
+                | Action::TabBroadcast(child)
+                | Action::ReconnectGroup(child),
+            ) => parent == child,
+            (Some(Action::NewTab), Action::CloseNewTab) => !self.text.is_empty(),
+            (Some(Action::Group(parent)), Action::GroupMenu(child)) => parent == child,
+            (Some(Action::Connect(parent)), Action::HostMenu(child)) => parent == child,
+            _ => false,
+        }
+    }
+}
+
+struct GroupMenu {
+    group: Option<HostGroup>,
+    add_only: bool,
+    x: f32,
+    y: f32,
+}
+
+struct HostPicker {
+    target: String,
+    candidates: Vec<(Host, String)>,
+    selected: HashSet<usize>,
+    scroll: usize,
+    focus: usize,
 }
 
 pub struct TermviaiUi {
@@ -407,6 +2163,7 @@ pub struct TermviaiUi {
     query: Input,
     search_focus: bool,
     group: String,
+    group_scroll: usize,
     form: Option<Form>,
     closing_form: Option<Form>,
     drawer_motion: Tween,
@@ -417,7 +2174,7 @@ pub struct TermviaiUi {
     dock_motion: Tween,
     dock_preview: Option<super::termviai_dock::Rect>,
     painted_page: Page,
-    hover_motion: HashMap<Action, Tween>,
+    hover_motion: HashMap<HoverKey, Tween>,
     pub(super) error: String,
     pub(super) terminal_errors: HashMap<usize, String>,
     pub(super) tab_drag: Option<super::termviai_tab_drag::TabDrag>,
@@ -425,10 +2182,11 @@ pub struct TermviaiUi {
     input_hits: Vec<InputHit>,
     input_drag: Option<Action>,
     host_menu: Option<(Host, f32, f32)>,
+    group_menu: Option<GroupMenu>,
+    host_picker: Option<HostPicker>,
     scroll: usize,
     max_scroll: usize,
     tab_scroll: usize,
-    group_scroll: usize,
     generation: u64,
     hover: Option<Action>,
     hover_started: Instant,
@@ -460,6 +2218,7 @@ impl TermviaiUi {
             query: Input::default(),
             search_focus: true,
             group: String::new(),
+            group_scroll: 0,
             form: None,
             closing_form: None,
             drawer_motion: Tween::new(0.),
@@ -478,10 +2237,11 @@ impl TermviaiUi {
             input_hits: vec![],
             input_drag: None,
             host_menu: None,
+            group_menu: None,
+            host_picker: None,
             scroll: 0,
             max_scroll: 0,
             tab_scroll: 0,
-            group_scroll: 0,
             generation: 0,
             hover: None,
             hover_started: Instant::now(),
@@ -534,6 +2294,8 @@ impl TermviaiUi {
             settings: false,
             first_row: 0,
             reveal_focus: true,
+            new_group_parent: None,
+            host_group_target: None,
             auth: AuthForm::default(),
         });
         self.form.as_mut().unwrap().fields[0].select_all();
@@ -556,6 +2318,8 @@ impl TermviaiUi {
             settings: true,
             first_row: 0,
             reveal_focus: true,
+            new_group_parent: None,
+            host_group_target: None,
             auth: AuthForm::default(),
         });
         self.form.as_mut().unwrap().fields[0].select_all();
@@ -576,6 +2340,8 @@ impl TermviaiUi {
     fn discard_form(&mut self) {
         self.input_drag = None;
         self.input_hits.clear();
+        self.host_picker = None;
+        self.group_menu = None;
         self.form = None;
         self.closing_form = None;
         self.drawer_motion = Tween::new(0.);
@@ -596,9 +2362,7 @@ impl TermviaiUi {
             return None;
         }
         if let Some(f) = &mut self.form {
-            if f.auth.picker
-                || (!f.auth.selected_identity.is_empty() && matches!(f.focus, 3 | 4 | 5))
-            {
+            if f.auth.picker_open || !f.focusable_fields().contains(&f.focus) {
                 return None;
             }
             f.reveal_focus = true;
@@ -622,9 +2386,140 @@ impl TermviaiUi {
             .find(|hit| hit.action == Action::HostMenu(index))
             .context("Host actions button is no longer visible")?;
         self.host_menu = Some((host, anchor.x, anchor.y + anchor.h + 6.));
+        self.group_menu = None;
         self.tab_menu = None;
         self.hover = None;
         self.pressed = None;
+        Ok(())
+    }
+
+    fn open_group_menu(&mut self, id: &str, add_only: bool) -> anyhow::Result<()> {
+        if add_only && id.is_empty() {
+            self.open_form(false, None);
+            return Ok(());
+        }
+        let action = if add_only {
+            Action::AddHostMenu
+        } else {
+            Action::GroupMenu(id.into())
+        };
+        let anchor = self
+            .hits
+            .iter()
+            .find(|h| h.action == action)
+            .context("The group actions button is no longer visible.")?;
+        let group = if id.is_empty() {
+            None
+        } else {
+            Some(
+                self.store
+                    .group(id)
+                    .context("This group no longer exists.")?
+                    .clone(),
+            )
+        };
+        self.group_menu = Some(GroupMenu {
+            group,
+            add_only,
+            x: anchor.x + anchor.w,
+            y: anchor.y + anchor.h + 6.,
+        });
+        self.host_menu = None;
+        self.tab_menu = None;
+        self.hover = None;
+        self.pressed = None;
+        Ok(())
+    }
+
+    fn menu_group(&self) -> anyhow::Result<String> {
+        let menu = self.group_menu.as_ref().context("Reopen the group menu.")?;
+        Ok(menu
+            .group
+            .as_ref()
+            .map(|g| g.id.clone())
+            .unwrap_or_default())
+    }
+
+    fn open_existing_hosts(&mut self, target: String) -> anyhow::Result<()> {
+        anyhow::ensure!(!target.is_empty(), "Choose a group to add existing hosts.");
+        let store = HostStore::load()?;
+        anyhow::ensure!(store.group(&target).is_some(), "The group was deleted.");
+        self.store = store;
+        let candidates = self
+            .store
+            .hosts
+            .iter()
+            .filter(|h| self.store.host_group_id(h) != target)
+            .map(|h| {
+                (
+                    h.clone(),
+                    self.store.group_path(self.store.host_group_id(h)),
+                )
+            })
+            .collect();
+        self.group_menu = None;
+        self.host_menu = None;
+        self.search_focus = false;
+        self.error.clear();
+        self.host_picker = Some(HostPicker {
+            target,
+            candidates,
+            selected: HashSet::new(),
+            scroll: 0,
+            focus: 0,
+        });
+        Ok(())
+    }
+
+    fn save_host_picker_at(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        let picker = self
+            .host_picker
+            .as_ref()
+            .context("No Host selection is open.")?;
+        let target = picker.target.clone();
+        anyhow::ensure!(!target.is_empty(), "Choose a group to add existing hosts.");
+        let selected: Vec<_> = picker
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| picker.selected.contains(i))
+            .map(|(_, (h, _))| h.clone())
+            .collect();
+        let mut store = HostStore::load_from(path)?;
+        store.move_hosts_to_group(&selected, &target)?;
+        store.save_to(path)?;
+        self.store = store;
+        self.host_picker = None;
+        self.navigate_group(target);
+        self.generation += 1;
+        Ok(())
+    }
+
+    fn delete_group_at(&mut self, group: &HostGroup, path: &std::path::Path) -> anyhow::Result<()> {
+        let mut store = HostStore::load_from(path)?;
+        store.remove_group(group)?;
+        store.save_to(path)?;
+        self.store = store;
+        let target = if self.group == group.id {
+            group.parent_id.clone()
+        } else {
+            self.group.clone()
+        };
+        self.navigate_group(target);
+        self.generation += 1;
+        Ok(())
+    }
+
+    fn delete_host_at(&mut self, host: &Host, path: &std::path::Path) -> anyhow::Result<()> {
+        let mut store = HostStore::load_from(path)?;
+        store.remove_host(host)?;
+        store.save_to(path)?;
+        self.store = store;
+        self.host_menu = None;
+        self.group_menu = None;
+        self.scroll = 0;
+        self.error.clear();
+        self.generation += 1;
         Ok(())
     }
 
@@ -632,10 +2527,20 @@ impl TermviaiUi {
         self.input_drag = None;
         self.input_hits.clear();
         self.host_menu = None;
-        let h = host.clone().unwrap_or(Host {
+        self.group_menu = None;
+        self.host_picker = None;
+        let mut h = host.clone().unwrap_or(Host {
             port: 22,
             ..Default::default()
         });
+        if !key {
+            let group = if host.is_some() {
+                self.store.host_group_id(&h)
+            } else {
+                &self.group
+            };
+            h.group = self.store.group_path(group);
+        }
         let values = if key {
             vec![String::new(), String::new()]
         } else {
@@ -643,10 +2548,11 @@ impl TermviaiUi {
                 h.label,
                 h.address,
                 h.port.to_string(),
-                h.username,
+                h.username.clone(),
                 String::new(),
                 h.identity_file,
                 h.group,
+                h.username,
             ]
         };
         self.closing_form = None;
@@ -661,17 +2567,59 @@ impl TermviaiUi {
             settings: false,
             first_row: 0,
             reveal_focus: true,
+            new_group_parent: None,
+            host_group_target: None,
             auth: AuthForm::default(),
         });
         if let Some(form) = &mut self.form {
+            if !key && form.original.is_none() {
+                form.host_group_target =
+                    Some((self.group.clone(), self.store.group_path(&self.group)));
+            }
             if let Some(host) = &form.original {
                 form.auth.selected_identity = host.identity_id.clone();
-                form.auth.remember = !host.credential_id.is_empty();
+                form.auth.selected_key = host.key_label.clone();
+                form.auth.mode = host.authentication_mode();
+                form.auth.keychain_key = !host.key_label.is_empty();
             }
         }
         self.error.clear();
         self.generation += 1;
     }
+    fn open_group_host(&mut self, target: String) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            target.is_empty() || self.store.group(&target).is_some(),
+            "The group was deleted."
+        );
+        let path = self.store.group_path(&target);
+        // The menu's destination belongs to the form, not library navigation.
+        self.open_form(false, None);
+        let form = self.form.as_mut().unwrap();
+        form.fields[6] = Input::new(path.clone());
+        form.host_group_target = Some((target, path));
+        Ok(())
+    }
+
+    fn open_group(&mut self) {
+        let parent = self.group.clone();
+        self.open_form(true, None);
+        let f = self.form.as_mut().unwrap();
+        f.key = false;
+        f.new_group_parent = Some(parent);
+        f.fields = vec![Input::default()];
+    }
+
+    fn navigate_group(&mut self, id: String) {
+        self.group = id;
+        self.group_scroll = usize::MAX;
+        self.query = Input::default();
+        self.search_focus = false;
+        self.scroll = 0;
+        self.host_menu = None;
+        self.group_menu = None;
+        self.error.clear();
+    }
+
     fn open_identity(&mut self, identity: Option<Identity>) {
         self.open_form(true, None);
         let f = self.form.as_mut().unwrap();
@@ -705,6 +2653,14 @@ impl TermviaiUi {
         );
         // Validate a fresh snapshot before touching credentials or the library.
         let mut store = HostStore::load_from(path)?;
+        if let Some(parent) = &f.new_group_parent {
+            let id = store.add_group(&f.fields[0].value, parent)?;
+            store.save_to(path)?;
+            self.store = store;
+            self.navigate_group(id);
+            self.close_form();
+            return Ok(());
+        }
         let mut pending_password: Option<(String, String, bool)> = None;
         if f.auth.editing_identity {
             let label = f.fields[0].value.trim().to_string();
@@ -779,50 +2735,75 @@ impl TermviaiUi {
                     .trim()
                     .parse()
                     .context("Port must be between 1 and 65535.")?,
-                username: v[3].clone(),
-                group: v[6].clone(),
-                identity_file: v[5].clone(),
-                identity_id: f.auth.selected_identity.clone(),
+
+                authentication: Some(f.auth.mode),
                 ..Default::default()
             };
-            if !host.identity_id.is_empty() {
-                host.resolve_identity(&store)?;
-            } else if !v[4].is_empty() {
-                let id = if f.auth.remember {
-                    new_credential_id()
-                } else {
-                    format!("session-{}", new_credential_id())
-                };
-                if f.auth.remember {
-                    host.credential_id = id.clone();
-                } else {
-                    host.session_credential = id.clone();
-                }
-                pending_password = Some((id, v[4].clone(), f.auth.remember));
-            } else if let Some(original) = &f.original {
-                if original.identity_id.is_empty() && !f.auth.reset_password {
-                    if f.auth.remember == !original.credential_id.is_empty() {
-                        host.credential_id = original.credential_id.clone();
-                        host.session_credential = original.session_credential.clone();
-                    } else if let Some(password) =
-                        wezterm_ssh::credentials::load(original.credential_ref())?
-                    {
-                        let id = if f.auth.remember {
-                            new_credential_id()
-                        } else {
-                            format!("session-{}", new_credential_id())
-                        };
-                        if f.auth.remember {
-                            host.credential_id = id.clone();
-                        } else {
-                            host.session_credential = id.clone();
+            match f.auth.mode {
+                Authentication::Password => {
+                    host.username = v[3].clone();
+                    if !v[4].is_empty() {
+                        let id = new_credential_id();
+                        host.credential_id = id.clone();
+                        pending_password = Some((id, v[4].clone(), true));
+                    } else if let Some(original) = &f.original {
+                        let reference = original.own_credential_ref();
+                        if !reference.is_empty() {
+                            if original.session_credential.is_empty() {
+                                host.credential_id = reference.to_owned();
+                            } else {
+                                let password = wezterm_ssh::credentials::load(reference)?.context(
+                                    "The temporary password has expired. Enter it again to save it.")?;
+                                let id = new_credential_id();
+                                host.credential_id = id.clone();
+                                pending_password = Some((id, password, true));
+                            }
                         }
-                        pending_password = Some((id, password, f.auth.remember));
-                    } else if f.auth.remember {
-                        anyhow::bail!("The temporary password is no longer available. Enter it again to remember it.");
+                    }
+                    anyhow::ensure!(!host.credential_id.is_empty(), "Enter a password.");
+                }
+                Authentication::Key => {
+                    host.username = v[7].clone();
+                    if f.auth.keychain_key {
+                        anyhow::ensure!(
+                            !f.auth.selected_key.is_empty(),
+                            "Select a key from Keychain."
+                        );
+                        host.key_label = f.auth.selected_key.clone();
+                    } else {
+                        anyhow::ensure!(!v[5].trim().is_empty(), "Enter a private key file path.");
+                        host.identity_file = v[5].clone();
                     }
                 }
+                Authentication::Identity => {
+                    anyhow::ensure!(
+                        !f.auth.selected_identity.is_empty(),
+                        "Select an identity from Keychain."
+                    );
+                    host.identity_id = f.auth.selected_identity.clone();
+                }
             }
+            if f.auth.mode != Authentication::Identity {
+                anyhow::ensure!(!host.username.trim().is_empty(), "Enter a username.");
+            }
+            if let Some((id, initial_path)) = &f.host_group_target {
+                if v[6].trim() == initial_path {
+                    anyhow::ensure!(
+                        id.is_empty() || store.group(id).is_some(),
+                        "The destination group was deleted. Reopen New Host."
+                    );
+                    host.group_id = id.clone();
+                    host.group = store.group_path(id);
+                } else {
+                    store.assign_host_group(&mut host, &v[6], None)?;
+                }
+            } else {
+                store.assign_host_group(&mut host, &v[6], f.original.as_ref())?;
+            }
+            // Persist references for the active mode, resolving a copy for validation.
+            let mut resolved = host.clone();
+            resolved.resolve_identity(&store)?;
+            resolved.validate()?;
             host.validate()?;
             if let Some(original) = &f.original {
                 let idx = store
@@ -854,18 +2835,14 @@ impl TermviaiUi {
             return Err(error);
         }
         if let Some(original) = &f.original {
-            let old = original.credential_ref();
-            if original.identity_id.is_empty()
-                && !old.is_empty()
-                && !store.hosts.iter().any(|h| h.credential_ref() == old)
-            {
+            let old = original.own_credential_ref();
+            if !old.is_empty() && !store.hosts.iter().any(|h| h.own_credential_ref() == old) {
                 // No saved host owns the replaced credential any longer.
                 wezterm_ssh::credentials::delete(old)?;
             }
         }
         self.store = store;
         self.query = Input::default();
-        self.group.clear();
         self.scroll = 0;
         self.close_form();
         self.error.clear();
@@ -901,6 +2878,7 @@ fn tile(
             outline_width: 0.,
             action: None,
             right_inset: 0.,
+            text_padding: 12.,
             opacity: 1.,
             transparent: false,
             zindex: 30,
@@ -924,22 +2902,31 @@ fn button(
     let icon = match &action {
         Action::ToggleSidebar => Some(Icon::Menu),
         Action::Hosts => Some(Icon::Hosts),
-        Action::Keys | Action::UseKey(_) => Some(Icon::Key),
+        Action::Keys | Action::AddKey | Action::UseKey(_) => Some(Icon::Key),
         Action::Settings => Some(Icon::Settings),
-        Action::ChooseAuth => Some(Icon::Key),
-        Action::RememberPassword => Some(Icon::Check),
+
         Action::EditIdentity(_) | Action::UseIdentity(_) => Some(Icon::Identity),
         Action::NewTab if text.is_empty() => Some(Icon::Plus),
         Action::NewTab | Action::Tab(_) | Action::FocusPane(_) => Some(Icon::Terminal),
-        Action::AddHost | Action::AddKey | Action::AddIdentity => Some(Icon::Plus),
-        Action::CloseTab(_) | Action::CloseNewTab | Action::Close | Action::RemovePane(_) => {
-            Some(Icon::Close)
+        Action::AddHost | Action::AddHostMenu | Action::NewGroupHost | Action::AddIdentity => {
+            Some(Icon::Plus)
         }
+        Action::CloseTab(_)
+        | Action::CloseNewTab
+        | Action::Close
+        | Action::RemovePane(_)
+        | Action::RemoveRecent(..) => Some(Icon::Close),
         Action::PrevTab | Action::PrevGroup => Some(Icon::ChevronLeft),
         Action::NextTab | Action::NextGroup => Some(Icon::ChevronRight),
         Action::Minimize => Some(Icon::Minimize),
         Action::Maximize => Some(Icon::Maximize),
-        Action::HostMenu(_) => Some(Icon::More),
+        Action::HostMenu(_) | Action::GroupMenu(_) => Some(Icon::More),
+        Action::ExistingGroupHosts => Some(Icon::ListPlus),
+        Action::CancelHostPicker => Some(Icon::Close),
+        Action::PickHost(_) => Some(Icon::Checkbox),
+        Action::AcceptHostPicker => Some(Icon::Check),
+        Action::AddGroup => Some(Icon::FolderPlus),
+        Action::DeleteHost | Action::DeleteGroup => Some(Icon::Trash),
         Action::Search => Some(Icon::Search),
         Action::QuickConnect => Some(Icon::ArrowRight),
         Action::Save => Some(Icon::Check),
@@ -947,7 +2934,8 @@ fn button(
         Action::Broadcast | Action::TabBroadcast(_) => Some(Icon::Broadcast),
         Action::ReconnectPane(_) | Action::ReconnectGroup(_) => Some(Icon::Refresh),
         Action::ToggleTray => Some(Icon::ChevronDown),
-        Action::RenameTab(_) => Some(Icon::Edit),
+        Action::RenameTab(_) | Action::EditMenuHost => Some(Icon::Edit),
+        Action::DuplicateHost => Some(Icon::Copy),
         Action::SaveWorkspace(_) => Some(Icon::Check),
         Action::OpenSaved(_) => Some(Icon::Grid),
         Action::ConnectRecent(_) => Some(Icon::Hosts),
@@ -1240,6 +3228,29 @@ struct CloseDialogLayout {
 }
 
 impl CloseDialogLayout {
+    fn group_delete(width: f32, height: f32, progress: f32) -> Self {
+        use super::termviai_dock::Rect;
+        let w = 440_f32.min(width - 32.);
+        let h = 348_f32.min(height - 84.);
+        let x = (width - w) / 2.;
+        let y = 52. + (height - 52. - h) / 2. + 10. * (1. - progress);
+        Self {
+            card: Rect { x, y, w, h },
+            padding: 24.,
+            cancel: Rect {
+                x: x + w - 270.,
+                y: y + h - 62.,
+                w: 94.,
+                h: 38.,
+            },
+            accept: Rect {
+                x: x + w - 166.,
+                y: y + h - 62.,
+                w: 142.,
+                h: 38.,
+            },
+        }
+    }
     fn new(width: f32, height: f32, progress: f32) -> Self {
         use super::termviai_dock::Rect;
         let w = (width - 32.).clamp(1., 480.);
@@ -1329,7 +3340,28 @@ fn paint_close_dialog(
     focused_confirm: bool,
     hover: &Option<Action>,
 ) {
+    if matches!(
+        prompt.target,
+        super::termviai_confirm::CloseTarget::DeleteGroup(_)
+    ) {
+        draw_group_delete(
+            tiles,
+            hits,
+            prompt,
+            width,
+            height,
+            progress,
+            focused_confirm,
+            hover,
+        );
+        return;
+    }
     let layout = CloseDialogLayout::new(width, height, progress);
+    let deleting_host = matches!(
+        prompt.target,
+        super::termviai_confirm::CloseTarget::DeleteHost(_)
+            | super::termviai_confirm::CloseTarget::DeleteGroup(_)
+    );
     let r = layout.card;
     let p = layout.padding;
     tile(tiles, 0., 0., width, height, "", "#090a12", INK, false);
@@ -1382,7 +3414,11 @@ fn paint_close_dialog(
             true,
         );
         let icon = tiles.last_mut().unwrap();
-        icon.icon = Some(Icon::Power);
+        icon.icon = Some(if deleting_host {
+            Icon::Trash
+        } else {
+            Icon::Power
+        });
         icon.icon_size = 24.;
         icon.corner_radius = 12.;
         tile(
@@ -1416,7 +3452,11 @@ fn paint_close_dialog(
             r.y + p + 25.,
             r.w - p * 2. - 56.,
             20.,
-            "CONFIRM DISCONNECT",
+            if deleting_host {
+                "REMOVE FROM HOSTS"
+            } else {
+                "CONFIRM DISCONNECT"
+            },
             SIDE,
             MUTED,
             false,
@@ -1505,7 +3545,11 @@ fn paint_close_dialog(
         layout.accept.w,
         layout.accept.h,
         if r.w < 260. && prompt.confirm_label != "Closing…" {
-            "Close"
+            if deleting_host {
+                "Delete"
+            } else {
+                "Close"
+            }
         } else {
             &prompt.confirm_label
         },
@@ -1603,7 +3647,9 @@ impl TermWindow {
                 || self.termviai_ui.form.is_some()
                 || self.termviai_ui.closing_form.is_some()
                 || self.termviai_ui.tab_menu.is_some()
-                || self.termviai_ui.host_menu.is_some())
+                || self.termviai_ui.host_menu.is_some()
+                || self.termviai_ui.group_menu.is_some()
+                || self.termviai_ui.host_picker.is_some())
     }
 
     fn termviai_save_form(&mut self) -> anyhow::Result<()> {
@@ -1652,6 +3698,7 @@ impl TermWindow {
         self.cancel_termviai_tab_drag();
         self.termviai_ui.input_drag = None;
         self.termviai_ui.host_menu = None;
+        self.termviai_ui.group_menu = None;
         self.termviai_ui.pressed = None;
         self.termviai_ui.hover = None;
         self.termviai_ui.tab_menu = None;
@@ -1667,6 +3714,30 @@ impl TermWindow {
         self.dragging = None;
         self.last_mouse_click = None;
         self.dead_key_status = window::DeadKeyStatus::None;
+    }
+
+    pub(super) fn termviai_delete_host(&mut self, host: &Host) -> anyhow::Result<()> {
+        self.termviai_ui.delete_host_at(host, &HostStore::path())
+    }
+
+    pub(super) fn termviai_delete_group(&mut self, group: &HostGroup) -> anyhow::Result<()> {
+        self.termviai_ui.delete_group_at(group, &HostStore::path())
+    }
+
+    pub(super) fn termviai_group_delete_detail(&self, group: &HostGroup) -> String {
+        let store = &self.termviai_ui.store;
+        let hosts = store
+            .hosts
+            .iter()
+            .filter(|h| store.host_group_id(h) == group.id)
+            .count();
+        let groups = store.child_groups(&group.id).len();
+        let parent = if group.parent_id.is_empty() {
+            "All Hosts".into()
+        } else {
+            tray_label(&store.group_path(&group.parent_id), 180.)
+        };
+        format!("Keep all hosts and subgroups.\n{hosts} direct hosts and {groups} subgroups move to {parent}.\nActive connections stay connected.")
     }
 
     fn termviai_action(&mut self, action: Action) -> anyhow::Result<()> {
@@ -1726,6 +3797,7 @@ impl TermWindow {
             Action::DismissMenu => {
                 self.termviai_ui.tab_menu = None;
                 self.termviai_ui.host_menu = None;
+                self.termviai_ui.group_menu = None;
             }
             Action::EditMenuHost => {
                 if let Some((host, _, _)) = self.termviai_ui.host_menu.take() {
@@ -1738,6 +3810,14 @@ impl TermWindow {
                     store.duplicate_host(&host)?;
                     store.save()?;
                     self.termviai_ui.store = store;
+                }
+            }
+            Action::DeleteHost => {
+                if let Some((host, _, _)) = self.termviai_ui.host_menu.take() {
+                    self.termviai_ui.error.clear();
+                    self.termviai_request_close(super::termviai_confirm::CloseTarget::DeleteHost(
+                        host,
+                    ));
                 }
             }
             Action::OpenSaved(id) => {
@@ -1764,6 +3844,18 @@ impl TermWindow {
                     .host
                     .clone();
                 self.termviai_connect(host)?;
+            }
+            Action::RemoveRecent(index, stamp) => {
+                let entry = self
+                    .termviai_ui
+                    .workspace
+                    .data
+                    .recent
+                    .get(index)
+                    .filter(|entry| entry.last_connected_ms == stamp)
+                    .context("This recent connection changed. Please select it again.")?
+                    .clone();
+                self.termviai_ui.workspace.data.remove_recent(&entry)?;
             }
             Action::ToggleTray => {
                 self.termviai_ui.tray_expanded = !self.termviai_ui.tray_expanded;
@@ -1793,6 +3885,56 @@ impl TermWindow {
                 self.termviai_ui.open_settings(size, keepalive);
             }
             Action::AddHost => self.termviai_ui.open_form(false, None),
+            Action::AddHostMenu => {
+                let group = self.termviai_ui.group.clone();
+                self.termviai_ui.open_group_menu(&group, true)?;
+            }
+            Action::GroupMenu(id) => self.termviai_ui.open_group_menu(&id, false)?,
+            Action::NewGroupHost | Action::ExistingGroupHosts => {
+                let target = if self.termviai_ui.group_menu.is_some() {
+                    self.termviai_ui.menu_group()?
+                } else {
+                    self.termviai_ui.group.clone()
+                };
+                if action == Action::ExistingGroupHosts {
+                    self.termviai_ui.open_existing_hosts(target)?;
+                } else {
+                    let store = HostStore::load()?;
+                    anyhow::ensure!(
+                        target.is_empty() || store.group(&target).is_some(),
+                        "The group was deleted."
+                    );
+                    self.termviai_ui.store = store;
+                    self.termviai_ui.open_group_host(target)?;
+                }
+            }
+            Action::DeleteGroup => {
+                let group = self
+                    .termviai_ui
+                    .group_menu
+                    .as_ref()
+                    .and_then(|m| m.group.clone())
+                    .context("Reopen the group menu.")?;
+                self.termviai_request_close(super::termviai_confirm::CloseTarget::DeleteGroup(
+                    group,
+                ));
+            }
+            Action::PickHost(index) => {
+                if let Some(picker) = &mut self.termviai_ui.host_picker {
+                    if index < picker.candidates.len() {
+                        if !picker.selected.remove(&index) {
+                            picker.selected.insert(index);
+                        }
+                        picker.focus = index;
+                    }
+                }
+            }
+            Action::AcceptHostPicker => self.termviai_ui.save_host_picker_at(&HostStore::path())?,
+            Action::CancelHostPicker => {
+                self.termviai_ui.host_picker = None;
+                self.termviai_ui.error.clear();
+            }
+            Action::AddGroup => self.termviai_ui.open_group(),
             Action::AddKey => self.termviai_ui.open_form(true, None),
             Action::AddIdentity => self.termviai_ui.open_identity(None),
             Action::EditIdentity(index) => {
@@ -1805,38 +3947,47 @@ impl TermWindow {
                     .clone();
                 self.termviai_ui.open_identity(Some(identity));
             }
-            Action::ChooseAuth => {
+            Action::AuthMode(mode) => {
+                self.termviai_ui.error.clear();
                 if let Some(f) = &mut self.termviai_ui.form {
-                    f.auth.picker = !f.auth.picker;
+                    f.set_auth_mode(mode);
+                }
+            }
+            Action::KeySource(keychain) => {
+                self.termviai_ui.error.clear();
+                if let Some(f) = &mut self.termviai_ui.form {
+                    f.auth.keychain_key = keychain;
+                    f.auth.picker_open = false;
+                    f.reveal_focus = false;
+                    if !f.focusable_fields().contains(&f.focus) {
+                        f.focus = 7;
+                    }
+                }
+            }
+            Action::AuthPicker => {
+                if let Some(f) = &mut self.termviai_ui.form {
+                    f.auth.picker_open = !f.auth.picker_open;
                     f.auth.picker_scroll = 0;
                 }
             }
-            Action::ManualAuth => {
+            Action::CloseAuthPicker => {
                 if let Some(f) = &mut self.termviai_ui.form {
-                    f.auth.selected_identity.clear();
-                    f.auth.picker = false;
+                    f.auth.picker_open = false;
                 }
             }
             Action::UseIdentity(index) => {
-                let identity = self
+                self.termviai_ui.error.clear();
+                let id = self
                     .termviai_ui
                     .store
                     .identities
                     .get(index)
                     .context("Identity no longer exists")?
+                    .id
                     .clone();
                 if let Some(f) = &mut self.termviai_ui.form {
-                    f.auth.selected_identity = identity.id;
-                    f.fields[3] = Input::new(identity.username);
-                    f.fields[5] = Input::default();
-                    f.fields[4] = Input::default();
-                    f.auth.picker = false;
-                    f.auth.reveal = false;
-                }
-            }
-            Action::RememberPassword => {
-                if let Some(f) = &mut self.termviai_ui.form {
-                    f.auth.remember = !f.auth.remember;
+                    f.auth.selected_identity = id;
+                    f.auth.picker_open = false;
                 }
             }
             Action::RevealPassword => {
@@ -1868,27 +4019,10 @@ impl TermWindow {
             }
 
             Action::Cancel => {
-                if let Some(f) = &mut self.termviai_ui.form {
-                    if f.auth.picker {
-                        f.auth.picker = false;
-                        return Ok(());
-                    }
-                }
                 self.termviai_ui.close_form();
                 self.termviai_ui.error.clear();
             }
-            Action::Save => {
-                if self
-                    .termviai_ui
-                    .form
-                    .as_ref()
-                    .is_some_and(|f| f.auth.picker)
-                {
-                    self.termviai_ui.form.as_mut().unwrap().auth.picker = false;
-                } else {
-                    self.termviai_save_form()?;
-                }
-            }
+            Action::Save => self.termviai_save_form()?,
             Action::HostMenu(i) => self.termviai_ui.open_host_menu(i)?,
             Action::Connect(i) => {
                 let h = self
@@ -1912,21 +4046,21 @@ impl TermWindow {
             }
             Action::Search => self.termviai_ui.search_focus = true,
             Action::Group(g) => {
-                self.termviai_ui.group = g;
-                self.termviai_ui.scroll = 0;
+                self.termviai_ui.navigate_group(g);
             }
             Action::UseKey(i) => {
+                self.termviai_ui.error.clear();
+                let label = self
+                    .termviai_ui
+                    .store
+                    .keys
+                    .get(i)
+                    .context("Key no longer exists")?
+                    .label
+                    .clone();
                 if let Some(f) = &mut self.termviai_ui.form {
-                    if f.is_host() {
-                        f.auth.selected_identity.clear();
-                        f.auth.picker = false;
-                        f.fields[4] = Input::default();
-                        f.auth.remember = false;
-                        f.auth.reset_password = true;
-                        f.fields[5] = Input::new(self.termviai_ui.store.keys[i].path.clone());
-                        f.focus = 5;
-                        f.reveal_focus = true;
-                    }
+                    f.auth.selected_key = label;
+                    f.auth.picker_open = false;
                 }
             }
             Action::Tab(id) | Action::CloseTab(id) => {
@@ -1952,7 +4086,9 @@ impl TermWindow {
             Action::PrevGroup => {
                 self.termviai_ui.group_scroll = self.termviai_ui.group_scroll.saturating_sub(1)
             }
-            Action::NextGroup => self.termviai_ui.group_scroll += 1,
+            Action::NextGroup => {
+                self.termviai_ui.group_scroll = self.termviai_ui.group_scroll.saturating_add(1)
+            }
             Action::Minimize => {
                 if let Some(w) = &self.window {
                     w.hide();
@@ -2042,7 +4178,32 @@ impl TermWindow {
                 height,
                 self.termviai_confirm.motion.value(Instant::now()),
             );
-            let over = hit_action(&layout.hits(width, height), x, y);
+            let group_delete = self.termviai_confirm.prompt.as_ref().is_some_and(|p| {
+                matches!(
+                    p.target,
+                    super::termviai_confirm::CloseTarget::DeleteGroup(_)
+                )
+            });
+            let layout = if group_delete {
+                CloseDialogLayout::group_delete(
+                    width,
+                    height,
+                    self.termviai_confirm.motion.value(Instant::now()),
+                )
+            } else {
+                layout
+            };
+            let mut dialog_hits = layout.hits(width, height);
+            if group_delete {
+                dialog_hits.push(Hit {
+                    x: layout.card.x + layout.card.w - 48.,
+                    y: layout.card.y + 20.,
+                    w: 24.,
+                    h: 28.,
+                    action: Action::ConfirmCancel,
+                });
+            }
+            let over = hit_action(&dialog_hits, x, y);
             match event.kind {
                 MouseEventKind::Move => {
                     if self.termviai_ui.hover != over {
@@ -2266,6 +4427,16 @@ impl TermWindow {
                 context.invalidate();
             }
             MouseEventKind::VertWheel(amount) => {
+                if let Some(picker) = &mut self.termviai_ui.host_picker {
+                    let step = amount.unsigned_abs().max(1) as usize;
+                    picker.scroll = if amount > 0 {
+                        picker.scroll.saturating_sub(step)
+                    } else {
+                        picker.scroll.saturating_add(step)
+                    };
+                    context.invalidate();
+                    return true;
+                }
                 if self.termviai_ui.tab_drag.is_some() && y < 52. {
                     let step = amount.unsigned_abs().max(1) as usize;
                     self.termviai_ui.tab_scroll = if amount > 0 {
@@ -2294,13 +4465,14 @@ impl TermWindow {
                     context.invalidate();
                     return true;
                 }
-                let layout = DrawerLayout::new(
+                let layout = DrawerLayout::for_form(
                     self.dimensions.pixel_width as f32 / scale,
                     (self.dimensions.pixel_height as f32 - self.get_os_border().top.get() as f32)
                         / scale,
+                    self.termviai_ui.form.as_ref().is_some_and(Form::is_host),
                 );
                 if let Some(form) = &mut self.termviai_ui.form {
-                    if form.auth.picker {
+                    if form.auth.picker_open {
                         form.auth.picker_scroll = if amount > 0 {
                             form.auth
                                 .picker_scroll
@@ -2313,18 +4485,16 @@ impl TermWindow {
                         context.invalidate();
                         return true;
                     }
-
                     if x >= layout.x
                         + (1. - self.termviai_ui.drawer_motion.value(Instant::now())) * layout.width
                         && y >= 148.
-                        && y < layout.footer
+                        && y < layout.footer + 32.
                     {
                         let step = amount.unsigned_abs().max(1) as usize;
                         form.first_row = if amount > 0 {
                             form.first_row.saturating_sub(step)
                         } else {
-                            (form.first_row + step)
-                                .min(form.fields.len().saturating_sub(layout.rows))
+                            form.first_row.saturating_add(step)
                         };
                         form.reveal_focus = false;
                         context.invalidate();
@@ -2393,10 +4563,61 @@ impl TermWindow {
             context.invalidate();
             return true;
         }
-        if self.termviai_ui.tab_menu.is_some() || self.termviai_ui.host_menu.is_some() {
+        if let Some(picker) = &mut self.termviai_ui.host_picker {
+            if !event.key_is_down {
+                return true;
+            }
+            let count = picker.candidates.len();
+            let mut action = None;
+            match event.key {
+                KeyCode::Char('\u{1b}') => action = Some(Action::CancelHostPicker),
+                KeyCode::Char('\t') => {
+                    picker.focus = if event.modifiers.contains(Modifiers::SHIFT) {
+                        (picker.focus + count + 1) % (count + 2)
+                    } else {
+                        (picker.focus + 1) % (count + 2)
+                    };
+                    if picker.focus < count {
+                        picker.scroll = picker.focus;
+                    }
+                }
+                KeyCode::UpArrow => {
+                    picker.focus = picker.focus.saturating_sub(1);
+                    picker.scroll = picker.focus.min(count.saturating_sub(1));
+                }
+                KeyCode::DownArrow => {
+                    picker.focus = (picker.focus + 1).min(count + 1);
+                    if picker.focus < count {
+                        picker.scroll = picker.focus;
+                    }
+                }
+                KeyCode::Char(' ' | '\r') => {
+                    action = Some(if picker.focus < count {
+                        Action::PickHost(picker.focus)
+                    } else if picker.focus == count {
+                        Action::CancelHostPicker
+                    } else {
+                        Action::AcceptHostPicker
+                    })
+                }
+                _ => {}
+            }
+            if let Some(action) = action {
+                if let Err(e) = self.termviai_action(action) {
+                    self.termviai_ui.error = format!("{e:#}");
+                }
+            }
+            context.invalidate();
+            return true;
+        }
+        if self.termviai_ui.tab_menu.is_some()
+            || self.termviai_ui.host_menu.is_some()
+            || self.termviai_ui.group_menu.is_some()
+        {
             if event.key_is_down && event.key == KeyCode::Char('\u{1b}') {
                 self.termviai_ui.tab_menu = None;
                 self.termviai_ui.host_menu = None;
+                self.termviai_ui.group_menu = None;
                 context.invalidate();
             }
             return true;
@@ -2420,6 +4641,46 @@ impl TermWindow {
             return false;
         }
         if !event.key_is_down || self.termviai_ui.closing_form.is_some() {
+            return true;
+        }
+        if self
+            .termviai_ui
+            .form
+            .as_ref()
+            .is_some_and(|f| f.auth.picker_open)
+        {
+            let ui = &mut self.termviai_ui;
+            let f = ui.form.as_mut().unwrap();
+            match event.key {
+                KeyCode::Char('\u{1b}' | '\r' | '\t') => f.auth.picker_open = false,
+                KeyCode::UpArrow | KeyCode::DownArrow => {
+                    let identity = f.auth.mode == Authentication::Identity;
+                    let entries: Vec<&str> = if identity {
+                        ui.store.identities.iter().map(|i| i.id.as_str()).collect()
+                    } else {
+                        ui.store.keys.iter().map(|k| k.label.as_str()).collect()
+                    };
+                    let selected = if identity {
+                        &mut f.auth.selected_identity
+                    } else {
+                        &mut f.auth.selected_key
+                    };
+                    if !entries.is_empty() {
+                        let current = entries.iter().position(|id| *id == selected.as_str());
+                        let next = match (current, &event.key) {
+                            (Some(i), KeyCode::UpArrow) => i.saturating_sub(1),
+                            (Some(i), _) => (i + 1).min(entries.len() - 1),
+                            (None, _) => 0,
+                        };
+                        *selected = entries[next].to_owned();
+                        f.auth.picker_scroll = next;
+                        ui.error.clear();
+                    }
+                }
+                _ => {}
+            }
+            ui.generation += 1;
+            context.invalidate();
             return true;
         }
         let ctrl = event.modifiers.contains(Modifiers::CTRL);
@@ -2475,15 +4736,6 @@ impl TermWindow {
             }
             return true;
         }
-        if let Some(f) = &mut self.termviai_ui.form {
-            if f.auth.picker {
-                if event.key == KeyCode::Char('\u{1b}') {
-                    f.auth.picker = false;
-                    context.invalidate();
-                }
-                return true;
-            }
-        }
         self.termviai_ui.generation += 1;
         match &event.key {
             KeyCode::Char('\u{1b}') => {
@@ -2526,21 +4778,14 @@ impl TermWindow {
             }
             KeyCode::Char('\t') => {
                 if let Some(f) = &mut self.termviai_ui.form {
-                    let n = f.fields.len();
-                    f.focus = if event.modifiers.contains(Modifiers::SHIFT) {
-                        (f.focus + n - 1) % n
+                    let fields = f.focusable_fields();
+                    let index = fields.iter().position(|i| *i == f.focus).unwrap_or(0);
+                    let next = if event.modifiers.contains(Modifiers::SHIFT) {
+                        (index + fields.len() - 1) % fields.len()
                     } else {
-                        (f.focus + 1) % n
+                        (index + 1) % fields.len()
                     };
-                    if !f.auth.selected_identity.is_empty() {
-                        while matches!(f.focus, 3 | 4 | 5) {
-                            f.focus = if event.modifiers.contains(Modifiers::SHIFT) {
-                                (f.focus + n - 1) % n
-                            } else {
-                                (f.focus + 1) % n
-                            };
-                        }
-                    }
+                    f.focus = fields[next];
                     f.reveal_focus = true;
                 }
             }
@@ -2640,6 +4885,12 @@ impl TermWindow {
         let border = self.get_os_border();
         let top = border.top.get() as f32;
         let h = (self.dimensions.pixel_height as f32 - top) / scale;
+        let pointer = self.current_mouse_event.as_ref().map(|event| {
+            (
+                event.coords.x as f32 / scale,
+                (event.coords.y as f32 - top) / scale,
+            )
+        });
         self.termviai_sync_broadcast();
         let active_tab = Mux::get().get_active_tab_for_window(self.mux_window_id);
         let pane_list = active_tab
@@ -3697,14 +5948,23 @@ impl TermWindow {
             {
                 let y = 184. + row as f32 * 48.;
                 if let Some(action) = action {
+                    let remove = match action {
+                        Action::ConnectRecent(index) => Some(Action::RemoveRecent(
+                            index,
+                            ui.workspace.data.recent[index].last_connected_ms,
+                        )),
+                        _ => None,
+                    };
+                    let trailing = if remove.is_some() { 36. } else { 0. };
                     button(
                         &mut tiles, &mut hits, cx, y, cw, 40., label, CARD, action, &hover,
                     );
+                    tiles.last_mut().unwrap().right_inset = trailing;
                     if cw > 400. {
-                        tiles.last_mut().unwrap().right_inset = 170.;
+                        tiles.last_mut().unwrap().right_inset = 182. + trailing;
                         tile(
                             &mut tiles,
-                            cx + cw - 182.,
+                            cx + cw - 182. - trailing,
                             y,
                             174.,
                             40.,
@@ -3714,6 +5974,24 @@ impl TermWindow {
                             false,
                         );
                         tiles.last_mut().unwrap().transparent = true;
+                    }
+                    if let Some(remove) = remove {
+                        button(
+                            &mut tiles,
+                            &mut hits,
+                            cx + cw - 32.,
+                            y + 6.,
+                            24.,
+                            28.,
+                            "",
+                            CARD,
+                            remove,
+                            &hover,
+                        );
+                        let close = tiles.last_mut().unwrap();
+                        close.transparent = true;
+                        close.fg = MUTED;
+                        close.icon_size = 18.;
                     }
                 } else {
                     tile(&mut tiles, cx, y, cw, 40., label, BG, MUTED, false);
@@ -3754,13 +6032,16 @@ impl TermWindow {
                 w - content_left,
                 124.,
                 "",
-                SIDE,
+                if ui.page == Page::Hosts { BG } else { SIDE },
                 INK,
                 false,
             );
             let query = if ui.query.value.is_empty() {
                 if ui.page == Page::Hosts {
-                    "Find a host or ssh user@hostname…".into()
+                    ui.store
+                        .group(&ui.group)
+                        .map(|g| format!("Search in {}…", g.name))
+                        .unwrap_or_else(|| "Search all hosts…".into())
                 } else {
                     "Find a key or identity…".into()
                 }
@@ -3774,7 +6055,7 @@ impl TermWindow {
                 &mut tiles,
                 &mut hits,
                 cx,
-                68.,
+                if ui.page == Page::Hosts { 122. } else { 68. },
                 cw,
                 42.,
                 query,
@@ -3790,41 +6071,78 @@ impl TermWindow {
             if ui.query.value.is_empty() {
                 tiles.last_mut().unwrap().fg = MUTED;
             }
-            if ui.page == Page::Hosts && cw >= 240. {
-                tiles.last_mut().unwrap().right_inset = 116.;
+            if ui.page == Page::Hosts {
+                tile(
+                    &mut tiles,
+                    cx - 12.,
+                    68.,
+                    (cw - 304.).max(48.),
+                    38.,
+                    "Hosts",
+                    BG,
+                    INK,
+                    false,
+                );
                 button(
                     &mut tiles,
                     &mut hits,
-                    cx + cw - 112.,
-                    74.,
-                    104.,
-                    30.,
-                    "Connect",
+                    cx + cw - 292.,
+                    68.,
+                    144.,
+                    38.,
+                    "Add Host",
+                    FIELD,
+                    if ui.group.is_empty() {
+                        Action::AddHost
+                    } else {
+                        Action::AddHostMenu
+                    },
+                    &hover,
+                );
+                if !ui.group.is_empty() {
+                    tiles.last_mut().unwrap().right_inset = 24.;
+                    tile(
+                        &mut tiles,
+                        cx + cw - 174.,
+                        78.,
+                        18.,
+                        18.,
+                        "",
+                        FIELD,
+                        MUTED,
+                        false,
+                    );
+                    let t = tiles.last_mut().unwrap();
+                    t.icon = Some(Icon::ChevronDown);
+                    t.icon_size = 14.;
+                    t.transparent = true;
+                }
+                button(
+                    &mut tiles,
+                    &mut hits,
+                    cx + cw - 136.,
+                    68.,
+                    136.,
+                    38.,
+                    "New Group",
+                    FIELD,
+                    Action::AddGroup,
+                    &hover,
+                );
+            } else {
+                button(
+                    &mut tiles,
+                    &mut hits,
+                    cx,
+                    130.,
+                    134_f32.min(cw),
+                    34.,
+                    "Add Key",
                     CARD,
-                    Action::QuickConnect,
+                    Action::AddKey,
                     &hover,
                 );
             }
-            button(
-                &mut tiles,
-                &mut hits,
-                cx,
-                130.,
-                134_f32.min(cw),
-                34.,
-                if ui.page == Page::Hosts {
-                    "Add Host"
-                } else {
-                    "Add Key"
-                },
-                SIGNAL_BG,
-                if ui.page == Page::Hosts {
-                    Action::AddHost
-                } else {
-                    Action::AddKey
-                },
-                &hover,
-            );
             if ui.page == Page::Keys {
                 button(
                     &mut tiles,
@@ -3856,266 +6174,39 @@ impl TermWindow {
                 );
                 y += 56.;
             }
-            let columns = ((cw + 16.) / 270.).floor().max(1.) as usize;
+            let columns = if ui.page == Page::Hosts {
+                ((cw + 12.) / 227.).floor().max(1.) as usize
+            } else {
+                ((cw + 16.) / 270.).floor().max(1.) as usize
+            };
             let cardw = (cw - 16. * (columns - 1) as f32) / columns as f32;
             if ui.page == Page::Hosts {
-                let mut groups: Vec<String> = ui
-                    .store
-                    .hosts
-                    .iter()
-                    .map(|h| h.group.clone())
-                    .filter(|g| !g.is_empty())
-                    .collect();
-                groups.sort();
-                groups.dedup();
-                if !groups.is_empty() {
-                    tile(&mut tiles, cx, y, cw, 26., "Groups", BG, INK, false);
-                    button(
-                        &mut tiles,
-                        &mut hits,
-                        cx + cw - 168.,
-                        y - 3.,
-                        102.,
-                        28.,
-                        "All hosts",
-                        CARD,
-                        Action::Group(String::new()),
-                        &hover,
-                    );
-                    ui.group_scroll = ui.group_scroll.min(groups.len().saturating_sub(columns));
-                    if groups.len() > columns {
-                        button(
-                            &mut tiles,
-                            &mut hits,
-                            cx + cw - 60.,
-                            y - 3.,
-                            26.,
-                            28.,
-                            "",
-                            CARD,
-                            Action::PrevGroup,
-                            &hover,
-                        );
-                        button(
-                            &mut tiles,
-                            &mut hits,
-                            cx + cw - 28.,
-                            y - 3.,
-                            26.,
-                            28.,
-                            "",
-                            CARD,
-                            Action::NextGroup,
-                            &hover,
-                        );
-                    }
-                    y += 36.;
-                    for (index, group) in groups
-                        .iter()
-                        .skip(ui.group_scroll)
-                        .take(columns)
-                        .enumerate()
-                    {
-                        let gx = cx + index as f32 * (cardw + 16.);
-                        let count = ui
-                            .store
-                            .hosts
-                            .iter()
-                            .filter(|host| &host.group == group)
-                            .count();
-                        let bg = if &ui.group == group { FIELD } else { CARD };
-                        button(
-                            &mut tiles,
-                            &mut hits,
-                            gx,
-                            y,
-                            cardw,
-                            70.,
-                            "",
-                            bg,
-                            Action::Group(group.clone()),
-                            &hover,
-                        );
-                        tile(
-                            &mut tiles,
-                            gx + 12.,
-                            y + 12.,
-                            46.,
-                            46.,
-                            "",
-                            SIGNAL_BG,
-                            INK,
-                            true,
-                        );
-                        tiles.last_mut().unwrap().icon = Some(Icon::Folder);
-                        tile(
-                            &mut tiles,
-                            gx + 56.,
-                            y + 10.,
-                            (cardw - 68.).max(20.),
-                            24.,
-                            group.clone(),
-                            bg,
-                            INK,
-                            false,
-                        );
-                        tiles.last_mut().unwrap().transparent = true;
-                        tile(
-                            &mut tiles,
-                            gx + 56.,
-                            y + 38.,
-                            (cardw - 68.).max(20.),
-                            22.,
-                            format!("{} Hosts", count),
-                            bg,
-                            MUTED,
-                            false,
-                        );
-                        tiles.last_mut().unwrap().transparent = true;
-                    }
-                    y += 94.;
-                }
-                let filtered: Vec<(usize, Host)> = ui
-                    .store
-                    .hosts
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, host)| {
-                        (ui.group.is_empty() || host.group == ui.group)
-                            && format!(
-                                "{} {} {} {}",
-                                host.label, host.address, host.username, host.group
-                            )
-                            .to_lowercase()
-                            .contains(&query)
-                    })
-                    .map(|(i, h)| (i, h.clone()))
-                    .collect();
-                tile(
+                draw_host_library(
                     &mut tiles,
+                    &mut hits,
+                    ui,
                     cx,
                     y,
                     cw,
-                    28.,
-                    format!("Hosts   {}", filtered.len()),
-                    BG,
-                    INK,
-                    false,
+                    h - 20.,
+                    columns,
+                    &hover,
                 );
-                y += 42.;
-                let rows = ((h - y - 28.) / 88.).floor().max(1.) as usize;
-                ui.max_scroll = filtered.len().div_ceil(columns).saturating_sub(rows);
-                ui.scroll = ui.scroll.min(ui.max_scroll);
-                if filtered.is_empty() {
-                    let empty = if ui.store.hosts.is_empty() {
-                        "Your servers, one workspace"
-                    } else {
-                        "No matching hosts"
-                    };
-                    tile(&mut tiles, cx, y + 34., cw, 46., empty, BG, INK, false);
-                    tile(
-                        &mut tiles,
-                        cx,
-                        y + 84.,
-                        cw,
-                        36.,
-                        if ui.store.hosts.is_empty() {
-                            "Add your first SSH host to get started."
-                        } else {
-                            "Try another search or choose All hosts."
-                        },
-                        BG,
-                        MUTED,
-                        false,
-                    );
-                    button(
-                        &mut tiles,
-                        &mut hits,
-                        cx,
-                        y + 142.,
-                        150.,
-                        40.,
-                        "Add Host",
-                        FIELD,
-                        Action::AddHost,
-                        &hover,
-                    );
-                }
-                for (index, (id, host)) in filtered
-                    .iter()
-                    .skip(ui.scroll * columns)
-                    .take(rows * columns)
-                    .enumerate()
+                // Fit the root breadcrumb surface to the rendered font, leaving
+                // its text origin and the rest of the trail in place.
+                let root_action = Action::Group(String::new());
+                if let Some(root) = tiles
+                    .iter_mut()
+                    .find(|t| t.action.as_ref() == Some(&root_action))
                 {
-                    let x = cx + (index % columns) as f32 * (cardw + 16.);
-                    let cy = y + (index / columns) as f32 * 88.;
-                    button(
-                        &mut tiles,
-                        &mut hits,
-                        x,
-                        cy,
-                        cardw,
-                        72.,
-                        "",
-                        CARD,
-                        Action::Connect(*id),
-                        &hover,
-                    );
-                    tile(
-                        &mut tiles,
-                        x + 12.,
-                        cy + 13.,
-                        46.,
-                        46.,
-                        "",
-                        SIGNAL_BG,
-                        INK,
-                        true,
-                    );
-                    tiles.last_mut().unwrap().icon = Some(Icon::Hosts);
-                    tile(
-                        &mut tiles,
-                        x + 56.,
-                        cy + 9.,
-                        (cardw - 96.).max(24.),
-                        25.,
-                        host.label.clone(),
-                        CARD,
-                        INK,
-                        false,
-                    );
-                    tiles.last_mut().unwrap().transparent = true;
-                    tile(
-                        &mut tiles,
-                        x + 56.,
-                        cy + 37.,
-                        (cardw - 70.).max(24.),
-                        22.,
-                        format!(
-                            "ssh, {}",
-                            if host.username.is_empty() {
-                                "default user"
-                            } else {
-                                &host.username
-                            }
-                        ),
-                        CARD,
-                        MUTED,
-                        false,
-                    );
-                    tiles.last_mut().unwrap().transparent = true;
-                    button(
-                        &mut tiles,
-                        &mut hits,
-                        x + cardw - 35.,
-                        cy + 8.,
-                        26.,
-                        26.,
-                        "",
-                        CARD,
-                        Action::HostMenu(*id),
-                        &hover,
-                    );
+                    root.w = text_positions(&ui_font, "All Hosts", scale)?
+                        .last()
+                        .copied()
+                        .unwrap_or(0.)
+                        + root.text_padding * 2.;
+                    if let Some(hit) = hits.iter_mut().find(|h| h.action == root_action) {
+                        hit.w = root.w;
+                    }
                 }
             } else {
                 let keys: Vec<_> = ui
@@ -4286,414 +6377,368 @@ impl TermWindow {
         }
         let drawer_start = tiles.len();
         let interactive_drawer = ui.form.is_some();
-        let drawer_offset = (1. - drawer_progress) * DrawerLayout::new(w, h).width;
+        let is_host = ui
+            .form
+            .as_ref()
+            .or(ui.closing_form.as_ref())
+            .is_some_and(Form::is_host);
+        let drawer_offset = (1. - drawer_progress) * DrawerLayout::for_form(w, h, is_host).width;
         if let Some(form) = ui.form.as_mut().or(ui.closing_form.as_mut()) {
-            let layout = DrawerLayout::new(w, h);
-            let animated = DrawerLayout {
-                x: layout.x + drawer_offset,
-                ..DrawerLayout::new(w, h)
-            };
-            animated.capture_hits(&mut hits, w);
-            let drawer_hit_start = hits.len();
-            tile(
-                &mut tiles,
-                layout.x - 2.,
-                52.,
-                2.,
-                h - 52.,
-                "",
-                TOP,
-                INK,
-                false,
-            );
-            tile(
-                &mut tiles,
-                layout.x,
-                52.,
-                layout.width,
-                h - 52.,
-                "",
-                SIDE,
-                INK,
-                false,
-            );
-            let fx = layout.x + 20.;
-            let fw = (layout.width - 40.).max(1.);
-            let title = if form.auth.picker {
-                "Choose authentication"
-            } else if form.auth.editing_identity {
-                if form.auth.original_identity.is_some() {
-                    "Edit Identity"
-                } else {
-                    "Add Identity"
+            if form.new_group_parent.is_some() {
+                draw_new_group(
+                    &mut tiles,
+                    &mut hits,
+                    form,
+                    &ui.store,
+                    w,
+                    h,
+                    &ui.error,
+                    interactive_drawer,
+                    drawer_progress,
+                    &hover,
+                );
+                for t in &mut tiles[drawer_start..] {
+                    t.zindex = 40;
                 }
-            } else if form.settings {
-                "Terminal settings"
-            } else if form.rename_tab.is_some() {
-                "Rename tab"
-            } else if form.key {
-                "Add Key"
-            } else if form.original.is_some() {
-                "Edit Host"
+                if !interactive_drawer {
+                    hits.retain(|hit| hit.y < 52.);
+                    hits.push(Hit {
+                        x: 0.,
+                        y: 52.,
+                        w,
+                        h: h - 52.,
+                        action: Action::Drawer,
+                    });
+                }
             } else {
-                "Add Host"
-            };
-            tile(&mut tiles, fx, 70., fw - 44., 38., title, SIDE, INK, false);
-            button(
-                &mut tiles,
-                &mut hits,
-                fx + fw - 36.,
-                72.,
-                36.,
-                34.,
-                "",
-                SIDE,
-                Action::Cancel,
-                &hover,
-            );
-            tile(
-                &mut tiles,
-                fx,
-                110.,
-                fw,
-                26.,
-                if form.auth.picker {
-                    "Use manual credentials or choose from Keychain"
-                } else if form.auth.editing_identity {
-                    "Username & password · Windows protected"
-                } else if form.settings {
-                    "Terminal & SSH · saved on this device"
-                } else if form.rename_tab.is_some() {
-                    "A stable name for this tab or group"
-                } else if form.key {
-                    "Use a local SSH private key"
-                } else {
-                    "SSH connection · saved locally"
-                },
-                SIDE,
-                MUTED,
-                false,
-            );
-            let labels = if form.auth.editing_identity {
-                vec!["Label", "Username", "Password"]
-            } else if form.settings {
-                vec![
-                    "Global font size · 6–48 pt",
-                    "SSH keepalive interval · seconds · 0 disables",
-                ]
-            } else if form.rename_tab.is_some() {
-                vec!["Tab name"]
-            } else if form.key {
-                vec!["Name", "Private key file path"]
-            } else {
-                vec![
-                    "Label",
-                    "Address",
-                    "Port",
-                    "Username (optional)",
-                    "Password (optional)",
-                    "Private key file path (optional)",
-                    "Group (optional)",
-                ]
-            };
-            let visible = if form.auth.picker {
-                0..0
-            } else {
-                form.visible_rows(layout.rows)
-            };
-            for (row, i) in visible.enumerate() {
-                let y = 148. + row as f32 * 70.;
-                tile(&mut tiles, fx, y, fw, 20., labels[i], SIDE, MUTED, false);
-                let focused = form.focus == i;
-                let password = form.password_index() == Some(i);
-                let linked = !form.auth.selected_identity.is_empty() && matches!(i, 3 | 4 | 5);
-                let text = if password && !form.auth.reveal {
-                    "•".repeat(form.fields[i].value.chars().count())
-                } else {
-                    form.fields[i].display(focused, ((fw - 30.) / 8.).max(1.) as usize)
+                let layout = DrawerLayout::for_form(w, h, form.is_host());
+                let animated = DrawerLayout {
+                    x: layout.x + drawer_offset,
+                    ..DrawerLayout::for_form(w, h, form.is_host())
                 };
-                if focused {
-                    tile(
-                        &mut tiles,
-                        fx - 1.,
-                        y + 23.,
-                        fw + 2.,
-                        36.,
-                        "",
-                        ACCENT,
-                        INK,
-                        true,
-                    );
-                }
+                animated.capture_hits(&mut hits, w);
+                let drawer_hit_start = hits.len();
+                tile(
+                    &mut tiles,
+                    layout.x - 2.,
+                    52.,
+                    2.,
+                    h - 52.,
+                    "",
+                    TOP,
+                    INK,
+                    false,
+                );
+                tile(
+                    &mut tiles,
+                    layout.x,
+                    52.,
+                    layout.width,
+                    h - 52.,
+                    "",
+                    SIDE,
+                    INK,
+                    false,
+                );
+                let inset = if form.is_host() { 24. } else { 20. };
+                let fx = layout.x + inset;
+                let fw = (layout.width - inset * 2.).max(1.);
+                let title = if form.auth.editing_identity {
+                    if form.auth.original_identity.is_some() {
+                        "Edit Identity"
+                    } else {
+                        "Add Identity"
+                    }
+                } else if form.settings {
+                    "Terminal settings"
+                } else if form.rename_tab.is_some() {
+                    "Rename tab"
+                } else if form.key {
+                    "Add Key"
+                } else if form.original.is_some() {
+                    "Edit Host"
+                } else {
+                    "New Host"
+                };
+                tile(&mut tiles, fx, 70., fw - 44., 38., title, SIDE, INK, false);
                 button(
                     &mut tiles,
                     &mut hits,
-                    fx,
-                    y + 24.,
-                    fw,
+                    fx + fw - 36.,
+                    72.,
+                    36.,
                     34.,
-                    text,
-                    FIELD,
-                    if linked {
-                        Action::ChooseAuth
-                    } else {
-                        Action::Field(i)
-                    },
+                    "",
+                    SIDE,
+                    Action::Cancel,
                     &hover,
                 );
-                if linked {
-                    let t = tiles.last_mut().unwrap();
-                    t.text = if i == 3 {
-                        form.fields[3].value.clone()
+                tile(
+                    &mut tiles,
+                    fx,
+                    110.,
+                    fw,
+                    26.,
+                    if form.auth.editing_identity {
+                        "Username & password · Windows protected"
+                    } else if form.settings {
+                        "Terminal & SSH · saved on this device"
+                    } else if form.rename_tab.is_some() {
+                        "A stable name for this tab or group"
+                    } else if form.key {
+                        "Use a local SSH private key"
                     } else {
-                        "Managed by Identity".into()
+                        "SSH connection · saved locally"
+                    },
+                    SIDE,
+                    MUTED,
+                    false,
+                );
+                if let Some((id, _)) = &form.host_group_target {
+                    let path = if id.is_empty() {
+                        "All Hosts".into()
+                    } else {
+                        format!("All Hosts / {}", ui.store.group_path(id))
                     };
-                    t.fg = MUTED;
-                } else {
-                    tiles.last_mut().unwrap().input = Some(InputPaint {
-                        masked: password && !form.auth.reveal,
-                        input: form.fields[i].clone(),
-                        focused: focused && interactive_drawer,
-                    });
+                    tiles.last_mut().unwrap().text =
+                        tray_label(&format!("Group · {path}"), fw - 24.);
                 }
-                if password {
-                    tiles.last_mut().unwrap().right_inset = 58.;
-                    if form.fields[i].value.is_empty() {
-                        tiles.last_mut().unwrap().text = if form.auth.original_identity.is_some()
-                            || form
-                                .original
-                                .as_ref()
-                                .is_some_and(|h| !h.credential_ref().is_empty())
-                        {
-                            "Unchanged · enter to replace".into()
-                        } else {
-                            "Enter password".into()
-                        };
-                    }
-                    button(
-                        &mut tiles,
-                        &mut hits,
-                        fx + fw - 60.,
-                        y + 26.,
-                        58.,
-                        30.,
-                        if form.auth.reveal { "Hide" } else { "Show" },
-                        FIELD,
-                        Action::RevealPassword,
-                        &hover,
-                    );
-                    if form.is_host() {
-                        button(
+                let labels = if form.auth.editing_identity {
+                    vec!["Label", "Username", "Password"]
+                } else if form.settings {
+                    vec![
+                        "Global font size · 6–48 pt",
+                        "SSH keepalive interval · seconds · 0 disables",
+                    ]
+                } else if form.rename_tab.is_some() {
+                    vec!["Tab name"]
+                } else if form.key {
+                    vec!["Name", "Private key file path"]
+                } else {
+                    vec![
+                        "Label",
+                        "Address",
+                        "Port",
+                        "Username",
+                        "Password",
+                        "Private key file path",
+                        "Group (optional)",
+                        "Username",
+                    ]
+                };
+                let rows = form.drawer_rows(&ui.store);
+                let body_height = if form.is_host() {
+                    (layout.footer + 32. - 148.).max(70.)
+                } else {
+                    layout.rows as f32 * 70.
+                };
+                let visible = form.visible_drawer_rows(&rows, body_height);
+                let mut row_y = 148.;
+                let mut picker_anchor = None;
+                for row in &rows[visible] {
+                    let y = row_y;
+                    row_y += row.height();
+                    match *row {
+                        FormRow::Field(i) => draw_form_field(
                             &mut tiles,
                             &mut hits,
-                            fx + fw - 168.,
-                            y - 2.,
-                            168.,
-                            22.,
-                            "Remember password",
-                            if form.auth.remember { SIGNAL_BG } else { SIDE },
-                            Action::RememberPassword,
+                            fx,
+                            y,
+                            fw,
+                            i,
+                            labels[i],
+                            form,
+                            interactive_drawer,
                             &hover,
-                        );
-                        tiles.last_mut().unwrap().icon = Some(if form.auth.remember {
-                            Icon::CheckboxChecked
-                        } else {
-                            Icon::Checkbox
-                        });
-                        tiles.last_mut().unwrap().icon_size = 14.;
+                        ),
+                        FormRow::KeyInput => draw_form_field(
+                            &mut tiles,
+                            &mut hits,
+                            fx,
+                            y,
+                            fw,
+                            5,
+                            "",
+                            form,
+                            interactive_drawer,
+                            &hover,
+                        ),
+                        FormRow::Endpoint => {
+                            draw_form_field(
+                                &mut tiles,
+                                &mut hits,
+                                fx,
+                                y,
+                                fw - 94.,
+                                1,
+                                "Address",
+                                form,
+                                interactive_drawer,
+                                &hover,
+                            );
+                            draw_form_field(
+                                &mut tiles,
+                                &mut hits,
+                                fx + fw - 82.,
+                                y,
+                                82.,
+                                2,
+                                "Port",
+                                form,
+                                interactive_drawer,
+                                &hover,
+                            );
+                        }
+                        _ => {
+                            if let Some(anchor) = draw_auth_row(
+                                &mut tiles, &mut hits, fx, y, fw, *row, form, &ui.store, &hover,
+                            ) {
+                                picker_anchor = Some(anchor);
+                            }
+                        }
                     }
                 }
-            }
-            let max_scroll = form.fields.len().saturating_sub(layout.rows);
-            if max_scroll > 0 && !form.auth.picker {
-                let track = layout.rows as f32 * 70. - 12.;
-                tile(&mut tiles, w - 7., 148., 3., track, "", FIELD, MUTED, true);
-                let thumb = (track * layout.rows as f32 / form.fields.len() as f32).max(16.);
-                let sy = 148. + (track - thumb) * form.first_row as f32 / max_scroll as f32;
-                tile(&mut tiles, w - 7., sy, 3., thumb, "", MUTED, MUTED, true);
-            }
-            if form.settings {
-                tile(
-                    &mut tiles,
-                    fx,
-                    300.,
-                    fw,
-                    28.,
-                    "Keepalive changes apply to new SSH connections.",
-                    SIDE,
-                    MUTED,
-                    false,
-                );
-                tile(
-                    &mut tiles,
-                    fx,
-                    328.,
-                    fw,
-                    28.,
-                    "Ctrl + wheel session font changes stay temporary.",
-                    SIDE,
-                    MUTED,
-                    false,
-                );
-            }
-            if form.is_host() && !form.auth.picker {
-                let label = ui
-                    .store
-                    .identities
-                    .iter()
-                    .find(|i| i.id == form.auth.selected_identity)
-                    .map(|i| format!("Identity · {}", i.label))
-                    .unwrap_or({
-                        ui.store
-                            .keys
-                            .iter()
-                            .find(|k| k.path == form.fields[5].value)
-                            .map(|k| format!("Key · {}", k.label))
-                            .unwrap_or_else(|| "Authentication · Manual / Keychain".into())
-                    });
-                button(
-                    &mut tiles,
-                    &mut hits,
-                    fx,
-                    layout.footer,
-                    fw,
-                    32.,
-                    label,
-                    CARD,
-                    Action::ChooseAuth,
-                    &hover,
-                );
-                tiles.last_mut().unwrap().icon = Some(Icon::Key);
-            }
-            if form.auth.picker {
-                let mut choices = vec![(
-                    "Manual credentials".to_string(),
-                    Action::ManualAuth,
-                    Icon::Terminal,
-                )];
-                choices.extend(
-                    ui.store
-                        .keys
-                        .iter()
-                        .enumerate()
-                        .map(|(i, k)| (format!("Key · {}", k.label), Action::UseKey(i), Icon::Key)),
-                );
-                choices.extend(ui.store.identities.iter().enumerate().map(|(i, k)| {
-                    (
-                        format!("Identity · {} · {}", k.label, k.username),
-                        Action::UseIdentity(i),
-                        Icon::Identity,
-                    )
-                }));
-                let count = ((layout.footer - 148.) / 52.).floor().max(1.) as usize;
-                form.auth.picker_scroll = form
-                    .auth
-                    .picker_scroll
-                    .min(choices.len().saturating_sub(count));
-                for (row, (label, action, icon)) in choices
-                    .into_iter()
-                    .skip(form.auth.picker_scroll)
-                    .take(count)
-                    .enumerate()
-                {
+                let content_height: f32 = rows.iter().map(FormRow::height).sum();
+                if content_height > body_height {
+                    let thumb = (body_height * body_height / content_height).max(16.);
+                    let skipped: f32 = rows[..form.first_row].iter().map(FormRow::height).sum();
+                    let sy = 148.
+                        + (body_height - thumb)
+                            * (skipped / (content_height - body_height)).min(1.);
+                    tile(
+                        &mut tiles,
+                        w - 7.,
+                        148.,
+                        3.,
+                        body_height,
+                        "",
+                        FIELD,
+                        MUTED,
+                        true,
+                    );
+                    tile(&mut tiles, w - 7., sy, 3., thumb, "", MUTED, MUTED, true);
+                }
+                if form.settings {
+                    tile(
+                        &mut tiles,
+                        fx,
+                        300.,
+                        fw,
+                        28.,
+                        "Keepalive changes apply to new SSH connections.",
+                        SIDE,
+                        MUTED,
+                        false,
+                    );
+                    tile(
+                        &mut tiles,
+                        fx,
+                        328.,
+                        fw,
+                        28.,
+                        "Ctrl + wheel session font changes stay temporary.",
+                        SIDE,
+                        MUTED,
+                        false,
+                    );
+                }
+                if form.auth.editing_identity && form.auth.original_identity.is_some() {
                     button(
                         &mut tiles,
                         &mut hits,
                         fx,
-                        148. + row as f32 * 52.,
+                        layout.footer,
                         fw,
-                        42.,
-                        label,
+                        30.,
+                        if form.auth.confirm_delete {
+                            "Confirm delete identity"
+                        } else {
+                            "Delete identity"
+                        },
                         CARD,
-                        action,
+                        Action::DeleteIdentity,
                         &hover,
                     );
-                    tiles.last_mut().unwrap().icon = Some(icon);
+                    tiles.last_mut().unwrap().fg = "#ed8193";
                 }
-                tile(
-                    &mut tiles,
-                    fx,
-                    layout.footer,
-                    fw,
-                    28.,
-                    "Scroll to browse · Esc to go back",
-                    SIDE,
-                    MUTED,
-                    false,
-                );
-            }
-            if form.auth.editing_identity && form.auth.original_identity.is_some() {
+                if !ui.error.is_empty() {
+                    tile(
+                        &mut tiles,
+                        fx,
+                        h - 88.,
+                        fw,
+                        30.,
+                        ui.error.clone(),
+                        "#59333f",
+                        INK,
+                        true,
+                    );
+                }
+                tile(&mut tiles, fx, h - 100., fw, 1., "", FIELD, MUTED, false);
+                let bw = ((fw - 12.) / 2.).max(1.);
                 button(
                     &mut tiles,
                     &mut hits,
                     fx,
-                    layout.footer,
-                    fw,
-                    30.,
-                    if form.auth.confirm_delete {
-                        "Confirm delete identity"
-                    } else {
-                        "Delete identity"
-                    },
-                    CARD,
-                    Action::DeleteIdentity,
+                    h - 52.,
+                    bw,
+                    40.,
+                    "Cancel",
+                    FIELD,
+                    Action::Cancel,
                     &hover,
                 );
-                tiles.last_mut().unwrap().fg = "#ed8193";
-            }
-            if !ui.error.is_empty() {
-                tile(
+                button(
                     &mut tiles,
-                    fx,
-                    h - 88.,
-                    fw,
-                    30.,
-                    ui.error.clone(),
-                    "#59333f",
-                    INK,
-                    true,
+                    &mut hits,
+                    fx + bw + 12.,
+                    h - 52.,
+                    bw,
+                    40.,
+                    "Save",
+                    FIELD,
+                    Action::Save,
+                    &hover,
                 );
+                if form.auth.picker_open {
+                    if let Some(anchor) = picker_anchor {
+                        draw_auth_picker(
+                            &mut tiles,
+                            &mut hits,
+                            anchor,
+                            h - 60.,
+                            form,
+                            &ui.store,
+                            &hover,
+                        );
+                    } else {
+                        form.auth.picker_open = false;
+                    }
+                }
+                for t in &mut tiles[drawer_start..] {
+                    t.x += drawer_offset;
+                    t.zindex = t.zindex.max(40);
+                }
+                for hit in &mut hits[drawer_hit_start..] {
+                    hit.x += drawer_offset;
+                }
+                if !interactive_drawer {
+                    // Closing visuals own the click until the next settled frame.
+                    hits.truncate(drawer_hit_start);
+                }
             }
-            let bw = ((fw - 12.) / 2.).max(1.);
-            button(
-                &mut tiles,
-                &mut hits,
-                fx,
-                h - 52.,
-                bw,
-                36.,
-                "Cancel",
-                CARD,
-                Action::Cancel,
-                &hover,
+        }
+        if let Some(menu) = &ui.group_menu {
+            draw_group_actions(&mut tiles, &mut hits, menu, w, h, &hover);
+        }
+        if let Some(picker) = &mut ui.host_picker {
+            draw_host_picker(
+                &mut tiles, &mut hits, picker, &ui.store, w, h, &ui.error, &hover,
             );
-            button(
-                &mut tiles,
-                &mut hits,
-                fx + bw + 12.,
-                h - 52.,
-                bw,
-                36.,
-                if form.auth.picker { "Back" } else { "Save" },
-                SIGNAL_BG,
-                Action::Save,
-                &hover,
-            );
-            for t in &mut tiles[drawer_start..] {
-                t.x += drawer_offset;
-                t.zindex = 40;
-            }
-            for hit in &mut hits[drawer_hit_start..] {
-                hit.x += drawer_offset;
-            }
-            if !interactive_drawer {
-                // Closing visuals own the click until the next settled frame.
-                hits.truncate(drawer_hit_start);
-            }
         }
         if let Some((_, mx, my)) = &ui.host_menu {
             let x = mx.min(w - 208.).max(8.);
-            let y = my.min(h - 96.).max(52.);
+            let y = my.min(h - 144.).max(52.);
             hits.push(Hit {
                 x: 0.,
                 y: 0.,
@@ -4702,7 +6747,7 @@ impl TermWindow {
                 action: Action::DismissMenu,
             });
             let start = tiles.len();
-            tile(&mut tiles, x, y, 200., 88., "", SIDE, INK, true);
+            tile(&mut tiles, x, y, 200., 136., "", SIDE, INK, true);
             button(
                 &mut tiles,
                 &mut hits,
@@ -4727,6 +6772,30 @@ impl TermWindow {
                 Action::DuplicateHost,
                 &hover,
             );
+            tile(
+                &mut tiles,
+                x + 12.,
+                y + 87.,
+                176.,
+                1.,
+                "",
+                FIELD,
+                MUTED,
+                false,
+            );
+            button(
+                &mut tiles,
+                &mut hits,
+                x + 6.,
+                y + 94.,
+                188.,
+                36.,
+                "Delete Host",
+                SIDE,
+                Action::DeleteHost,
+                &hover,
+            );
+            tiles.last_mut().unwrap().fg = "#ed8193";
             for tile in &mut tiles[start..] {
                 tile.zindex = 60;
             }
@@ -4886,6 +6955,8 @@ impl TermWindow {
         if confirmation.is_none()
             && ui.pressed.is_none()
             && ui.host_menu.is_none()
+            && ui.group_menu.is_none()
+            && ui.host_picker.is_none()
             && ui.tab_menu.is_none()
             && ui.form.is_none()
             && ui.closing_form.is_none()
@@ -4959,6 +7030,15 @@ impl TermWindow {
             );
         }
         ui.hits = hits;
+        let hover_hits = &ui.hits;
+        let hovered_hit = pointer
+            .and_then(|(x, y)| {
+                hover_hits
+                    .iter()
+                    .rev()
+                    .find(|hit| x >= hit.x && x < hit.x + hit.w && y >= hit.y && y < hit.y + hit.h)
+            })
+            .filter(|hit| hover.as_ref() == Some(&hit.action));
         let mut moving = ui.sidebar_motion.is_active(now)
             || ui.drawer_motion.is_active(now)
             || ui.page_motion.is_active(now)
@@ -4969,17 +7049,11 @@ impl TermWindow {
         let mut visible_actions = std::collections::HashSet::new();
         for t in &mut tiles {
             if let Some(action) = &t.action {
-                visible_actions.insert(action.clone());
-                let motion = ui
-                    .hover_motion
-                    .entry(action.clone())
-                    .or_insert_with(|| Tween::new(0.));
+                let key = t.hover_key().unwrap();
+                visible_actions.insert(key.clone());
+                let motion = ui.hover_motion.entry(key).or_insert_with(|| Tween::new(0.));
                 motion.set_target(
-                    if hover.as_ref() == Some(action) {
-                        1.
-                    } else {
-                        0.
-                    },
+                    if t.hovered_by(hovered_hit) { 1. } else { 0. },
                     now,
                     Duration::from_millis(120),
                 );
@@ -5016,9 +7090,9 @@ impl TermWindow {
         let mut input_hits = Vec::new();
         for mut t in tiles {
             let hover = t
-                .action
+                .hover_key()
                 .as_ref()
-                .and_then(|a| hover_colors.get(a))
+                .and_then(|key| hover_colors.get(key))
                 .copied()
                 .unwrap_or(0.);
             let pressed = t.action.is_some() && t.action == self.termviai_ui.pressed;
@@ -5036,13 +7110,26 @@ impl TermWindow {
                 ),
                 hover * 0.58,
             );
+            if matches!(t.action, Some(Action::Save | Action::AcceptHostPicker)) {
+                bg = mix_color(color(t.bg), color("#474159"), hover);
+            }
             if pressed {
                 bg = mix_color(bg, color(ACCENT), 0.28);
             }
             if t.transparent {
                 // Header broadcast controls are bare icons at rest. Only the
                 // hovered control gains a subdued surface; color carries state.
-                bg = if t.icon == Some(Icon::Broadcast) {
+                bg = if matches!(
+                    t.action,
+                    Some(
+                        Action::GroupMenu(_)
+                            | Action::HostMenu(_)
+                            | Action::TabBroadcast(_)
+                            | Action::ReconnectGroup(_)
+                    )
+                ) {
+                    color(ICON_HOVER_BG).mul_alpha(if pressed { 1. } else { hover })
+                } else if t.icon == Some(Icon::Broadcast) {
                     color(SIGNAL_BG).mul_alpha(if pressed { 0.95 } else { hover * 0.8 })
                 } else {
                     bg.mul_alpha(0.)
@@ -5050,9 +7137,18 @@ impl TermWindow {
             }
             bg = bg.mul_alpha(t.opacity);
             let close_icon = t.text.is_empty()
+                && t.icon == Some(Icon::Close)
                 && matches!(
                     t.action,
-                    Some(Action::CloseTab(_) | Action::CloseNewTab | Action::RemovePane(_))
+                    Some(
+                        Action::CloseTab(_)
+                            | Action::CloseNewTab
+                            | Action::RemovePane(_)
+                            | Action::RemoveRecent(..)
+                            | Action::CancelHostPicker
+                            | Action::Cancel
+                            | Action::ConfirmCancel
+                    )
                 );
             let fg = if close_icon {
                 mix_color(
@@ -5060,6 +7156,8 @@ impl TermWindow {
                     color("#ed8193"),
                     if pressed { 1. } else { hover },
                 )
+            } else if matches!(t.action, Some(Action::GroupMenu(_))) {
+                mix_color(color(t.fg), color(INK), hover)
             } else {
                 color(t.fg)
             }
@@ -5091,7 +7189,11 @@ impl TermWindow {
             )];
             if let Some(paint) = &t.input {
                 let input = &paint.input;
-                let left = if t.icon.is_some() { 38. } else { 12. };
+                let left = if t.icon.is_some() {
+                    38.
+                } else {
+                    t.text_padding
+                };
                 let available = (t.w - left - 12. - t.right_inset - 2.).max(1.);
                 let display_value = paint.rendered_value();
                 let positions = text_positions(&font, &display_value, scale)?;
@@ -5112,7 +7214,8 @@ impl TermWindow {
                     .last()
                     .map(|(index, _)| index)
                     .unwrap_or(start);
-                if !input.value.is_empty() || paint.focused {
+                if !input.value.is_empty() || (paint.focused && t.text != "••••••••")
+                {
                     t.text = display_value
                         .chars()
                         .skip(start)
@@ -5189,8 +7292,12 @@ impl TermWindow {
                 ));
             }
             if !t.text.is_empty() {
-                let left = if t.icon.is_some() { 38. } else { 12. };
-                let text_width = (t.w - left - 12. - t.right_inset).max(0.);
+                let left = if t.icon.is_some() {
+                    38.
+                } else {
+                    t.text_padding
+                };
+                let text_width = (t.w - left - t.text_padding - t.right_inset).max(0.);
                 if text_width > 0. {
                     let text_height = metrics.cell_size.height as f32 / scale;
                     parts.push((
@@ -5265,19 +7372,493 @@ impl TermWindow {
 mod tests {
     use super::*;
 
+    #[test]
+    fn tab_children_keep_parent_hover_without_linking_other_controls() {
+        let mut tiles = vec![];
+        let mut hits = vec![];
+        for (x, width, label, action) in [
+            (0., 200., "SSH", Action::Tab(1)),
+            (140., 28., "", Action::TabBroadcast(1)),
+            (170., 24., "", Action::CloseTab(1)),
+            (210., 200., "New Tab", Action::NewTab),
+            (380., 24., "", Action::CloseNewTab),
+            (420., 32., "", Action::NewTab),
+        ] {
+            button(
+                &mut tiles, &mut hits, x, 8., width, 36., label, TOP, action, &None,
+            );
+        }
+        for index in [1, 2] {
+            assert!(tiles[0].hovered_by(Some(&hits[index])));
+            assert!(tiles[index].hovered_by(Some(&hits[index])));
+            assert!(!tiles[3].hovered_by(Some(&hits[index])));
+        }
+        assert!(tiles[3].hovered_by(Some(&hits[4])));
+        assert!(!tiles[5].hovered_by(Some(&hits[4])));
+        assert!(!tiles[3].hovered_by(Some(&hits[5])));
+        assert_ne!(tiles[3].hover_key(), tiles[5].hover_key());
+        assert!(!tiles[1].hovered_by(Some(&hits[0])));
+        assert!(!tiles[2].hovered_by(Some(&hits[0])));
+        assert!(!tiles[0].hovered_by(None));
+        // A matching action outside the tab (such as an open menu) isn't a child.
+        let outside = Hit {
+            x: 140.,
+            y: 100.,
+            w: 28.,
+            h: 36.,
+            action: Action::TabBroadcast(1),
+        };
+        assert!(!tiles[0].hovered_by(Some(&outside)));
+    }
+
+    #[test]
+    fn group_cards_have_separate_body_and_menu_hits_and_picker_is_modal() {
+        let mut store = HostStore::default();
+        let id = store.add_group("Group", "").unwrap();
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        let mut tiles = vec![];
+        let mut hits = vec![];
+        draw_host_library(
+            &mut tiles, &mut hits, &mut ui, 24., 194., 460., 700., 2, &None,
+        );
+        for action in [Action::GroupMenu(id.clone()), Action::Group(id.clone())] {
+            let h = hits.iter().find(|h| h.action == action).unwrap();
+            assert_eq!(
+                hit_action(&hits, h.x + h.w / 2., h.y + h.h / 2.),
+                Some(action)
+            );
+        }
+        assert!(!tiles.iter().any(|t| t.icon == Some(Icon::ChevronRight)));
+        let body = tiles
+            .iter()
+            .find(|t| t.action == Some(Action::Group(id.clone())))
+            .unwrap();
+        let menu = hits
+            .iter()
+            .find(|h| h.action == Action::GroupMenu(id.clone()))
+            .unwrap();
+        assert!(body.hovered_by(Some(menu)));
+        let outside = Hit {
+            x: menu.x,
+            y: 194.,
+            w: menu.w,
+            h: menu.h,
+            action: menu.action.clone(),
+        };
+        assert!(!body.hovered_by(Some(&outside)));
+        ui.hits = hits;
+        ui.open_group_menu(&id, false).unwrap();
+        assert_eq!(ui.menu_group().unwrap(), id);
+        draw_group_actions(
+            &mut tiles,
+            &mut ui.hits,
+            ui.group_menu.as_ref().unwrap(),
+            720.,
+            700.,
+            &None,
+        );
+        let item = ui
+            .hits
+            .iter()
+            .find(|h| h.action == Action::NewGroupHost)
+            .unwrap();
+        assert_eq!(
+            hit_action(&ui.hits, item.x + 10., item.y + 10.),
+            Some(Action::NewGroupHost)
+        );
+        assert!(!ui.hits.iter().any(|h| matches!(h.action, Action::Group(_))));
+
+        let mut picker = HostPicker {
+            target: id,
+            candidates: (0..20)
+                .map(|n| {
+                    (
+                        Host {
+                            label: format!("Host {n}"),
+                            address: "example.org".into(),
+                            ..Default::default()
+                        },
+                        "Original".into(),
+                    )
+                })
+                .collect(),
+            selected: HashSet::new(),
+            scroll: usize::MAX,
+            focus: 19,
+        };
+        for (w, h) in [(720., 480.), (1280., 800.)] {
+            let mut hits = vec![];
+            let mut tiles = vec![];
+            draw_host_picker(
+                &mut tiles,
+                &mut hits,
+                &mut picker,
+                &ui.store,
+                w,
+                h,
+                "",
+                &None,
+            );
+            assert!(hits.iter().any(|h| h.action == Action::PickHost(19)));
+            assert!(!hits.iter().any(|h| h.action == Action::AcceptHostPicker));
+            assert_eq!(hit_action(&hits, 1., 60.), Some(Action::CancelHostPicker));
+            assert!(hits
+                .iter()
+                .all(|hit| hit.x >= 0. && hit.y >= 0. && hit.x + hit.w <= w && hit.y + hit.h <= h));
+            picker.scroll = usize::MAX;
+        }
+    }
+
+    #[test]
+    fn all_hosts_add_opens_form_and_existing_host_picker_cannot_ungroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        let mut store = HostStore::default();
+        let id = store.add_group("Original", "").unwrap();
+        let host = Host {
+            label: "Keep membership".into(),
+            address: "example.org".into(),
+            group_id: id,
+            group: "Original".into(),
+            ..Default::default()
+        };
+        store.hosts.push(host.clone());
+        store.save_to(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        ui.open_group_menu("", true).unwrap();
+        assert!(ui.form.as_ref().unwrap().is_host());
+        assert!(ui.group_menu.is_none());
+        assert!(ui.open_existing_hosts(String::new()).is_err());
+        assert!(ui.host_picker.is_none());
+        ui.host_picker = Some(HostPicker {
+            target: String::new(),
+            candidates: vec![(host, "Original".into())],
+            selected: std::iter::once(0).collect(),
+            scroll: 0,
+            focus: 0,
+        });
+        assert!(ui.save_host_picker_at(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn host_picker_save_is_atomic_and_deleted_destination_is_not_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        let mut store = HostStore::default();
+        let id = store.add_group("Target", "").unwrap();
+        let host = Host {
+            label: "one".into(),
+            address: "example.org".into(),
+            port: 22,
+            ..Default::default()
+        };
+        store.hosts.push(host.clone());
+        store.save_to(&path).unwrap();
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        ui.host_picker = Some(HostPicker {
+            target: id.clone(),
+            candidates: vec![(host.clone(), String::new())],
+            selected: std::iter::once(0).collect(),
+            scroll: 0,
+            focus: 0,
+        });
+        ui.save_host_picker_at(&path).unwrap();
+        assert_eq!(ui.group, id);
+        assert!(ui.host_picker.is_none());
+        assert_eq!(HostStore::load_from(&path).unwrap().hosts[0].group_id, id);
+        ui.host_picker = Some(HostPicker {
+            target: id.clone(),
+            candidates: vec![(host, String::new())],
+            selected: std::iter::once(0).collect(),
+            scroll: 0,
+            focus: 0,
+        });
+        let before = std::fs::read(&path).unwrap();
+        assert!(ui.save_host_picker_at(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let group = ui.store.group(&id).unwrap().clone();
+        ui.delete_group_at(&group, &path).unwrap();
+        assert!(ui.group.is_empty());
+        assert_eq!(HostStore::load_from(&path).unwrap().hosts.len(), 1);
+    }
+
+    #[test]
+    fn group_menu_new_host_preserves_location_and_saves_to_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        let mut store = HostStore::default();
+        let target = store.add_group("Target", "").unwrap();
+        let other = store.add_group("Other", "").unwrap();
+        store.save_to(&path).unwrap();
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        let key = tempfile::NamedTempFile::new().unwrap();
+        for origin in [String::new(), other] {
+            ui.navigate_group(origin.clone());
+            ui.query = Input::new("Target".into());
+            ui.open_group_host(target.clone()).unwrap();
+            assert_eq!(ui.group, origin);
+            assert_eq!(ui.query.value, "Target");
+            assert_eq!(ui.form.as_ref().unwrap().fields[6].value, "Target");
+            ui.close_form();
+            assert_eq!(ui.group, origin);
+            ui.open_group_host(target.clone()).unwrap();
+            let form = ui.form.as_mut().unwrap();
+            form.set_auth_mode(Authentication::Key);
+            form.fields[0] = Input::new(format!("Host {origin}"));
+            form.fields[1] = Input::new("example.org".into());
+            form.fields[7] = Input::new("root".into());
+            form.fields[5] = Input::new(key.path().to_string_lossy().into_owned());
+            ui.save_form_at(&path).unwrap();
+            assert_eq!(ui.group, origin);
+        }
+        let saved = HostStore::load_from(&path).unwrap();
+        assert_eq!(saved.hosts.len(), 2);
+        assert!(saved.hosts.iter().all(|host| host.group_id == target));
+    }
+
+    #[test]
+    fn new_host_does_not_recreate_a_deleted_destination_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        let mut store = HostStore::default();
+        let group = store.add_group("Target", "").unwrap();
+        store.save_to(&path).unwrap();
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        ui.navigate_group(group);
+        ui.open_form(false, None);
+        let key = tempfile::NamedTempFile::new().unwrap();
+        let f = ui.form.as_mut().unwrap();
+        f.set_auth_mode(Authentication::Key);
+        f.fields[0] = Input::new("New Host".into());
+        f.fields[1] = Input::new("example.org".into());
+        f.fields[7] = Input::new("root".into());
+        f.fields[5] = Input::new(key.path().to_string_lossy().into_owned());
+        HostStore::default().save_to(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(ui
+            .save_form_at(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("destination group was deleted"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn group_delete_buttons_match_confirmation_hit_testing_during_animation() {
+        let prompt = super::super::termviai_confirm::ClosePrompt::group_test_prompt();
+        for progress in [0.25, 1.] {
+            let mut tiles = vec![];
+            let mut hits = vec![];
+            draw_group_delete(
+                &mut tiles, &mut hits, &prompt, 720., 480., progress, false, &None,
+            );
+            let layout = CloseDialogLayout::group_delete(720., 480., progress);
+            for (rect, action) in [
+                (layout.cancel, Action::ConfirmCancel),
+                (layout.accept, Action::ConfirmAccept),
+            ] {
+                assert_eq!(
+                    hit_action(&hits, rect.x + rect.w / 2., rect.y + rect.h / 2.),
+                    Some(action.clone())
+                );
+                let button = tiles
+                    .iter()
+                    .find(|t| t.action == Some(action.clone()) && !t.text.is_empty())
+                    .unwrap();
+                assert_eq!(button.bg, FIELD);
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
-    fn host_password_can_switch_between_session_and_remembered_without_retyping() {
+    fn new_group_persists_at_captured_parent_and_new_host_inherits_location() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        let mut store = HostStore::default();
+        let parent = store.add_group("PortForwarding", "").unwrap();
+        store.save_to(&path).unwrap();
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        ui.navigate_group(parent.clone());
+        ui.open_group();
+        assert!(!ui.form.as_ref().unwrap().is_host());
+        assert_eq!(ui.form.as_ref().unwrap().focusable_fields(), vec![0]);
+        ui.form.as_mut().unwrap().fields[0] = Input::new("218".into());
+        ui.save_form_at(&path).unwrap();
+        let child = ui.store.child_groups(&parent)[0].id.clone();
+        assert_eq!(ui.group, child);
+        ui.navigate_group(parent.clone());
+        ui.open_group();
+        ui.form.as_mut().unwrap().fields[0] = Input::new("218".into());
+        let before = std::fs::read(&path).unwrap();
+        assert!(ui.save_form_at(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        ui.close_form();
+        ui.navigate_group(child.clone());
+        ui.open_form(false, None);
+        assert_eq!(
+            ui.form.as_ref().unwrap().fields[6].value,
+            "PortForwarding / 218"
+        );
+        let key = tempfile::NamedTempFile::new().unwrap();
+        let f = ui.form.as_mut().unwrap();
+        f.set_auth_mode(Authentication::Key);
+        f.fields[0] = Input::new("nested host".into());
+        f.fields[1] = Input::new("example.org".into());
+        f.fields[7] = Input::new("root".into());
+        f.fields[5] = Input::new(key.path().to_string_lossy().into_owned());
+        ui.save_form_at(&path).unwrap();
+        assert_eq!(ui.group, child);
+        let loaded = HostStore::load_from(&path).unwrap();
+        assert_eq!(loaded.hosts[0].group_id, child);
+        assert!(loaded.host_in_group(&loaded.hosts[0], &parent));
+        let copy = ui.store.duplicate_host(&loaded.hosts[0]).unwrap();
+        assert_eq!(copy.group_id, child);
+        // The parent was removed in another window before a group form saves.
+        ui.open_group();
+        ui.form.as_mut().unwrap().fields[0] = Input::new("new".into());
+        HostStore::default().save_to(&path).unwrap();
+        assert!(ui.save_form_at(&path).is_err());
+        assert!(HostStore::load_from(&path).unwrap().groups.is_empty());
+    }
+
+    #[test]
+    fn group_navigation_scopes_search_and_all_library_rows_remain_reachable() {
+        let mut store = HostStore::default();
+        let parent = store.add_group("PortForwarding", "").unwrap();
+        for n in 0..21 {
+            let id = store.add_group(&format!("Group {n}"), &parent).unwrap();
+            store.hosts.push(Host {
+                label: format!("Host {n}"),
+                address: "example.org".into(),
+                port: 22,
+                group_id: id,
+                ..Default::default()
+            });
+        }
+        store.hosts.push(Host {
+            label: "outside".into(),
+            ..Default::default()
+        });
+        let rows = host_library_rows(&store, &parent, "", 2);
+        assert!(matches!(rows.last(), Some(HostLibraryRow::Hosts(_))));
+        for height in [180., 240., 600.] {
+            let mut seen = HashSet::new();
+            for start in 0..rows.len() + 2 {
+                let (visible, _) = host_library_visible(&rows, start, height);
+                assert!(!visible.is_empty());
+                assert!(
+                    rows[visible.clone()]
+                        .iter()
+                        .map(HostLibraryRow::height)
+                        .sum::<f32>()
+                        <= height
+                );
+                seen.extend(visible);
+            }
+            assert_eq!(seen.len(), rows.len());
+        }
+        let filtered = host_library_rows(&store, &parent, "Host 20", 2);
+        assert!(!filtered
+            .iter()
+            .any(|r| matches!(r, HostLibraryRow::Groups(_))));
+        let matches: Vec<_> = filtered
+            .iter()
+            .filter_map(|r| {
+                if let HostLibraryRow::Hosts(h) = r {
+                    Some(h)
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, 20); // Actions keep the original store index after filtering.
+        assert!(host_library_rows(&store, &parent, "outside", 2)
+            .iter()
+            .any(|r| matches!(r, HostLibraryRow::Empty)));
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        ui.query = Input::new("old query".into());
+        ui.scroll = 19;
+        ui.navigate_group(parent);
+        assert!(ui.query.value.is_empty());
+        assert_eq!(ui.scroll, 0);
+    }
+
+    #[test]
+    fn group_breadcrumbs_and_create_card_have_bounded_independent_hit_targets() {
+        let mut store = HostStore::default();
+        let mut parent = String::new();
+        for n in 0..12 {
+            parent = store
+                .add_group(&format!("Nested group {n}"), &parent)
+                .unwrap();
+        }
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        ui.navigate_group(parent);
+        for width in [452., 800.] {
+            let mut tiles = vec![];
+            let mut hits = vec![];
+            draw_group_breadcrumbs(&mut tiles, &mut hits, &mut ui, 24., 194., width, &None);
+            assert!(hits
+                .iter()
+                .any(|h| h.action == Action::Group(String::new())));
+            assert!(hits.iter().any(|h| h.action == Action::PrevGroup));
+            assert!(hits.iter().all(|h| h.x >= 0. && h.x + h.w <= width + 24.));
+            assert!(tiles.iter().any(|t| t.text.contains("Nested group 11")));
+        }
+        ui.open_group();
+        let f = ui.form.as_ref().unwrap();
+        let mut tiles = vec![];
+        let mut hits = vec![];
+        draw_new_group(
+            &mut tiles, &mut hits, f, &ui.store, 720., 480., "", true, 1., &None,
+        );
+        assert!(tiles
+            .iter()
+            .all(|t| t.x >= 0. && t.y >= 52. && t.x + t.w <= 720. && t.y + t.h <= 480.));
+        assert_eq!(hit_action(&hits, 8., 100.), Some(Action::Cancel));
+        let card = hits.iter().find(|h| h.action == Action::Drawer).unwrap();
+        assert_eq!(
+            hit_action(&hits, card.x + 2., card.y + 2.),
+            Some(Action::Drawer)
+        );
+        let save = tiles
+            .iter()
+            .find(|t| t.action == Some(Action::Save))
+            .unwrap();
+        let cancel = tiles
+            .iter()
+            .find(|t| t.action == Some(Action::Cancel) && t.text == "Cancel")
+            .unwrap();
+        assert_eq!(save.bg, cancel.bg);
+        assert!(save.y > 280.);
+    }
+
+    #[test]
+    fn host_password_is_persistent_and_unchanged_save_preserves_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hosts.json");
         let mut ui = TermviaiUi::with_store(HostStore::default(), String::new());
         ui.open_form(false, None);
         let f = ui.form.as_mut().unwrap();
         f.fields[1] = Input::new("example.invalid".into());
+        f.fields[3] = Input::new("test-user".into());
         f.fields[4] = Input::new("synthetic-only password".into());
         ui.save_form_at(&path).unwrap();
         let first = ui.store.hosts[0].clone();
-        assert!(first.credential_id.is_empty());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = wezterm_ssh::credentials::delete(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(first.credential_id.clone());
+        assert!(!first.credential_id.is_empty());
+        assert!(first.session_credential.is_empty());
         assert_eq!(
             wezterm_ssh::credentials::load(first.credential_ref())
                 .unwrap()
@@ -5288,39 +7869,219 @@ mod tests {
             .unwrap()
             .contains("synthetic-only password"));
         ui.open_form(false, Some(first.clone()));
-        ui.form.as_mut().unwrap().auth.remember = true;
+        assert!(ui.form.as_ref().unwrap().has_saved_password());
+        assert!(ui.form.as_ref().unwrap().fields[4].value.is_empty());
         ui.save_form_at(&path).unwrap();
-        let remembered = ui.store.hosts[0].clone();
-        assert!(!remembered.credential_id.is_empty());
-        assert!(remembered.session_credential.is_empty());
-        assert_eq!(
-            wezterm_ssh::credentials::load(remembered.credential_ref())
-                .unwrap()
-                .as_deref(),
-            Some("synthetic-only password")
-        );
-        ui.open_form(false, Some(remembered.clone()));
-        ui.form.as_mut().unwrap().auth.remember = false;
+        assert_eq!(ui.store.hosts[0].credential_id, first.credential_id);
+        ui.open_form(false, Some(ui.store.hosts[0].clone()));
+        ui.form.as_mut().unwrap().fields[4] = Input::new("replacement secret".into());
         ui.save_form_at(&path).unwrap();
-        assert!(wezterm_ssh::credentials::load(&remembered.credential_id)
+        let _replacement = Cleanup(ui.store.hosts[0].credential_id.clone());
+        assert!(wezterm_ssh::credentials::load(first.credential_ref())
             .unwrap()
             .is_none());
-        let session = ui.store.hosts[0].credential_ref().to_string();
         assert_eq!(
-            wezterm_ssh::credentials::load(&session).unwrap().as_deref(),
-            Some("synthetic-only password")
+            wezterm_ssh::credentials::load(ui.store.hosts[0].credential_ref())
+                .unwrap()
+                .as_deref(),
+            Some("replacement secret")
         );
-        wezterm_ssh::credentials::delete(&session).unwrap();
-        // A restored host can retain a reference after the process password expires.
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_temporary_password_migrates_or_reports_expiry_without_losing_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        let id = format!("session-{}", new_credential_id());
+        wezterm_ssh::credentials::save(&id, "legacy test password", false).unwrap();
+        let host = Host {
+            address: "example.invalid".into(),
+            port: 22,
+            username: "test-user".into(),
+            session_credential: id.clone(),
+            ..Default::default()
+        };
+        let store = HostStore {
+            hosts: vec![host.clone()],
+            ..Default::default()
+        };
+        store.save_to(&path).unwrap();
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        ui.open_form(false, Some(host.clone()));
+        ui.save_form_at(&path).unwrap();
+        let persistent = ui.store.hosts[0].credential_id.clone();
+        assert!(!persistent.is_empty());
+        assert!(ui.store.hosts[0].session_credential.is_empty());
+        assert_eq!(
+            wezterm_ssh::credentials::load(&persistent)
+                .unwrap()
+                .as_deref(),
+            Some("legacy test password")
+        );
+        wezterm_ssh::credentials::delete(&persistent).unwrap();
+        assert!(wezterm_ssh::credentials::load(&id).unwrap().is_none());
+        ui.store.hosts[0] = host.clone();
+        ui.store.save_to(&path).unwrap();
         let before = std::fs::read(&path).unwrap();
-        ui.open_form(false, Some(ui.store.hosts[0].clone()));
-        ui.form.as_mut().unwrap().auth.remember = true;
+        ui.open_form(false, Some(host));
         assert!(ui
             .save_form_at(&path)
             .unwrap_err()
             .to_string()
             .contains("Enter it again"));
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn authentication_modes_keep_drafts_but_only_expose_active_fields() {
+        let mut ui = TermviaiUi::with_store(HostStore::default(), String::new());
+        ui.open_form(false, None);
+        let f = ui.form.as_mut().unwrap();
+        assert_eq!(f.auth.mode, Authentication::Password);
+        f.fields[3] = Input::new("password-user".into());
+        f.fields[4] = Input::new("draft-password".into());
+        f.fields[5] = Input::new("draft-key".into());
+        f.fields[7] = Input::new("key-user".into());
+        f.set_auth_mode(Authentication::Key);
+        assert_eq!(f.password_index(), None);
+        assert_eq!(f.focusable_fields(), vec![0, 1, 2, 7, 5, 6]);
+        f.auth.keychain_key = true;
+        assert!(!f.focusable_fields().contains(&5));
+        f.set_auth_mode(Authentication::Identity);
+        assert_eq!(f.focusable_fields(), vec![0, 1, 2, 6]);
+        f.set_auth_mode(Authentication::Password);
+        assert_eq!(f.fields[3].value, "password-user");
+        assert_eq!(f.fields[4].value, "draft-password");
+        assert_eq!(f.fields[7].value, "key-user");
+        assert_eq!(f.fields[5].value, "draft-key");
+    }
+
+    #[test]
+    fn exclusive_auth_layout_scrolls_and_picker_stays_within_drawer() {
+        let store = HostStore {
+            keys: (0..20)
+                .map(|i| KeyFile {
+                    label: format!("Key {i}"),
+                    path: format!("key-{i}"),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        ui.open_form(false, None);
+        let f = ui.form.as_mut().unwrap();
+        for mode in [
+            Authentication::Password,
+            Authentication::Key,
+            Authentication::Identity,
+        ] {
+            f.set_auth_mode(mode);
+            let rows = f.drawer_rows(&ui.store);
+            for height in [480., 720., 1080.] {
+                let layout = DrawerLayout::for_form(1280., height, true);
+                let available = layout.footer + 32. - 148.;
+                let mut seen = std::collections::HashSet::new();
+                for start in 0..rows.len() + 2 {
+                    f.first_row = start;
+                    f.reveal_focus = false;
+                    let visible = f.visible_drawer_rows(&rows, available);
+                    assert!(!visible.is_empty());
+                    assert!(
+                        rows[visible.clone()]
+                            .iter()
+                            .map(FormRow::height)
+                            .sum::<f32>()
+                            <= available
+                    );
+                    seen.extend(visible);
+                }
+                assert_eq!(seen.len(), rows.len());
+            }
+            f.focus = 6;
+            f.reveal_focus = true;
+            f.first_row = 0;
+            let range = f.visible_drawer_rows(&rows, 240.);
+            assert!(rows[range].iter().any(|r| r.contains_field(6)));
+        }
+        f.set_auth_mode(Authentication::Key);
+        f.auth.keychain_key = true;
+        for y in [180., 360.] {
+            let mut tiles = vec![];
+            let mut hits = vec![];
+            f.auth.picker_scroll = 19;
+            draw_auth_picker(
+                &mut tiles,
+                &mut hits,
+                (300., y, 392., 40.),
+                420.,
+                f,
+                &ui.store,
+                &None,
+            );
+            assert!(tiles.iter().all(|t| t.y >= 148. && t.y + t.h <= 420.));
+            assert!(hits.iter().any(|h| h.action == Action::UseKey(19)));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saving_uses_only_active_authentication_and_key_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        let key = tempfile::NamedTempFile::new().unwrap();
+        let store = HostStore {
+            keys: vec![KeyFile {
+                label: "Selected key".into(),
+                path: key.path().to_string_lossy().into_owned(),
+            }],
+            identities: vec![Identity {
+                id: "test-identity-ref".into(),
+                label: "Ops".into(),
+                username: "deploy".into(),
+            }],
+            ..Default::default()
+        };
+        store.save_to(&path).unwrap();
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        ui.open_form(false, None);
+        let f = ui.form.as_mut().unwrap();
+        f.fields[1] = Input::new("example.invalid".into());
+        f.fields[3] = Input::new("manual".into());
+        f.fields[4] = Input::new("inactive-secret".into());
+        f.fields[5] = Input::new("invalid-unused-path".into());
+        f.fields[7] = Input::new("key-user".into());
+        f.auth.selected_identity = "test-identity-ref".into();
+        f.auth.selected_key = "Selected key".into();
+        f.auth.keychain_key = true;
+        f.set_auth_mode(Authentication::Key);
+        ui.save_form_at(&path).unwrap();
+        let host = ui.store.hosts[0].clone();
+        assert_eq!(host.authentication, Some(Authentication::Key));
+        assert_eq!(host.username, "key-user");
+        assert!(
+            host.identity_id.is_empty()
+                && host.credential_ref().is_empty()
+                && host.identity_file.is_empty()
+        );
+        assert_eq!(host.key_label, "Selected key");
+        ui.open_form(false, Some(host));
+        let f = ui.form.as_mut().unwrap();
+        f.set_auth_mode(Authentication::Identity);
+        f.auth.selected_identity = "test-identity-ref".into();
+        f.fields[4] = Input::new("another-inactive-secret".into());
+        ui.save_form_at(&path).unwrap();
+        let host = &ui.store.hosts[0];
+        assert_eq!(host.authentication, Some(Authentication::Identity));
+        assert!(
+            host.username.is_empty()
+                && host.key_label.is_empty()
+                && host.identity_file.is_empty()
+                && host.credential_ref().is_empty()
+        );
+        assert_eq!(host.identity_id, "test-identity-ref");
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert!(!json.contains("inactive-secret") && !json.contains("invalid-unused-path"));
     }
 
     #[cfg(windows)]
@@ -5356,13 +8117,42 @@ mod tests {
         let f = ui.form.as_mut().unwrap();
         f.fields[1] = Input::new("example.invalid".into());
         f.auth.selected_identity = original.id.clone();
+        f.set_auth_mode(Authentication::Identity);
         ui.save_form_at(&path).unwrap();
-        assert_eq!(ui.store.hosts[0].username, "deploy");
+        assert!(ui.store.hosts[0].username.is_empty());
         assert_eq!(ui.store.hosts[0].identity_id, original.id);
         let json = std::fs::read_to_string(&path).unwrap();
         assert!(!json.contains("synthetic identity secret"));
         let saved = HostStore::load_from(&path).unwrap();
-        assert_eq!(saved.hosts[0].credential_ref(), original.id);
+        assert!(saved.hosts[0].credential_ref().is_empty());
+        let mut resolved = saved.hosts[0].clone();
+        resolved.resolve_identity(&saved).unwrap();
+        assert_eq!(resolved.credential_ref(), original.id);
+        assert_eq!(resolved.username, "deploy");
+
+        // Switching away from an identity must not delete its shared password.
+        ui.open_form(false, Some(ui.store.hosts[0].clone()));
+        let f = ui.form.as_mut().unwrap();
+        f.set_auth_mode(Authentication::Password);
+        f.fields[3] = Input::new("manual-user".into());
+        f.fields[4] = Input::new("manual secret".into());
+        ui.save_form_at(&path).unwrap();
+        let host = &ui.store.hosts[0];
+        let _manual_cleanup = Cleanup(host.credential_id.clone());
+        assert!(host.identity_id.is_empty() && host.key_label.is_empty());
+        assert_eq!(host.username, "manual-user");
+        assert_eq!(
+            wezterm_ssh::credentials::load(host.credential_ref())
+                .unwrap()
+                .as_deref(),
+            Some("manual secret")
+        );
+        assert_eq!(
+            wezterm_ssh::credentials::load(&original.id)
+                .unwrap()
+                .as_deref(),
+            Some("synthetic identity secret")
+        );
     }
 
     #[test]
@@ -5384,6 +8174,63 @@ mod tests {
         assert!(form.fields[2].value.is_empty());
         assert!(!form.auth.reveal);
         assert_eq!(form.fields[1].value, "root");
+    }
+
+    #[test]
+    fn deleting_host_persists_only_the_confirmed_entry_and_rejects_stale_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts.json");
+        let host = Host {
+            label: "Original".into(),
+            address: "example.org".into(),
+            port: 22,
+            credential_id: "shared-ref".into(),
+            ..Default::default()
+        };
+        let mut store = HostStore {
+            groups: vec![],
+            hosts: vec![host.clone()],
+            keys: vec![KeyFile {
+                label: "key".into(),
+                path: "key.pem".into(),
+            }],
+            identities: vec![Identity {
+                id: "identity".into(),
+                label: "Ops".into(),
+                username: "root".into(),
+            }],
+        };
+        let copy = store.duplicate_host(&host).unwrap();
+        store.save_to(&path).unwrap();
+        let mut ui = TermviaiUi::with_store(store, String::new());
+        // Concurrent additions must survive; the captured entry can move index.
+        let mut fresh = HostStore::load_from(&path).unwrap();
+        fresh.hosts.reverse();
+        fresh.hosts.push(Host {
+            label: "New".into(),
+            address: "new.example.org".into(),
+            ..Default::default()
+        });
+        fresh.save_to(&path).unwrap();
+        ui.delete_host_at(&host, &path).unwrap();
+        let loaded = HostStore::load_from(&path).unwrap();
+        assert_eq!(loaded.hosts.len(), 2);
+        assert_eq!(loaded.hosts[0], copy);
+        assert_eq!(loaded.hosts[1].label, "New");
+        assert_eq!(loaded.keys.len(), 1);
+        assert_eq!(loaded.identities.len(), 1);
+        assert_eq!(loaded.hosts[0].credential_id, "shared-ref");
+        let before = std::fs::read(&path).unwrap();
+        assert!(ui.delete_host_at(&host, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut stale = copy.clone();
+        stale.address = "changed.example.org".into();
+        assert!(ui.delete_host_at(&stale, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::write(&path, "broken").unwrap();
+        assert!(ui.delete_host_at(&copy, &path).is_err());
+        assert_eq!(ui.store.hosts, loaded.hosts);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
     }
 
     #[test]
@@ -5839,6 +8686,8 @@ mod tests {
                 settings: false,
                 first_row: 0,
                 reveal_focus: true,
+                new_group_parent: None,
+                host_group_target: None,
                 auth: AuthForm::default(),
             };
             let n = form.fields.len();

@@ -1,5 +1,84 @@
 # TermViAI UI 验证
 
+## 2026-10-23 tab 与卡片内部按钮悬浮
+
+旧逻辑仅按单一 Action 相等高亮，进入子按钮就让父容器淡出；New Tab 页签和加号又共用 Action，造成跨控件联动。动画缓存改为 Action 加实际控件矩形，使用当前指针、有效顶层命中和几何包含关系计算父子悬浮。Tab 的关闭/广播/重连、New Tab 的关闭、Group 与 Host 卡片的菜单保留父容器高亮；其他同 ID 控件不继承。只有实际命中的图标高亮，嵌套菜单/广播/重连使用 #5a5c76 的独立悬浮面；关闭 X 保持透明底色和红色悬浮。点击分发、拖动及广播状态未改变。
+
+新增 tab 子控件、新页签/加号隔离、容器外同动作和父悬浮不反向点亮子按钮回归；现有分组卡片测试补充菜单与容器关系。Windows GUI 128 项通过，Release 构建成功；格式/补丁检查、修改源码与 Windows 副本哈希一致。试用包 `releases/nested-hover-20261023.zip`。原生鼠标动画与 DPI 视觉仍待试用确认。
+
+## 2026-10-23 首页 Add Host 不再误移除分组
+
+All Hosts 复用了分组添加菜单，空目标 ID 在存储层表示未分组，导致 Add Existing Hosts 将选择的主机移出原分组。首页现直接打开 New Host，不显示下拉箭头；具体分组保留两种添加方式。选择器打开与保存均要求非空目标，防止过期或错误状态取消分组；底层 move_hosts_to_group 仍保留合法的取消分组能力。新增回归覆盖首页直接打开表单、空目标无法打开选择器、错误空目标保存不改变文件；原有有效目标及并发删除测试保留。Windows GUI 127 项通过，Release 构建及格式/补丁检查通过，源码与构建副本一致。试用包 `releases/home-add-host-20261023.zip`。既有误移动不自动猜测恢复。
+
+## 2026-10-23 All Hosts 面包屑背景贴合
+
+截图中的右侧留白过大来自固定字符宽度估算。改用 UI 实际字体 shaping advance 计算背景与点击宽度，左右各 6 px，文字起点、字号、其他面包屑位置均保持不变。纯视觉改动未新增测试；格式/补丁检查及 Windows Release 编译通过，修改源码与 Windows 副本哈希一致。试用包 `releases/breadcrumb-fit-20261023.zip`，实际视觉待试用确认。
+
+## 2026-10-23 删除分组确认按钮焦点框
+
+截图底部横线来自 draw_group_delete 的焦点下划线，不是边框裁切。改为与其他确认弹窗相同的完整 2 px 圆角焦点框，先绘制扩展底层再绘制原按钮，默认 Cancel，随键盘焦点移至 Delete Group。按钮命中区域、背景和确认逻辑不变。相关弹窗动画/命中回归通过（1 项，125 项过滤）；Windows Release 构建通过，源码副本、格式及补丁检查通过。试用包 `releases/group-focus-20261023.zip`；实际 DPI 视觉仍待试用确认。
+
+## 2026-10-23 分组卡片、面包屑与菜单反馈修正
+
+根据两张实际截图移除分组卡片右箭头，将省略号移到卡片右侧并保留独立命中区域。面包屑标签内边距由 12 px 缩为 6 px，All Hosts 按文字估算宽度排列，分隔箭头由 12 px 改为 18 px 并加深至 #b4b8cd；多层路径分页仍保留。Host 菜单 Edit / Duplicate 补充同款 18 px Edit / Copy 图标，三项统一图标文字对齐，Delete 保留危险操作红色。
+
+所谓 Add Host 点击穿透来自 NewGroupHost 分支显式调用 navigate_group，并非底层命中区域泄漏。改为 open_group_host 捕获目标 ID/路径并打开表单，页面分组保持不变。回归覆盖 All Hosts 和其他分组作为入口、取消、保存后的原位置、主机实际归属及菜单隔离底层卡片。Windows GUI 126 项通过，格式与补丁检查通过，10 个已修改 Rust 文件与 Windows 构建副本逐字节一致。Windows Release 编译通过，试用包为 `releases/group-polish-20261023.zip`。原生鼠标/DPI 视觉效果仍待试用确认。
+
+
+## 2026-10-23 分组管理操作（审核 UX）
+
+实现审核稿的分组箭头、省略号菜单、当前分组菜单、Add Host 下拉、新建分组后进入和空分组添加入口。New Group 与 Add Existing Hosts 使用居中原生弹窗；New Host 复用现有认证编辑表单并明确显示目标分组。Save/Add Hosts 默认与 Cancel 同背景，悬浮低饱和紫色；删除确认默认中性背景、悬浮红色，X 默认灰色、悬浮红色。选择弹窗支持滚轮、方向键、Space/Enter、Tab 和 Escape，并隔离底层点击。
+
+删除只移除容器，直属 Hosts/子分组提升一层，深层路径更新，旧文本分组不会重新出现；同名提升冲突和过期条目均拒绝保存。批量加入已有 Hosts 为移动而非复制，整批校验后原子保存，保留所有认证字段。新增主机对捕获的目标 group ID 校验，目标删除后不会通过旧路径重新创建。
+
+Windows 原生 GUI 125 项测试通过，含 7 项新增回归与更新后的分组流程回归。源码与 Windows 构建副本逐字节核对，格式/补丁检查通过；试用包 `releases/group-actions-20261023.zip`。保留上次输出覆盖修复、最近连接移除与认证 UX 改动。原生鼠标视觉、DPI 与真实 SSH 网络验收仍需在目标机器试用。
+
+## 2026-10-23 启动输出覆盖、最近连接移除与 Key 按钮
+
+已在 Windows 原生测试复现截图中的 `SSH-2.0-OpenSSH_8.8connect...` 覆盖：`Screen::rewrap_lines` 把普通行首（x=0）误认为自动折行边界，将光标退回上一行。首次连接的布局宽度变化可与 CR/LF 分批到达交错，导致后续文字覆盖既有输出。修复仅让逻辑行内真正的折行边界回到上一行；普通行首保持原位置。新增核心回归覆盖变宽/变窄、CR 与 LF 之间/完整换行之后的调整；GUI 回归使用实际更新横幅，遍历启动文字每个字节边界与三种分块方式。该测试修复前失败、修复后通过。
+
+New Tab 的 Recent connections 行右侧新增透明背景 X，复用应用关闭图标，默认灰色、悬浮红色。只移除选中的历史快照，不删除 Host、凭据、保存的工作区或当前连接；并发重连产生的新记录保留，旧窗口缓存保存不会恢复已移除条目。Add Key 使用密钥图标和与 Add Identity 相同的 CARD 背景。
+
+Windows Release 终端核心 54、Mux 42、GUI 118 项测试通过，共 214 项；Release 编译通过。试用包为 `releases/startup-output-recents-20261023.zip`，未发布新的 beta。真实 SSH 网络和原生鼠标视觉仍需人工验收。
+
+## 2026-10-22 嵌套 Host 分组与面包屑
+
+按确认 UX 实现独立的嵌套分组：All Hosts 展示全部主机；分组卡片进入下一层；蓝色面包屑返回祖先，当前节点为普通文字。父分组与搜索包含全部后代主机。Groups 区只展示直属子分组；输入搜索时收起分组卡片。工具栏保留 Add Host，新增 New Group，并将搜索放到标题下方。Host 卡片补充地址，采用现有圆角、原生矢量图标及低饱和配色。深层面包屑溢出时提供翻页，全部分组与主机共用可滚动内容区。
+
+New Group 使用紧凑卡片，Name 加只读 Parent group，创建于打开时捕获的层级；空分组持久化。同级名称忽略大小写判重，不同父分组可同名。Add Host 默认填写当前位置，保存后保留导航位置。旧文本分组加载为确定 ID 的一级分组，含斜杠的旧名字不自动拆层；Host 快照及认证保持兼容。详见 [HOST_GROUPS.md](HOST_GROUPS.md)。
+
+Windows 原生 GUI **116 项通过**，Release 构建成功。新增 6 项回归覆盖层级汇总、相似名称隔离、旧数据/空组重载、坏图保护、当前层级建组和 Host 默认归属、并发重名及失效父级、子树搜索、长列表滚动、面包屑边界及新建卡片命中区域。测试后仅调整计数文案的单复数，最终程序已重新编译。nightly rustfmt 和 `git diff --check` 通过，6 个改动 Rust 源文件与 Windows 构建快照逐字节一致。
+
+试用包：`releases/host-groups-20261022.zip`；SHA-256：`f62b023d724e0fdc9232c1f63a87573b63404a8c1f5ffd7e23a6c7432a243944`。5 个 PE 文件均为 AMD64，ZIP CRC 和包内逐文件摘要校验通过。测试、最终构建与源码清单位于 `releases/verify-host-groups-20261022/`。保留 beta.4 版本字符串，未发布新 Beta。真实鼠标、DPI 与最终视觉仍待人工验收；包内包含上一轮认证与 Host 删除修复。
+
+## 2026-10-22 Host 删除入口
+
+Host 三点菜单新增红色 Delete Host，与 Edit / Duplicate 之间使用细分隔线。删除复用现有原生确认卡片、动画和输入隔离，显示主机名及地址、垃圾桶图标与 Delete Host 按钮，默认焦点为 Cancel；Esc、外部点击均取消。确认时重新读取主机库，以完整条目匹配被确认的主机，防止排序、并发新增或过期编辑导致误删；写入成功才刷新内存列表。
+
+删除仅移除 Hosts 条目，不断开现有连接，不删除 Keychain、保存的终端组或最近连接；这些对象及复制的 Host 可能仍引用同一密码，因此保留凭据引用。嵌套分组导航仍处于 UX 审核阶段，没有加入本次应用代码。
+
+Windows 完整 GUI **110 项通过**，Release 构建成功，nightly rustfmt 与 `git diff --check` 通过。新增回归覆盖取消/仅确认一次、目标捕获、并发新增和重排、共享引用保留、重复删除/过期条目拒绝以及损坏文件保护。6 个修改 Rust 文件与 Windows 快照一致。试用包 `releases/host-delete-20261022.zip`，SHA-256 `b693f7d4c01e062216b1562607c3c9b6cd6e3626e79772b17f6f9359912ba823`；ZIP CRC、逐文件摘要和 5 个 AMD64 PE 检查通过。日志及清单位于 `releases/verify-host-delete-20261022/`。真实原生鼠标和视觉验收尚未执行。
+
+## 2026-10-22 Host 互斥认证设计落地
+
+按审核后的 UX 改为 Password / SSH Key / Identity 三个互斥模式，默认 Password；Key 内通过 File path / Keychain 单选切换。Address / Port 同行，Group 位于认证下方，Identity 使用只读用户名及密码摘要。取消旧的可同时选择的折叠列表。模式切换仅在表单内保留草稿，保存只写入当前模式和来源。Save 与 Cancel 默认同一中性背景，Save 悬浮变低饱和紫色。列表方向键选择，Enter / Tab / Esc 收起列表，不提交后方表单。
+
+显式认证方式同时约束 libssh / ssh2：Password、Identity 不尝试 agent/公钥；Key 只尝试选定的私钥，含空格路径保留完整，完成密钥认证因子后仍允许交互式后续挑战。旧配置未编辑时保留既有 SSH 行为；编辑时推断模式，保存后使用明确的互斥模式。连接缓存区分模式，工作区和最近连接保留原始引用。
+
+Windows 原生 **GUI 108 项、SSH 19 项，共 127 项通过**；Release 编译成功。覆盖模式草稿、焦点、仅保存当前来源、旧配置与密码迁移、Identity 共享密码保护、失效选择、缓存区分、480/720/1080 高度滚动及下拉边界。nightly rustfmt 与 `git diff --check` 通过。5 个修改 Rust 文件与 Windows 构建输入逐字节一致。
+
+验证包：`releases/host-auth-exclusive-20261022.zip`；SHA-256：`0ab1639b059ec07eed6cc4007c9f834d1f2ff521630546943bd2b7868e129b0d`。ZIP CRC、包内逐文件摘要及 5 个 PE 的 AMD64 架构检查通过，CLI 版本仍为 `0.1.0-beta.4`。证据目录为 `releases/verify-host-auth-exclusive-20261022/`。这是独立本地验证包；真实 GUI 视觉、鼠标、DPI 与真实 SSH 密码/密钥/MFA 登录尚未验收。历史折叠列表方案及其验证记录保留在下节，当前实现已由本节替代。
+
+## 2026-10-22 Host 认证折叠列表与密码保存
+
+移除 Remember password 勾选框、独立认证选择页和 Manual credentials。输入的 Host 密码随保存写入 Windows 凭据管理器，未修改时固定显示 `••••••••`；占位符不写入输入值，Show/Hide 仅作用于新输入。Keys / Identities 在字段下方分别折叠，选中项使用低饱和底色、勾号和标题摘要，再次点击取消选择。空列表与失效引用有对应提示。沿用现有矢量图标、圆角、配色和抽屉动画。
+
+上方用户名、密码与密钥路径不随列表回填、清空或锁定。连接时所选 Identity 覆盖用户名/密码，所选 Key 覆盖路径；手填值独立保留。工作区与最近连接保存原始配置，避免将连接时解析出的凭据回写为手填值。
+
+Windows 原生完整 GUI 测试 **105 项通过**，Release 编译、nightly rustfmt 和 `git diff --check` 通过。覆盖默认持久保存、未改保留、替换、旧临时密码迁移/过期、Identity 选中时保留手填密码及取消选择、选择优先级、旧格式兼容，以及 480/720/1080 高度下长列表全部项目可滚动到且不覆盖页脚。3 个改动 Rust 文件与最终 Windows 构建输入逐字节一致。
+
+验证包：`releases/host-auth-accordion-20261022.zip`；SHA-256：`32208fc62d46209c5d6d3c2250dc32bf1208f02be22b01938774edce9605abb8`。包内 5 个 PE 文件为 AMD64，ZIP CRC 与逐文件摘要校验通过。构建证据保存于 `releases/verify-host-auth-accordion-20261022/`。沿用 beta.4 版本字符串，属于独立本地验证包；真实 GUI 视觉、鼠标和 SSH 登录仍待人工验收。
+
 ## 2026-10-22 Identities 与 Host 密码认证
 
 Keychain 增加 Keys / Identities 分区、身份卡片和新增/编辑抽屉；Host 增加遮蔽密码、Show/Hide、Remember password 和可滚动认证选择器。沿用现有矢量图标、卡片间距、圆角、低饱和紫色和抽屉动画。密码存储与兼容约定见 [IDENTITIES.md](IDENTITIES.md)。

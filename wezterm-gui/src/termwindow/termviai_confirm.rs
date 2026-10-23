@@ -3,6 +3,7 @@
 use super::termviai_motion::Tween;
 use super::TermWindow;
 use crate::frontend::front_end;
+use crate::hosts::{Host, HostGroup};
 use config::WindowCloseConfirmation;
 use mux::Mux;
 use std::time::{Duration, Instant};
@@ -11,12 +12,14 @@ use window::{Connection, ConnectionOps, WindowOps};
 const ENTER: Duration = Duration::from_millis(160);
 const EXIT: Duration = Duration::from_millis(140);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum CloseTarget {
     Pane { tab_id: usize, pane_id: usize },
     Tab(usize),
     Window,
     Application,
+    DeleteHost(Host),
+    DeleteGroup(HostGroup),
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +30,24 @@ pub(super) struct ClosePrompt {
     pub(super) confirm_label: String,
     pub(super) target: CloseTarget,
     window_id: usize,
+}
+
+#[cfg(test)]
+impl ClosePrompt {
+    pub(super) fn group_test_prompt() -> Self {
+        Self {
+            title: "Delete Group?".into(),
+            detail: "Keep all hosts and subgroups. Active connections stay connected.".into(),
+            summary: "Example".into(),
+            confirm_label: "Delete Group".into(),
+            window_id: 0,
+            target: CloseTarget::DeleteGroup(HostGroup {
+                id: "group".into(),
+                name: "Example".into(),
+                parent_id: String::new(),
+            }),
+        }
+    }
 }
 
 pub(super) struct ConfirmState {
@@ -78,7 +99,7 @@ impl ConfirmState {
             return None;
         }
         let prompt = self.prompt.as_ref()?;
-        let target = (prompt.target, prompt.window_id);
+        let target = (prompt.target.clone(), prompt.window_id);
         if target.0 == CloseTarget::Application {
             // Keep the card visible and input modal until the
             // message loop ends, instead of briefly reopening the terminal.
@@ -131,7 +152,7 @@ fn target_is_current(
             .iter()
             .any(|(id, panes)| *id == tab_id && panes.contains(&pane_id)),
         CloseTarget::Tab(tab_id) => tabs.iter().any(|(id, _)| *id == tab_id),
-        CloseTarget::Window => true,
+        CloseTarget::Window | CloseTarget::DeleteHost(_) | CloseTarget::DeleteGroup(_) => true,
         CloseTarget::Application => unreachable!(),
     }
 }
@@ -183,10 +204,28 @@ impl TermWindow {
             return;
         }
         let tabs = window_targets(self.mux_window_id);
-        if !target_is_current(target, self.mux_window_id, self.mux_window_id, &tabs) {
+        if !target_is_current(
+            target.clone(),
+            self.mux_window_id,
+            self.mux_window_id,
+            &tabs,
+        ) {
             return;
         }
         let (title, detail, summary, confirm_label) = match target {
+            CloseTarget::DeleteGroup(ref group) => (
+                "Delete Group?".to_string(),
+                self.termviai_group_delete_detail(group),
+                group.name.clone(),
+                "Delete Group".to_string(),
+            ),
+            CloseTarget::DeleteHost(ref host) => (
+                "Delete Host?".to_string(),
+                "Remove this Host entry. Connections, saved groups and Keychain are kept."
+                    .to_string(),
+                format!("{} · {}", host.label, host.endpoint()),
+                "Delete Host".to_string(),
+            ),
             CloseTarget::Pane { pane_id, .. } => (
                 "Disconnect terminal?".to_string(),
                 "This terminal connection will be closed.".to_string(),
@@ -298,7 +337,7 @@ impl TermWindow {
         expected_window: usize,
     ) -> anyhow::Result<()> {
         if !target_is_current(
-            target,
+            target.clone(),
             expected_window,
             self.mux_window_id,
             &window_targets(self.mux_window_id),
@@ -309,6 +348,14 @@ impl TermWindow {
         }
         let mux = Mux::get();
         match target {
+            CloseTarget::DeleteGroup(group) => {
+                self.termviai_delete_group(&group)?;
+                return Ok(());
+            }
+            CloseTarget::DeleteHost(host) => {
+                self.termviai_delete_host(&host)?;
+                return Ok(());
+            }
             CloseTarget::Pane { pane_id, .. } => {
                 mux.remove_pane(pane_id);
             }
@@ -352,6 +399,26 @@ mod tests {
             target,
             window_id: 5,
         }
+    }
+
+    #[test]
+    fn host_deletion_confirmation_captures_entry_and_cancel_never_accepts() {
+        let now = Instant::now();
+        let host = Host {
+            label: "Delete this".into(),
+            address: "example.org".into(),
+            ..Default::default()
+        };
+        let target = CloseTarget::DeleteHost(host);
+        let mut state = ConfirmState::default();
+        state.open(prompt(target.clone()), now);
+        assert!(!state.focused_confirm);
+        state.dismiss(now + ENTER);
+        assert!(state.accept(now + ENTER).is_none());
+        state.settle(now + ENTER + EXIT);
+        state.open(prompt(target.clone()), now + ENTER + EXIT);
+        assert_eq!(state.accept(now + ENTER + EXIT), Some((target, 5)));
+        assert!(state.accept(now + ENTER + EXIT).is_none());
     }
 
     #[test]
@@ -435,10 +502,10 @@ mod tests {
             pane_id: 3,
         };
         let original = vec![(11, vec![3, 4]), (22, vec![6])];
-        assert!(target_is_current(target, 5, 5, &original));
-        assert!(!target_is_current(target, 5, 9, &original));
+        assert!(target_is_current(target.clone(), 5, 5, &original));
+        assert!(!target_is_current(target.clone(), 5, 9, &original));
         let moved = vec![(11, vec![4]), (22, vec![3, 6])];
-        assert!(!target_is_current(target, 5, 5, &moved));
+        assert!(!target_is_current(target.clone(), 5, 5, &moved));
         assert!(!target_is_current(target, 5, 5, &[]));
     }
 

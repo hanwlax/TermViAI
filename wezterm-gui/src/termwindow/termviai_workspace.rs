@@ -1,7 +1,7 @@
 //! Stable session labels and reconnectable SSH workspace templates.
 use super::termviai_ui::Page;
 use super::{TermWindow, TermWindowNotif};
-use crate::hosts::Host;
+use crate::hosts::{Authentication, Host};
 use crate::workspaces::{SavedLayout, SplitAxis, WorkspaceStore};
 use anyhow::Context;
 use config::keyassignment::SpawnTabDomain;
@@ -38,13 +38,14 @@ pub(super) fn group_needs_reconnect(states: impl IntoIterator<Item = bool>) -> b
 
 fn domain_name(host: &Host, ssh_keepalive_interval: u64) -> String {
     format!(
-        "termviai:{}:{}:{}:{}:keepalive={}:auth={}",
+        "termviai:{}:{}:{}:{}:keepalive={}:auth={}:mode={:?}",
         host.username,
         host.endpoint(),
         host.identity_file,
         host.label,
         ssh_keepalive_interval,
-        host.credential_ref()
+        host.credential_ref(),
+        host.authentication
     )
 }
 
@@ -60,10 +61,27 @@ fn ssh_domain(host: &Host, ssh_keepalive_interval: u64) -> SshDomain {
         "serveraliveinterval".into(),
         ssh_keepalive_interval.to_string(),
     );
+    if let Some(mode) = host.authentication {
+        domain.ssh_option.insert(
+            "termviai_auth_mode".into(),
+            match mode {
+                Authentication::Password => "password",
+                Authentication::Key => "key",
+                Authentication::Identity => "identity",
+            }
+            .into(),
+        );
+    }
     if !host.identity_file.is_empty() {
-        domain
-            .ssh_option
-            .insert("identityfile".into(), host.identity_file.clone());
+        domain.ssh_option.insert(
+            if host.authentication == Some(Authentication::Key) {
+                "termviai_identity_file"
+            } else {
+                "identityfile"
+            }
+            .into(),
+            host.identity_file.clone(),
+        );
     }
     if !host.credential_ref().is_empty() {
         domain
@@ -366,14 +384,17 @@ impl TermWindow {
                 }
             }
         }
+        let raw_hosts: Vec<Host> = layout.hosts().into_iter().cloned().collect();
         let mut layout = layout;
         resolve(&mut layout, &crate::hosts::HostStore::load()?)?;
         let mux = Mux::get();
         let ssh_keepalive_interval = self.termviai_ssh_keepalive_interval();
-        for host in layout.hosts() {
+        let mut original_hosts = HashMap::new();
+        for (host, raw_host) in layout.hosts().into_iter().zip(raw_hosts) {
             let mut host = host.clone();
             host.validate()?;
             let domain_name = domain_name(&host, ssh_keepalive_interval);
+            original_hosts.insert(domain_name.clone(), raw_host.clone());
             if mux.get_domain_by_name(&domain_name).is_none() {
                 let dom = ssh_domain(&host, ssh_keepalive_interval);
                 let domain: Arc<dyn Domain> =
@@ -386,7 +407,7 @@ impl TermWindow {
             self.termviai_ui
                 .workspace
                 .hosts
-                .insert(domain.domain_id(), host);
+                .insert(domain.domain_id(), raw_host);
         }
         if let Some((tab, pane, _)) = split {
             anyhow::ensure!(
@@ -515,7 +536,10 @@ impl TermWindow {
             window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
                 tw.termviai_ui.connecting = false;
                 for host in opened.iter().rev() {
-                    if let Err(error) = tw.termviai_ui.workspace.data.record_recent(host) {
+                    let raw = original_hosts
+                        .get(&domain_name(host, ssh_keepalive_interval))
+                        .unwrap_or(host);
+                    if let Err(error) = tw.termviai_ui.workspace.data.record_recent(raw) {
                         tw.termviai_ui.error =
                             format!("Recent connections could not be saved: {error:#}");
                     }
@@ -558,6 +582,37 @@ impl TermWindow {
 #[cfg(test)]
 mod keepalive_tests {
     use super::*;
+
+    #[test]
+    fn explicit_authentication_is_carried_to_transport_and_separates_cached_sessions() {
+        let mut host = Host {
+            address: "example.org".into(),
+            port: 22,
+            username: "alice".into(),
+            ..Default::default()
+        };
+        let legacy = ssh_domain(&host, 30);
+        let mut names = HashSet::from([legacy.name]);
+        for (mode, option) in [
+            (Authentication::Password, "password"),
+            (Authentication::Key, "key"),
+            (Authentication::Identity, "identity"),
+        ] {
+            host.authentication = Some(mode);
+            let domain = ssh_domain(&host, 30);
+            assert_eq!(domain.ssh_option["termviai_auth_mode"], option);
+            assert!(names.insert(domain.name));
+        }
+        host.authentication = Some(Authentication::Key);
+        host.identity_file = r"C:\Users\Test User\.ssh\private key".into();
+        let domain = ssh_domain(&host, 30);
+        assert_eq!(
+            domain.ssh_option["termviai_identity_file"],
+            host.identity_file
+        );
+        assert!(!domain.ssh_option.contains_key("identityfile"));
+        assert!(!domain.ssh_option.contains_key("termviai_credential"));
+    }
 
     #[test]
     fn termviai_ssh_domain_carries_keepalive_and_changes_cache_identity() {

@@ -119,6 +119,8 @@ pub struct WorkspaceStore {
     extra: BTreeMap<String, serde_json::Value>,
     #[serde(skip)]
     source: Option<PathBuf>,
+    #[serde(skip)]
+    loaded_recent: Vec<RecentConnection>,
 }
 
 impl Default for WorkspaceStore {
@@ -129,6 +131,7 @@ impl Default for WorkspaceStore {
             version: SCHEMA_VERSION,
             extra: BTreeMap::new(),
             source: None,
+            loaded_recent: Vec::new(),
         }
     }
 }
@@ -159,6 +162,7 @@ impl WorkspaceStore {
         store.extra.remove("history");
         store.validate()?;
         store.sort_and_trim();
+        store.loaded_recent = store.recent.clone();
         Ok(store)
     }
 
@@ -173,6 +177,14 @@ impl WorkspaceStore {
                 host: host.clone(),
                 last_connected_ms: stamp,
             });
+            Ok(())
+        })
+    }
+
+    /// Remove only the selected history entry, preserving a newer reconnect.
+    pub fn remove_recent(&mut self, entry: &RecentConnection) -> anyhow::Result<()> {
+        self.mutate(|latest| {
+            latest.recent.retain(|current| current != entry);
             Ok(())
         })
     }
@@ -243,7 +255,13 @@ impl WorkspaceStore {
                     Some(existing) if incoming.last_connected_ms > existing.last_connected_ms => {
                         *existing = incoming;
                     }
-                    None => latest.recent.push(incoming),
+                    None if !cache
+                        .loaded_recent
+                        .iter()
+                        .any(|entry| same_host(&entry.host, &incoming.host)) =>
+                    {
+                        latest.recent.push(incoming);
+                    }
                     _ => {}
                 }
             }
@@ -270,6 +288,7 @@ impl WorkspaceStore {
         latest.sort_and_trim();
         latest.validate()?;
         latest.write_to(&path)?;
+        latest.loaded_recent = latest.recent.clone();
         *self = latest;
         Ok(result)
     }
@@ -468,6 +487,32 @@ mod tests {
         let loaded = WorkspaceStore::load_from(&path).unwrap();
         assert_eq!(loaded.recent.len(), 2);
         assert_eq!(loaded.saved[0].name, "Renamed");
+    }
+
+    #[test]
+    fn remove_recent_preserves_saved_groups_and_concurrent_connections() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workspaces.json");
+        let mut first = WorkspaceStore::load_from(&path).unwrap();
+        first.save_group(None, "Saved", group()).unwrap();
+        first.record_recent(&host("one")).unwrap();
+        let removed = first.recent[0].clone();
+        let mut stale = WorkspaceStore::load_from(&path).unwrap();
+        first.record_recent(&host("two")).unwrap();
+        stale.remove_recent(&removed).unwrap();
+        assert_eq!(stale.recent.len(), 1);
+        assert_eq!(stale.recent[0].host.address, "two");
+        assert_eq!(stale.saved.len(), 1);
+        // A cached library merge must not resurrect a removed row.
+        first.save().unwrap();
+        assert_eq!(first.recent, stale.recent);
+        first.record_recent(&host("one")).unwrap();
+        stale.remove_recent(&removed).unwrap();
+        assert_eq!(stale.recent.len(), 2);
+        assert_eq!(
+            WorkspaceStore::load_from(&path).unwrap().recent,
+            stale.recent
+        );
     }
 
     #[test]

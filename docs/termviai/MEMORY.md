@@ -1,16 +1,14 @@
 # TermViAI 项目记忆
 
-更新时间：2026-10-22（Asia/Shanghai）
+更新时间：2026-10-23（Asia/Shanghai）。当前版本 `v0.1.0-beta.5`，发布提交以 Git 标签为准。说明见 [beta.5 发布说明](RELEASE_V0.1.0_BETA.5.md) 与 [验证记录](RELEASE_V0.1.0_BETA.5_VALIDATION.md)。
 
-当前版本为 `v0.1.0-beta.4`。本轮汇总 Keychain Identities、Host 密码与 Windows 凭据管理器、组内终端拖放交换、部分离线重连、广播全选语义和局部错误提示，并完善表单编辑和 Host 菜单。Windows 原生 178 项测试与 Release 构建通过，CLI/字符串版本为 `0.1.0-beta.4`，PE 数值版本 `0.1.0.4`。详见 [beta.4 发布说明](RELEASE_V0.1.0_BETA.4.md) 与 [验证记录](RELEASE_V0.1.0_BETA.4_VALIDATION.md)。
+beta.5 汇总：嵌套 Host 分组与祖先面包屑、父组全部后代主机、Host 删除、组内新建/移动已有主机、仅删容器并提升子项；首页 Add Host 仅新建。认证采用 Password / SSH Key / Identity 互斥模式，保存密码、固定八圆点占位、Keychain 选择，Save 默认中性悬浮紫色。详见 [HOST_GROUPS.md](HOST_GROUPS.md) 和 [IDENTITIES.md](IDENTITIES.md)。
 
-SSH 空闲 poll 无限退避会拖延保活，现按 libssh 保活期限唤醒并限制最大等待；但这是否为用户三路断连的唯一原因、以及左上幸存原因尚未确认。真实四路空闲仍需复测，详见 [SSH_RECONNECT.md](SSH_RECONNECT.md)。
+修复首次连接布局重排导致普通行首光标退回上一行、输出重叠；最近连接可用 X 移除且旧窗口缓存不会恢复已删记录。统一图标、面包屑和确认焦点框。tab 与 Host/Group 内图标悬浮保持父容器高亮，嵌套操作图标独立背景，X 透明变红；New Tab 与加号独立，终端与广播托盘仍独立反馈。
 
-品牌释义：TermViAI = Terminal Via AI，指应用通过 AI 制作，当前没有内置 AI 功能。图标源为 `assets/icon/termviai-icon.png`，导出脚本 `assets/icon/export.py`。拖动排序保留 SSH、布局、广播和选中状态；真实 GUI 与网络场景待持续人工验收。
+Windows 原生 260 项测试通过。构建脚本 `termviai-beta5.cmd`，源码以当前 Git 仓库为准，Windows 构建副本仅用于构建。此前试用包沿用 beta.4 字符串；升级以 beta.5 Release 为准。各轮细节和人工验收边界保留在 [UI_VALIDATION.md](UI_VALIDATION.md)。
 
-Windows 构建环境为 `termviai-win`，本轮脚本 `termviai-beta4.cmd`；Windows 源码快照不是代码真源。此前的功能验证包可能沿用旧版本字符串，升级以正式 beta.4 Release 为准。细节见 [IDENTITIES.md](IDENTITIES.md) 和 [UI_VALIDATION.md](UI_VALIDATION.md)。
-
-本文是 TermViAI 后续开发的优先上下文。历次实现细节和历史验证保留在 [HANDOVER.md](HANDOVER.md) 与 [STATUS.md](STATUS.md)；若历史段落与本文冲突，以本文和当前代码为准。
+真实 SSH/MFA、四路长时间空闲/睡眠唤醒、鼠标拖放、DPI/GPU/IME 仍需持续验收。保活修复不能证明是所有断连的唯一原因。TermViAI = Terminal Via AI，当前没有内置 AI 功能。
 
 ## 项目身份与发布状态
 
@@ -19,18 +17,18 @@ Windows 构建环境为 `termviai-win`，本轮脚本 `termviai-beta4.cmd`；Win
 - GitHub 仓库：<https://github.com/hanwlax/TermViAI>。
 - 当前分支：`main`，远端为 `origin/main`。
 - 首个公开版本：`v0.1.0-beta.1`。
-- 当前版本：`v0.1.0-beta.4`；发布提交以该 Git 标签指向的提交为准。
-- Release：<https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.4>，标记为 prerelease。
-- Windows 便携包：`TermViAI-v0.1.0-beta.4-windows-x86_64.zip`。
-- 发布包 SHA-256：`fd25b4603e8a9d0af65b43e422baf65a73a6b45feacf47908b1d6aaf53b2a60d`。
-- 本地构建、版本、嵌入图标与归档验证见 [RELEASE_V0.1.0_BETA.4_VALIDATION.md](RELEASE_V0.1.0_BETA.4_VALIDATION.md)。GitHub Release 为正式附件真源，发布后须回传 ZIP 与校验文件核验。
+- 当前版本：`v0.1.0-beta.5`；发布提交以该 Git 标签指向的提交为准。
+- Release：<https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.5>，标记为 prerelease。
+- Windows 便携包：`TermViAI-v0.1.0-beta.5-windows-x86_64.zip`。
+- 发布包 SHA-256：`ca4e680038fe7be0e6a1af454337a3a79ef733634f24313077aba13bbeac656e`。
+- 本地构建、版本、嵌入图标与归档验证见 [RELEASE_V0.1.0_BETA.5_VALIDATION.md](RELEASE_V0.1.0_BETA.5_VALIDATION.md)。GitHub Release 为正式附件真源，发布后须回传 ZIP 与校验文件核验。
 
 从首个发布版本起，**不保留任何旧品牌兼容层**。源码、模块、配置、环境变量和数据路径不得重新引入先前品牌标识。当前配置项为 `termviai_ui`，数据目录覆盖变量为 `TERMVIAI_DATA_DIR`，Windows 默认数据目录为 `%APPDATA%\wezterm\termviai`；不迁移更早的实验数据目录。
 
 ## 已完成的产品能力
 
-- 原生 Windows Hosts 与 Keychain 页面；无需账号登录。Hosts 卡片的三个点单击打开 Edit Host / Duplicate Host 菜单（不再响应 Host 右键），复制继承全部配置并自动使用 `xxx-copy`（重名递增后缀）。不支持 Telnet。
-- Keychain 新增 Identities（名称、用户名、密码）与独立 Keys 分区。Host 支持输入密码、记住密码及从 Keychain 选择认证；密码使用 Windows Credential Manager，未记住时仅进程内存保存。JSON/SSH 参数只含不透明引用。详见 [IDENTITIES.md](IDENTITIES.md)。
+- 原生 Windows Hosts 与 Keychain 页面；无需账号登录。Hosts 卡片的三个点单击打开 Edit Host / Duplicate Host / Delete Host 菜单（不再响应 Host 右键），复制继承全部配置并自动使用 `xxx-copy`（重名递增后缀）。不支持 Telnet。
+- Keychain 新增 Identities（名称、用户名、密码）与独立 Keys 分区。Host 支持 Password / SSH Key / Identity 互斥认证，以及 Keychain 下拉选择；密码使用 Windows Credential Manager。JSON/SSH 参数只含不透明引用。详见 [IDENTITIES.md](IDENTITIES.md)。
 - 默认启动到 Hosts 页面，不自动创建本地终端；关闭最后一个终端后返回 Hosts，不退出应用。
 - 顶栏 `+` 打开 New Tab 页面，只显示已保存工作区和最近连接。用户认为 Recent tab groups 占用空间且价值有限，已移除该区域与自动记录流程；需要复用的终端组通过 `Ctrl+S` 手动保存。旧 `history` 数据读取时忽略，下次正常写入库时清理，手动保存和最近连接保留。
 - 多个 SSH 连接可组合到同一 Tab，使用响应式比例分屏、圆角边框和统一四边间距。终端侧栏仅保留 Hosts、Keychain、Settings 导航，移除 WORKSPACE 区域及向右/向下添加 SSH、保存组按钮；保存仍可用标签右键菜单和 Ctrl+S。Hosts 顶部不再显示 Grid view 装饰标识。
@@ -66,6 +64,8 @@ Windows 构建环境为 `termviai-win`，本轮脚本 `termviai-beta4.cmd`；Win
 上游 WezTerm 历史、许可证与 `README.wezterm.md` 保留。Cargo 产物内部仍名为 `wezterm-gui.exe`，官方发布包将其命名为 `TermViAI.exe`，并写入 TermViAI 的 Windows PE 产品元数据。
 
 ## 构建与验证记忆
+
+- beta.5：Windows SSH 19、window 5、终端核心 54、mux 42、广播 12、GUI 128，共 260 项通过。Windows CI 新增终端核心测试。
 
 - beta.4：Windows 原生 SSH 18、window 5、mux 42、广播 12、完整 GUI 101，共 178 项通过；Release 构建、PE 版本与 10 帧嵌入图标、便携包 CRC/SHA-256 校验通过。以下为历史版本验证记录。
 

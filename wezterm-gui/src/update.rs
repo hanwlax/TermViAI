@@ -91,7 +91,10 @@ pub fn load_last_release_info_and_set_banner() {
 }
 
 fn set_banner_from_release_info(latest: &Release) {
-    let mux = crate::Mux::get();
+    crate::Mux::get().set_banner(Some(release_banner(latest)));
+}
+
+fn release_banner(latest: &Release) -> String {
     let url = format!("https://wezterm.org/changelog.html#{}", latest.tag_name);
 
     let icon = ITermFileData {
@@ -118,7 +121,7 @@ fn set_banner_from_release_info(latest: &Release) {
     let underline_on = CSI::Sgr(Sgr::Underline(Underline::Single));
     let reset = CSI::Sgr(Sgr::Reset);
     let link_off = OperatingSystemCommand::SetHyperlink(None);
-    mux.set_banner(Some(format!(
+    format!(
         "{}{}WezTerm Update Available\r\n{}{}{}{}Click to see what's new{}{}\r\n",
         icon,
         top_line_pos,
@@ -128,7 +131,7 @@ fn set_banner_from_release_info(latest: &Release) {
         underline_on,
         link_off,
         reset,
-    )));
+    )
 }
 
 fn schedule_set_banner_from_release_info(latest: &Release) {
@@ -231,5 +234,79 @@ pub fn start_update_checker() {
             .name("update_checker".into())
             .spawn(update_checker)
             .expect("failed to spawn update checker thread");
+    }
+}
+
+#[cfg(test)]
+mod startup_output_tests {
+    use super::*;
+    use std::sync::Arc;
+    use wezterm_term::{Terminal, TerminalSize};
+
+    #[test]
+    fn startup_banner_and_ssh_output_preserve_line_boundaries() {
+        let latest = Release {
+            url: String::new(),
+            body: String::new(),
+            html_url: String::new(),
+            tag_name: "test".into(),
+            assets: vec![],
+        };
+        let banner = release_banner(&latest);
+        let lines = [
+            "Using libssh-rs to connect to root@host:22",
+            "SSH-2.0-OpenSSH_8.8",
+            "Authenticated. Opening remote terminal...",
+            "Welcome to cloud",
+            "Last login: Thu Oct 22 2026 from host",
+            "[root@host ~]# ",
+        ];
+        let output = lines.join("\r\n");
+        for chunk_size in [1, 7, output.len()] {
+            for resize_after in 0..=output.len() {
+                let mut size = TerminalSize {
+                    rows: 24,
+                    cols: 100,
+                    pixel_width: 800,
+                    pixel_height: 384,
+                    dpi: 96,
+                };
+                let mut term = Terminal::new(
+                    size,
+                    Arc::new(config::TermConfig::new()),
+                    "TermViAI",
+                    "test",
+                    Box::new(Vec::new()),
+                );
+                term.advance_bytes(&banner);
+                for chunk in output.as_bytes()[..resize_after].chunks(chunk_size) {
+                    term.advance_bytes(chunk);
+                }
+                size.rows = 20;
+                size.cols = 96;
+                size.pixel_width = 768;
+                size.pixel_height = 320;
+                term.resize(size);
+                for chunk in output.as_bytes()[resize_after..].chunks(chunk_size) {
+                    term.advance_bytes(chunk);
+                }
+                let actual: Vec<_> = term
+                    .screen()
+                    .lines_in_phys_range(0..term.screen().scrollback_rows())
+                    .iter()
+                    .map(|line| line.as_str().trim_end().to_string())
+                    .collect();
+                for expected in lines {
+                    assert!(
+                        actual.iter().any(|line| line == expected.trim_end()),
+                        "chunk={}, resize={}, missing={}, actual={:?}",
+                        chunk_size,
+                        resize_after,
+                        expected,
+                        actual
+                    );
+                }
+            }
+        }
     }
 }

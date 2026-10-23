@@ -26,6 +26,30 @@ impl AuthenticationEvent {
     }
 }
 
+// UI authentication selections constrain automatic credentials; legacy SSH callers
+// without this option retain their existing agent/config/password behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthPolicy {
+    Legacy,
+    Password,
+    Key,
+}
+impl AuthPolicy {
+    fn from_option(mode: Option<&str>) -> Self {
+        match mode {
+            Some("key") => Self::Key,
+            Some("password" | "identity") => Self::Password,
+            _ => Self::Legacy,
+        }
+    }
+    fn public_key(self) -> bool {
+        self != Self::Password
+    }
+    fn password(self, key_factor_complete: bool) -> bool {
+        self != Self::Key || key_factor_complete
+    }
+}
+
 impl crate::sessioninner::SessionInner {
     #[cfg(feature = "ssh2")]
     fn agent_auth(&mut self, sess: &ssh2::Session, user: &str) -> anyhow::Result<bool> {
@@ -62,8 +86,16 @@ impl crate::sessioninner::SessionInner {
     ) -> anyhow::Result<bool> {
         use std::path::{Path, PathBuf};
 
-        if let Some(files) = self.config.get("identityfile") {
-            for file in files.split_whitespace() {
+        let files: Vec<&str> = if let Some(file) = self.config.get("termviai_identity_file") {
+            vec![file.as_str()]
+        } else {
+            self.config
+                .get("identityfile")
+                .map(|s| s.split_whitespace().collect())
+                .unwrap_or_default()
+        };
+        {
+            for file in files {
                 let pubkey: PathBuf = format!("{}.pub", file).into();
                 let file = Path::new(file);
 
@@ -129,11 +161,48 @@ impl crate::sessioninner::SessionInner {
     }
 
     #[cfg(feature = "libssh-rs")]
+    fn selected_key_auth_libssh(
+        &self,
+        sess: &libssh_rs::Session,
+    ) -> anyhow::Result<libssh_rs::AuthStatus> {
+        let file = self
+            .config
+            .get("termviai_identity_file")
+            .context("No SSH key selected")?;
+        let key = match libssh_rs::SshKey::from_privkey_file(file, None) {
+            Ok(key) => key,
+            Err(_) => {
+                let (reply, answers) = bounded(1);
+                self.tx_event
+                    .try_send(SessionEvent::Authenticate(AuthenticationEvent {
+                        username: sess.get_user_name()?,
+                        instructions: String::new(),
+                        prompts: vec![AuthenticationPrompt {
+                            prompt: format!("Passphrase to decrypt {file}: "),
+                            echo: false,
+                        }],
+                        reply,
+                    }))?;
+                let answers = smol::block_on(answers.recv())?;
+                let passphrase = answers
+                    .first()
+                    .context("User cancelled key authentication")?;
+                libssh_rs::SshKey::from_privkey_file(file, Some(passphrase))?
+            }
+        };
+        Ok(sess.userauth_publickey(None, &key)?)
+    }
+
+    #[cfg(feature = "libssh-rs")]
     pub fn authenticate_libssh(&mut self, sess: &libssh_rs::Session) -> anyhow::Result<()> {
         use std::collections::HashMap;
+        let policy =
+            AuthPolicy::from_option(self.config.get("termviai_auth_mode").map(String::as_str));
+        let mut key_factor_complete = false;
         let mut saved_password = self
             .config
             .get("termviai_credential")
+            .filter(|_| policy != AuthPolicy::Key)
             .map(|id| crate::credentials::load(id))
             .transpose()?
             .flatten();
@@ -172,7 +241,8 @@ impl crate::sessioninner::SessionInner {
             let auth_methods = sess.userauth_list(None)?;
             // Try a supplied password once. Rejection falls through to the normal
             // interactive prompt; never replay it for key passphrases or OTPs.
-            if auth_methods.contains(AuthMethods::PASSWORD) {
+            if policy.password(key_factor_complete) && auth_methods.contains(AuthMethods::PASSWORD)
+            {
                 if let Some(password) = saved_password.take() {
                     match sess.userauth_password(None, Some(&password))? {
                         AuthStatus::Success => return Ok(()),
@@ -184,17 +254,35 @@ impl crate::sessioninner::SessionInner {
 
             let mut status_by_method = HashMap::new();
 
-            if auth_methods.contains(AuthMethods::PUBLIC_KEY) {
-                match sess.userauth_public_key_auto(None, None)? {
+            if policy.public_key()
+                && !key_factor_complete
+                && auth_methods.contains(AuthMethods::PUBLIC_KEY)
+            {
+                let status = if policy == AuthPolicy::Key {
+                    self.selected_key_auth_libssh(sess)?
+                } else {
+                    sess.userauth_public_key_auto(None, None)?
+                };
+                match status {
                     AuthStatus::Success => return Ok(()),
-                    AuthStatus::Partial => continue,
+                    AuthStatus::Partial => {
+                        key_factor_complete = policy == AuthPolicy::Key;
+                        continue;
+                    }
                     status => {
+                        anyhow::ensure!(
+                            policy != AuthPolicy::Key,
+                            "The selected SSH key was not accepted: {:?}",
+                            status
+                        );
                         status_by_method.insert(AuthMethods::PUBLIC_KEY, status);
                     }
                 }
             }
 
-            if auth_methods.contains(AuthMethods::INTERACTIVE) {
+            if policy.password(key_factor_complete)
+                && auth_methods.contains(AuthMethods::INTERACTIVE)
+            {
                 loop {
                     match sess.userauth_keyboard_interactive(None, None)? {
                         AuthStatus::Success => return Ok(()),
@@ -244,7 +332,8 @@ impl crate::sessioninner::SessionInner {
                 }
             }
 
-            if auth_methods.contains(AuthMethods::PASSWORD) {
+            if policy.password(key_factor_complete) && auth_methods.contains(AuthMethods::PASSWORD)
+            {
                 let (reply, answers) = bounded(1);
                 self.tx_event
                     .try_send(SessionEvent::Authenticate(AuthenticationEvent {
@@ -287,9 +376,13 @@ impl crate::sessioninner::SessionInner {
     ) -> anyhow::Result<()> {
         use std::collections::HashSet;
 
+        let policy =
+            AuthPolicy::from_option(self.config.get("termviai_auth_mode").map(String::as_str));
+        let mut key_factor_complete = false;
         let mut saved_password = self
             .config
             .get("termviai_credential")
+            .filter(|_| policy != AuthPolicy::Key)
             .map(|id| crate::credentials::load(id))
             .transpose()?
             .flatten();
@@ -303,25 +396,58 @@ impl crate::sessioninner::SessionInner {
             // auth may then unlock 2fac)
             let methods: HashSet<&str> = sess.auth_methods(&user)?.split(',').collect();
             log::trace!("ssh auth methods: {:?}", methods);
+            if policy != AuthPolicy::Legacy {
+                anyhow::ensure!(
+                    (policy.public_key() && !key_factor_complete && methods.contains("publickey"))
+                        || (policy.password(key_factor_complete)
+                            && (methods.contains("password")
+                                || methods.contains("keyboard-interactive"))),
+                    "The server does not offer the selected authentication method."
+                );
+            }
 
-            if !sess.authenticated() && methods.contains("password") {
+            if policy.password(key_factor_complete)
+                && !sess.authenticated()
+                && methods.contains("password")
+            {
                 if let Some(password) = saved_password.take() {
                     if sess.userauth_password(user, &password).is_ok() {
                         continue;
                     }
                 }
             }
-            if !sess.authenticated() && methods.contains("publickey") {
-                if self.agent_auth(sess, user)? {
+            if policy.public_key()
+                && !key_factor_complete
+                && !sess.authenticated()
+                && methods.contains("publickey")
+            {
+                if policy == AuthPolicy::Legacy && self.agent_auth(sess, user)? {
                     continue;
                 }
 
                 if self.pubkey_auth(sess, user, host)? {
                     continue;
                 }
+                if policy == AuthPolicy::Key {
+                    let next = sess.auth_methods(user)?;
+                    // libssh2 exposes a completed first factor through the remaining
+                    // method list. Continue only when the server advances past keys.
+                    key_factor_complete = !next.split(',').any(|m| m == "publickey")
+                        && next
+                            .split(',')
+                            .any(|m| matches!(m, "password" | "keyboard-interactive"));
+                    anyhow::ensure!(
+                        key_factor_complete,
+                        "The selected SSH key was not accepted."
+                    );
+                    continue;
+                }
             }
 
-            if !sess.authenticated() && methods.contains("password") {
+            if policy.password(key_factor_complete)
+                && !sess.authenticated()
+                && methods.contains("password")
+            {
                 let (reply, answers) = bounded(1);
                 self.tx_event
                     .try_send(SessionEvent::Authenticate(AuthenticationEvent {
@@ -347,7 +473,10 @@ impl crate::sessioninner::SessionInner {
                 }
             }
 
-            if !sess.authenticated() && methods.contains("keyboard-interactive") {
+            if policy.password(key_factor_complete)
+                && !sess.authenticated()
+                && methods.contains("keyboard-interactive")
+            {
                 struct Helper<'a> {
                     tx_event: &'a Sender<SessionEvent>,
                     saved_password: &'a mut Option<String>,
@@ -435,5 +564,24 @@ mod saved_password_tests {
             assert!(!super::is_password_prompt(prompt, false));
         }
         assert!(!super::is_password_prompt("Password:", true));
+    }
+}
+
+#[cfg(test)]
+mod auth_policy_tests {
+    use super::AuthPolicy;
+    #[test]
+    fn explicit_modes_isolate_credentials_and_allow_key_second_factors() {
+        for name in ["password", "identity"] {
+            let policy = AuthPolicy::from_option(Some(name));
+            assert!(!policy.public_key());
+            assert!(policy.password(false));
+        }
+        let policy = AuthPolicy::from_option(Some("key"));
+        assert!(policy.public_key());
+        assert!(!policy.password(false));
+        assert!(policy.password(true));
+        let legacy = AuthPolicy::from_option(None);
+        assert!(legacy.public_key() && legacy.password(false));
     }
 }

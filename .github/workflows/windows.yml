@@ -71,6 +71,8 @@ jobs:
         run: cargo test --locked --release -p wezterm-ssh --lib -- --test-threads=1
       - name: Test maximized custom frame
         run: cargo test --locked --release -p window termviai_frame_tests -- --test-threads=1
+      - name: Test terminal core
+        run: cargo test --locked --release -p wezterm-term --lib -- --test-threads=1
       - name: Test mux
         run: cargo test --locked --release -p mux -- --test-threads=1
       - name: Test TermViAI GUI behavior

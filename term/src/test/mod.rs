@@ -1378,3 +1378,38 @@ fn test_hyperlinks() {
         Compare::TEXT | Compare::ATTRS,
     );
 }
+
+#[test]
+fn resize_preserves_line_start_between_carriage_return_and_line_feed() {
+    for cols in [60, 100] {
+        for split in ["\r", "\r\n"] {
+            let mut term = TestTerm::new(8, 80, 16);
+            term.print("banner\r\nUsing SSH to connect");
+            term.print(split);
+            term.resize(TerminalSize {
+                rows: 8,
+                cols,
+                ..Default::default()
+            });
+            if split == "\r" {
+                term.print("\n");
+            }
+            term.print("SSH-2.0\r\nLast login\r\n[root@host ~]# ");
+            assert_visible_contents(
+                &term,
+                file!(),
+                line!(),
+                &[
+                    "banner",
+                    "Using SSH to connect",
+                    "SSH-2.0",
+                    "Last login",
+                    "[root@host ~]# ",
+                    "",
+                    "",
+                    "",
+                ],
+            );
+        }
+    }
+}

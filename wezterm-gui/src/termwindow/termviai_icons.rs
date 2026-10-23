@@ -12,11 +12,17 @@ pub enum Icon {
     Menu,
     Hosts,
     Key,
+    Lock,
+    Eye,
+    EyeOff,
+    Radio,
+    RadioChecked,
     Identity,
     Terminal,
     Search,
     Plus,
     Close,
+    Trash,
     ChevronLeft,
     ChevronRight,
     ChevronDown,
@@ -26,8 +32,11 @@ pub enum Icon {
     Restore,
     Grid,
     List,
+    ListPlus,
     Folder,
+    FolderPlus,
     Edit,
+    Copy,
     Check,
     Checkbox,
     CheckboxChecked,
@@ -64,11 +73,17 @@ impl Icon {
             Self::Menu => MENU,
             Self::Hosts => HOSTS,
             Self::Key => KEY,
+            Self::Lock => LOCK,
+            Self::Eye => EYE,
+            Self::EyeOff => EYE_OFF,
+            Self::Radio => RADIO,
+            Self::RadioChecked => RADIO_CHECKED,
             Self::Identity => IDENTITY,
             Self::Terminal => TERMINAL,
             Self::Search => SEARCH,
             Self::Plus => PLUS,
             Self::Close => CLOSE,
+            Self::Trash => TRASH,
             Self::ChevronLeft => CHEVRON_LEFT,
             Self::ChevronRight => CHEVRON_RIGHT,
             Self::ChevronDown => CHEVRON_DOWN,
@@ -78,8 +93,11 @@ impl Icon {
             Self::Restore => RESTORE,
             Self::Grid => GRID,
             Self::List => LIST,
+            Self::ListPlus => LIST_PLUS,
             Self::Folder => FOLDER,
+            Self::FolderPlus => FOLDER_PLUS,
             Self::Edit => EDIT,
+            Self::Copy => COPY,
             Self::Check => CHECK,
             Self::Checkbox => CHECKBOX,
             Self::CheckboxChecked => CHECKBOX_CHECKED,
@@ -248,7 +266,37 @@ const TERMINAL: &[Poly] = &[outline(&[
 
 const SEARCH: &[Poly] = &[outline(&[circle(10, 10, 6), m(15, 15), l(21, 21)])];
 const PLUS: &[Poly] = &[outline(&[m(12, 5), l(12, 19), m(5, 12), l(19, 12)])];
+const FOLDER_PLUS: &[Poly] = &[outline(&[
+    m(3, 7),
+    l(3, 20),
+    l(21, 20),
+    l(21, 7),
+    l(12, 7),
+    l(10, 4),
+    l(3, 4),
+    l(3, 7),
+    m(9, 13),
+    l(15, 13),
+    m(12, 10),
+    l(12, 16),
+])];
 const CLOSE: &[Poly] = &[outline(&[m(6, 6), l(18, 18), m(18, 6), l(6, 18)])];
+const TRASH: &[Poly] = &[outline(&[
+    m(4, 6),
+    l(20, 6),
+    m(9, 6),
+    l(9, 3),
+    l(15, 3),
+    l(15, 6),
+    m(6, 6),
+    l(7, 21),
+    l(17, 21),
+    l(18, 6),
+    m(10, 10),
+    l(10, 17),
+    m(14, 10),
+    l(14, 17),
+])];
 const CHEVRON_LEFT: &[Poly] = &[outline(&[m(15, 5), l(8, 12), l(15, 19)])];
 const CHEVRON_RIGHT: &[Poly] = &[outline(&[m(9, 5), l(16, 12), l(9, 19)])];
 const CHEVRON_DOWN: &[Poly] = &[outline(&[m(5, 9), l(12, 16), l(19, 9)])];
@@ -321,6 +369,10 @@ const FOLDER: &[Poly] = &[outline(&[
     q(3, 20, 3, 18),
     PolyCommand::Close,
 ])];
+const COPY: &[Poly] = &[
+    outline(&[m(8, 8), l(20, 8), l(20, 20), l(8, 20), PolyCommand::Close]),
+    outline(&[m(16, 8), l(16, 4), l(4, 4), l(4, 16), l(8, 16)]),
+];
 const EDIT: &[Poly] = &[outline(&[
     m(4, 15),
     l(15, 4),
@@ -511,3 +563,42 @@ mod tests {
         }
     }
 }
+
+const LOCK: &[Poly] = &[
+    outline(&[
+        m(7, 10),
+        l(7, 7),
+        q(7, 2, 12, 2),
+        q(17, 2, 17, 7),
+        l(17, 10),
+    ]),
+    outline(&[m(5, 10), l(19, 10), l(19, 21), l(5, 21), PolyCommand::Close]),
+    outline(&[m(12, 14), l(12, 17)]),
+];
+const EYE_SHAPE: Poly = outline(&[
+    m(2, 12),
+    q(12, -2, 22, 12),
+    q(12, 26, 2, 12),
+    PolyCommand::Close,
+]);
+const EYE: &[Poly] = &[EYE_SHAPE, outline(&[circle(12, 12, 3)])];
+const EYE_OFF: &[Poly] = &[
+    EYE_SHAPE,
+    outline(&[circle(12, 12, 3)]),
+    outline(&[m(3, 3), l(21, 21)]),
+];
+const RADIO: &[Poly] = &[outline(&[circle(12, 12, 8)])];
+const RADIO_CHECKED: &[Poly] = &[outline(&[circle(12, 12, 8)]), fill(&[circle(12, 12, 4)])];
+
+const LIST_PLUS: &[Poly] = &[outline(&[
+    m(4, 6),
+    l(18, 6),
+    m(4, 12),
+    l(12, 12),
+    m(4, 18),
+    l(10, 18),
+    m(18, 12),
+    l(18, 20),
+    m(14, 16),
+    l(22, 16),
+])];
