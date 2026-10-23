@@ -18,7 +18,7 @@ impl crate::TermWindow {
             return Ok(());
         }
         let draw_lines = !self.config.termviai_ui || self.termviai_pane_headers().is_empty();
-        let palette = pane.palette();
+        let palette = self.termviai_pane_palette(pane.as_ref());
         let foreground = palette.split.to_linear();
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;

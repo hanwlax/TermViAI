@@ -90,6 +90,7 @@ mod termviai_icons;
 mod termviai_layout;
 mod termviai_motion;
 mod termviai_tab_drag;
+mod termviai_theme;
 mod termviai_ui;
 mod termviai_workspace;
 pub mod webgpu;
@@ -1808,8 +1809,11 @@ impl TermWindow {
 impl TermWindow {
     fn palette(&mut self) -> &ColorPalette {
         if self.palette.is_none() {
-            self.palette
-                .replace(config::TermConfig::new().color_palette());
+            self.palette.replace(if self.config.termviai_ui {
+                self.termviai_theme().terminal_palette()
+            } else {
+                config::TermConfig::new().color_palette()
+            });
         }
         self.palette.as_ref().unwrap()
     }

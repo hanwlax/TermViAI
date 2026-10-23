@@ -3,6 +3,7 @@
 //! Split rectangles remain in the window's layout grid. Each pane has its own
 //! font grid inside that rectangle; rendering, PTY size, mouse and IME all use
 //! the same metrics. Session overrides are never serialized.
+use super::termviai_theme::Theme;
 use super::TermWindow;
 use crate::hosts::HostStore;
 use crate::utilsprites::RenderMetrics;
@@ -28,6 +29,8 @@ pub(super) const MAX_SSH_KEEPALIVE_INTERVAL: u64 = 86_400;
 struct Preferences {
     terminal_font_size: Option<f64>,
     ssh_keepalive_interval_seconds: Option<u64>,
+    #[serde(default)]
+    theme: Theme,
     #[serde(flatten)]
     other: serde_json::Map<String, serde_json::Value>,
 }
@@ -73,6 +76,8 @@ pub(super) struct PaneFont {
 }
 
 pub(super) struct TermviaiFonts {
+    theme: Theme,
+    pub(super) painted_theme: Option<Theme>,
     global_size: Option<f64>,
     ssh_keepalive_interval: u64,
     session_sizes: HashMap<PaneId, f64>,
@@ -82,6 +87,8 @@ pub(super) struct TermviaiFonts {
 impl Default for TermviaiFonts {
     fn default() -> Self {
         Self {
+            theme: Theme::default(),
+            painted_theme: None,
             global_size: None,
             ssh_keepalive_interval: DEFAULT_SSH_KEEPALIVE_INTERVAL,
             session_sizes: HashMap::new(),
@@ -93,25 +100,27 @@ impl Default for TermviaiFonts {
 impl TermviaiFonts {
     pub fn load() -> Self {
         let path = HostStore::path().with_file_name("settings.json");
-        let (global_size, ssh_keepalive_interval) = match Preferences::load(&path) {
+        let (global_size, ssh_keepalive_interval, theme) = match Preferences::load(&path) {
             Ok(prefs) => (
                 prefs.terminal_font_size.filter(|size| valid_size(*size)),
                 prefs
                     .ssh_keepalive_interval_seconds
                     .filter(|interval| *interval <= MAX_SSH_KEEPALIVE_INTERVAL)
                     .unwrap_or(DEFAULT_SSH_KEEPALIVE_INTERVAL),
+                prefs.theme,
             ),
             Err(err) => {
                 log::error!(
                     "{:#}; preserving preferences and using the configured font",
                     err
                 );
-                (None, DEFAULT_SSH_KEEPALIVE_INTERVAL)
+                (None, DEFAULT_SSH_KEEPALIVE_INTERVAL, Theme::default())
             }
         };
         Self {
             global_size,
             ssh_keepalive_interval,
+            theme,
             ..Self::default()
         }
     }
@@ -122,6 +131,9 @@ impl TermviaiFonts {
 
     pub fn ssh_keepalive_interval(&self) -> u64 {
         self.ssh_keepalive_interval
+    }
+    pub fn theme(&self) -> Theme {
+        self.theme
     }
 }
 
@@ -179,6 +191,7 @@ impl TermWindow {
         &mut self,
         size: f64,
         ssh_keepalive_interval: u64,
+        theme: Theme,
     ) -> anyhow::Result<()> {
         ensure!(valid_size(size), "Font size must be between 6 and 48 pt.");
         ensure!(
@@ -191,22 +204,24 @@ impl TermWindow {
         let mut prefs = Preferences::load(&path)?;
         prefs.terminal_font_size = Some(size);
         prefs.ssh_keepalive_interval_seconds = Some(ssh_keepalive_interval);
+        prefs.theme = theme;
         prefs.save(&path)?;
-        self.termviai_apply_preferences(size, ssh_keepalive_interval);
+        self.termviai_apply_preferences(size, ssh_keepalive_interval, theme);
         for other in crate::frontend::front_end().gui_windows() {
             let current_id = self.mux_window_id;
             other
                 .window
                 .notify(super::TermWindowNotif::Apply(Box::new(move |window| {
                     if window.config.termviai_ui && window.mux_window_id != current_id {
-                        window.termviai_apply_preferences(size, ssh_keepalive_interval);
+                        window.termviai_apply_preferences(size, ssh_keepalive_interval, theme);
                     }
                 })));
         }
         Ok(())
     }
 
-    fn termviai_apply_preferences(&mut self, size: f64, ssh_keepalive_interval: u64) {
+    fn termviai_apply_preferences(&mut self, size: f64, ssh_keepalive_interval: u64, theme: Theme) {
+        self.termviai_fonts.theme = theme;
         self.termviai_fonts.global_size = Some(size);
         self.termviai_fonts.ssh_keepalive_interval = ssh_keepalive_interval;
         let dimensions = self.dimensions;
@@ -415,16 +430,36 @@ mod tests {
         std::fs::write(&path, r#"{"terminal_font_size":14.5,"appearance":"mocha"}"#).unwrap();
         let mut prefs = Preferences::load(&path).unwrap();
         assert_eq!(prefs.terminal_font_size, Some(14.5));
+        assert_eq!(prefs.theme, Theme::Ink);
+        prefs.theme = Theme::Light;
         prefs.terminal_font_size = Some(18.0);
         prefs.ssh_keepalive_interval_seconds = Some(45);
         prefs.save(&path).unwrap();
         let loaded = Preferences::load(&path).unwrap();
+        assert_eq!(loaded.theme, Theme::Light);
         assert_eq!(loaded.terminal_font_size, Some(18.0));
         assert_eq!(loaded.ssh_keepalive_interval_seconds, Some(45));
         assert_eq!(loaded.other["appearance"], "mocha");
         std::fs::write(&path, "broken").unwrap();
         assert!(Preferences::load(&path).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "broken");
+    }
+
+    #[test]
+    fn appearance_names_round_trip_and_unknown_themes_fall_back() {
+        for theme in Theme::ALL {
+            let prefs = Preferences {
+                theme,
+                ..Preferences::default()
+            };
+            let text = serde_json::to_string(&prefs).unwrap();
+            let loaded: Preferences = serde_json::from_str(&text).unwrap();
+            assert_eq!(loaded.theme, theme);
+        }
+        let future: Preferences =
+            serde_json::from_str(r#"{"theme":"future","terminal_font_size":15}"#).unwrap();
+        assert_eq!(future.theme, Theme::Ink);
+        assert_eq!(future.terminal_font_size, Some(15.));
     }
 
     #[test]

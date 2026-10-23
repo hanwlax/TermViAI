@@ -4,6 +4,10 @@
 
 > 最新、精简且可执行的项目上下文见 [MEMORY.md](MEMORY.md)。后续工作应先读取该文件；下文保留完整历史记录。
 
+## 2026-10-23 TermViAI v0.1.0-beta.6
+
+第六个 Beta 汇总三套主题及 Settings 预览/持久化、默认收起的广播面板、屏幕顺序成员列表、Tab 工作区菜单、统一边框与嵌套悬浮、Keychain Key 编辑/删除，以及终端 Ctrl + 单击链接。Windows 原生 272 项测试通过。实现、发布包验证和人工验收边界见 [MEMORY.md](MEMORY.md)、[发布说明](RELEASE_V0.1.0_BETA.6.md) 与 [验证记录](RELEASE_V0.1.0_BETA.6_VALIDATION.md)。
+
 ## 2026-10-23 TermViAI v0.1.0-beta.5
 
 第五个 Beta 汇总互斥认证表单、嵌套 Host 分组及管理、启动输出重叠修复、最近连接移除与悬浮交互优化。Windows 原生 260 项测试通过。最新行为、打包验证和边界见 [MEMORY.md](MEMORY.md)、[发布说明](RELEASE_V0.1.0_BETA.5.md) 与 [验证记录](RELEASE_V0.1.0_BETA.5_VALIDATION.md)。

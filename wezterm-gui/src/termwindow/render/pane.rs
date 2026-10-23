@@ -99,7 +99,7 @@ impl crate::TermWindow {
         let global_cursor_fg = self.palette().cursor_fg;
         let global_cursor_bg = self.palette().cursor_bg;
         let config = self.config.clone();
-        let palette = pos.pane.palette();
+        let palette = self.termviai_pane_palette(pos.pane.as_ref());
 
         let (padding_left, padding_top) = padding;
 
@@ -724,7 +724,7 @@ impl crate::TermWindow {
             pos.height as f32 * cell_height,
         );
 
-        let palette = pos.pane.palette();
+        let palette = self.termviai_pane_palette(pos.pane.as_ref());
 
         // TODO: visual bell background layer
         // TODO: scrollbar

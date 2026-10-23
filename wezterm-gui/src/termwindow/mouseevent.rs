@@ -951,15 +951,19 @@ impl super::TermWindow {
             || event.coords.y < 0
             || event.coords.y as usize > self.dimensions.pixel_height;
 
-        context.set_cursor(Some(if self.current_highlight.is_some() {
-            // When hovering over a hyperlink, show an appropriate
-            // mouse cursor to give the cue that it is clickable
-            CursorIcon::Pointer
-        } else if pane.is_mouse_grabbed() || outside_window {
-            CursorIcon::Default
-        } else {
-            CursorIcon::Text
-        }));
+        context.set_cursor(Some(
+            if self.current_highlight.is_some()
+                && (!self.config.termviai_ui || event.modifiers.contains(window::Modifiers::CTRL))
+            {
+                // When hovering over a hyperlink, show an appropriate
+                // mouse cursor to give the cue that it is clickable
+                CursorIcon::Pointer
+            } else if pane.is_mouse_grabbed() || outside_window {
+                CursorIcon::Default
+            } else {
+                CursorIcon::Text
+            },
+        ));
 
         let event_trigger_type = match &event.kind {
             WMEK::Press(press) => {

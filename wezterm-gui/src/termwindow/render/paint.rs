@@ -162,6 +162,7 @@ impl crate::TermWindow {
     }
 
     pub fn paint_pass(&mut self) -> anyhow::Result<()> {
+        self.termviai_sync_theme();
         self.termviai_sync_terminal_layout();
         {
             let gl_state = self.render_state.as_ref().unwrap();
@@ -233,7 +234,8 @@ impl crate::TermWindow {
             let background = if panes.len() == 1 {
                 // If we're the only pane, use the pane's palette
                 // to draw the padding background
-                panes[0].pane.palette().background
+                self.termviai_pane_palette(panes[0].pane.as_ref())
+                    .background
             } else {
                 self.palette().background
             }

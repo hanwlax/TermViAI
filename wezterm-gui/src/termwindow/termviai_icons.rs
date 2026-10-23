@@ -443,9 +443,9 @@ const SETTINGS: &[Poly] = &[outline(&[
     circle(8, 18, 2),
 ])];
 const MORE: &[Poly] = &[fill(&[
-    circle(5, 12, 1),
-    circle(12, 12, 1),
-    circle(19, 12, 1),
+    circle(5, 12, 2),
+    circle(12, 12, 2),
+    circle(19, 12, 2),
 ])];
 const LINK: &[Poly] = &[outline(&[
     m(10, 8),

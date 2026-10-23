@@ -164,7 +164,7 @@ impl Host {
             self.identity_file = store
                 .keys
                 .iter()
-                .find(|key| key.label == self.key_label)
+                .find(|key| key.matches_label(&self.key_label))
                 .context("This key is no longer in Keychain. Edit the host to choose a key.")?
                 .path
                 .clone();
@@ -229,11 +229,21 @@ impl Host {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeyFile {
     pub label: String,
     pub path: String,
+    // Saved workspaces, recents and other windows may still hold the old label.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub previous_labels: Vec<String>,
+}
+
+impl KeyFile {
+    pub fn matches_label(&self, label: &str) -> bool {
+        !label.is_empty()
+            && (self.label == label || self.previous_labels.iter().any(|s| s == label))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +276,75 @@ pub struct HostStore {
 }
 
 impl HostStore {
+    pub fn save_key(
+        &mut self,
+        original: Option<&KeyFile>,
+        label: &str,
+        path: &str,
+    ) -> anyhow::Result<()> {
+        let label = label.trim();
+        let path = path.trim();
+        anyhow::ensure!(
+            !label.is_empty() && !label.chars().any(char::is_control),
+            "Enter a valid key name."
+        );
+        anyhow::ensure!(
+            Path::new(path).is_file(),
+            "Enter an existing private key file path."
+        );
+        let index = original
+            .map(|original| {
+                self.keys
+                    .iter()
+                    .position(|key| key == original)
+                    .context("This key changed. Reopen it and try again.")
+            })
+            .transpose()?;
+        anyhow::ensure!(
+            !self
+                .keys
+                .iter()
+                .enumerate()
+                .any(|(i, key)| Some(i) != index && key.matches_label(label)),
+            "This name belongs to another key, or one of its previous names."
+        );
+        let mut key = original.cloned().unwrap_or_default();
+        if !key.label.is_empty() && key.label != label {
+            key.previous_labels.retain(|name| name != label);
+            key.previous_labels.push(key.label.clone());
+        }
+        key.label = label.into();
+        key.path = path.into();
+        if let Some(index) = index {
+            for host in &mut self.hosts {
+                if key.matches_label(&host.key_label) {
+                    host.key_label = key.label.clone();
+                }
+            }
+            self.keys[index] = key;
+        } else {
+            self.keys.push(key);
+        }
+        Ok(())
+    }
+
+    pub fn remove_key(&mut self, original: &KeyFile) -> anyhow::Result<()> {
+        let index = self
+            .keys
+            .iter()
+            .position(|key| key == original)
+            .context("This key changed. Reopen it and try again.")?;
+        anyhow::ensure!(
+            !self
+                .hosts
+                .iter()
+                .any(|host| original.matches_label(&host.key_label)),
+            "This key is used by a Host. Change that host's authentication first."
+        );
+        self.keys.remove(index);
+        Ok(())
+    }
+
     /// Include old text-only groups without changing Host snapshots or credentials.
     fn prepare_groups(&mut self) -> anyhow::Result<()> {
         let mut ids = std::collections::HashSet::new();
@@ -868,6 +947,7 @@ mod tests {
             keys: vec![KeyFile {
                 label: "Selected key".into(),
                 path: key.path().to_string_lossy().into_owned(),
+                ..Default::default()
             }],
             identities: vec![Identity {
                 id: "identity-ref".into(),
@@ -906,6 +986,7 @@ mod tests {
             keys: vec![KeyFile {
                 label: "saved-key".into(),
                 path: key.path().to_string_lossy().into(),
+                ..Default::default()
             }],
             identities: vec![Identity {
                 id: "identity".into(),

@@ -8,8 +8,7 @@ use std::sync::Arc;
 use termviai_broadcast::{route_input, BroadcastState};
 use window::WindowOps;
 
-/// Selection is retained while paused; only effective participants get the
-/// active broadcast indicator. Keep this separate from the selection checkbox.
+/// Only effective participants get the active indicator or checked tray state.
 pub(super) fn pane_broadcasting(state: &BroadcastState<usize>, pane: usize) -> bool {
     state.enabled() && state.is_member(pane)
 }
@@ -18,6 +17,23 @@ pub(super) fn pane_broadcasting(state: &BroadcastState<usize>, pane: usize) -> b
 /// Use the same predicate for the tab indicator and its select-all action.
 pub(super) fn group_broadcasting(state: &BroadcastState<usize>) -> bool {
     state.enabled() && state.pane_count() > 0 && state.member_count() == state.pane_count()
+}
+
+/// The compact tray has no separate pause switch. Selecting a gray participant
+/// starts that selection; stale targets retained by the core while paused must
+/// not silently enable other terminals.
+pub(super) fn toggle_participant(
+    state: &mut BroadcastState<usize>,
+    pane: usize,
+) -> anyhow::Result<()> {
+    state.targets_for(pane)?; // Validate before changing any existing selection.
+    let selected = pane_broadcasting(state, pane);
+    if !state.enabled() {
+        state.select_none();
+    }
+    state.set_member(pane, !selected)?;
+    state.set_enabled(state.member_count() > 0);
+    Ok(())
 }
 
 fn pane_accepts_input(pane: &Arc<dyn Pane>) -> bool {
@@ -34,7 +50,7 @@ pub(super) struct TabBroadcasts {
 }
 impl TabBroadcasts {
     /// The tab button acts on the entire group, including excluded or zoom-hidden
-    /// panes. The tray switch remains a pause/resume control for selected members.
+    /// panes. The tray offers direct member selection and All / None controls.
     pub(super) fn toggle_group(&mut self, tab: usize) {
         if let Some(state) = self.tabs.get_mut(&tab) {
             if group_broadcasting(state) {
@@ -215,6 +231,31 @@ impl TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_member_controls_follow_the_visible_state() {
+        let mut state = BroadcastState::new([1, 2, 3]);
+        assert!(toggle_participant(&mut state, 99).is_err());
+        assert_eq!(state.member_count(), 3);
+        assert!(!state.enabled());
+        toggle_participant(&mut state, 1).unwrap();
+        assert_eq!(state.targets_for(1).unwrap(), vec![1]);
+        assert!(pane_broadcasting(&state, 1));
+        assert!(!pane_broadcasting(&state, 2));
+        toggle_participant(&mut state, 2).unwrap();
+        assert_eq!(state.targets_for(1).unwrap(), vec![1, 2]);
+        toggle_participant(&mut state, 1).unwrap();
+        assert!(!pane_broadcasting(&state, 1));
+        assert!(pane_broadcasting(&state, 2));
+        toggle_participant(&mut state, 2).unwrap();
+        assert!(!state.enabled());
+        state.select_all();
+        state.set_enabled(true);
+        assert!(group_broadcasting(&state));
+        state.set_enabled(false);
+        toggle_participant(&mut state, 3).unwrap();
+        assert_eq!(state.targets_for(3).unwrap(), vec![3]);
+    }
+
     #[test]
     fn pane_errors_follow_identity_and_are_pruned_when_closed() {
         let mut all = TabBroadcasts::default();

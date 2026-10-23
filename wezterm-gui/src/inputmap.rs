@@ -87,6 +87,53 @@ impl InputMap {
         }
 
         if !config.disable_default_mouse_bindings {
+            let complete_selection = |destination| {
+                if config.termviai_ui {
+                    CompleteSelection(destination)
+                } else {
+                    CompleteSelectionOrOpenLinkAtMouseCursor(destination)
+                }
+            };
+            if config.termviai_ui {
+                // Ctrl-click starts a fresh selection; a drag completes that
+                // selection instead of navigating to the link underneath it.
+                for (event, action) in [
+                    (
+                        MouseEventTrigger::Down {
+                            streak: 1,
+                            button: MouseButton::Left,
+                        },
+                        SelectTextAtMouseCursor(SelectionMode::Cell),
+                    ),
+                    (
+                        MouseEventTrigger::Drag {
+                            streak: 1,
+                            button: MouseButton::Left,
+                        },
+                        ExtendSelectionToMouseCursor(SelectionMode::Cell),
+                    ),
+                    (
+                        MouseEventTrigger::Up {
+                            streak: 1,
+                            button: MouseButton::Left,
+                        },
+                        CompleteSelectionOrOpenLinkAtMouseCursor(
+                            ClipboardCopyDestination::ClipboardAndPrimarySelection,
+                        ),
+                    ),
+                ] {
+                    mouse
+                        .entry((
+                            event,
+                            MouseEventTriggerMods {
+                                mods: Modifiers::CTRL,
+                                mouse_reporting: false,
+                                alt_screen: MouseEventAltScreen::Any,
+                            },
+                        ))
+                        .or_insert(action);
+                }
+            }
             m!(
                 [
                     MouseEventTriggerMods {
@@ -182,9 +229,7 @@ impl InputMap {
                         streak: 1,
                         button: MouseButton::Left
                     },
-                    CompleteSelectionOrOpenLinkAtMouseCursor(
-                        ClipboardCopyDestination::ClipboardAndPrimarySelection
-                    )
+                    complete_selection(ClipboardCopyDestination::ClipboardAndPrimarySelection)
                 ],
                 [
                     MouseEventTriggerMods {
@@ -196,9 +241,7 @@ impl InputMap {
                         streak: 1,
                         button: MouseButton::Left
                     },
-                    CompleteSelectionOrOpenLinkAtMouseCursor(
-                        ClipboardCopyDestination::ClipboardAndPrimarySelection
-                    )
+                    complete_selection(ClipboardCopyDestination::ClipboardAndPrimarySelection)
                 ],
                 [
                     MouseEventTriggerMods {
@@ -234,9 +277,7 @@ impl InputMap {
                         streak: 1,
                         button: MouseButton::Left
                     },
-                    CompleteSelectionOrOpenLinkAtMouseCursor(
-                        ClipboardCopyDestination::PrimarySelection
-                    )
+                    complete_selection(ClipboardCopyDestination::PrimarySelection)
                 ],
                 [
                     MouseEventTriggerMods {
@@ -807,5 +848,83 @@ fn show_key_table_as_lua(table: &config::keyassignment::KeyTable, indent: usize)
     for ((key, mods), entry) in ordered {
         let action = &entry.action;
         println!("{pad}{},", lua_key(key, *mods, action));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_links_require_ctrl_without_losing_selection_bindings() {
+        let config = ConfigHandle::default_config();
+        assert!(config.termviai_ui);
+        let map = InputMap::new(&config);
+        for alt_screen in [MouseEventAltScreen::False, MouseEventAltScreen::True] {
+            let release = MouseEventTrigger::Up {
+                streak: 1,
+                button: MouseButton::Left,
+            };
+            for mods in [
+                Modifiers::NONE,
+                Modifiers::SHIFT,
+                Modifiers::ALT,
+                Modifiers::ALT | Modifiers::SHIFT,
+            ] {
+                assert!(matches!(
+                    map.lookup_mouse(
+                        release.clone(),
+                        MouseEventTriggerMods {
+                            mods,
+                            mouse_reporting: false,
+                            alt_screen
+                        }
+                    ),
+                    Some(KeyAssignment::CompleteSelection(_))
+                ));
+            }
+            let ctrl = MouseEventTriggerMods {
+                mods: Modifiers::CTRL,
+                mouse_reporting: false,
+                alt_screen,
+            };
+            assert!(matches!(
+                map.lookup_mouse(release.clone(), ctrl),
+                Some(KeyAssignment::CompleteSelectionOrOpenLinkAtMouseCursor(_))
+            ));
+            assert!(matches!(
+                map.lookup_mouse(
+                    MouseEventTrigger::Down {
+                        streak: 1,
+                        button: MouseButton::Left
+                    },
+                    ctrl
+                ),
+                Some(KeyAssignment::SelectTextAtMouseCursor(SelectionMode::Cell))
+            ));
+            assert!(matches!(
+                map.lookup_mouse(
+                    MouseEventTrigger::Drag {
+                        streak: 1,
+                        button: MouseButton::Left
+                    },
+                    ctrl
+                ),
+                Some(KeyAssignment::ExtendSelectionToMouseCursor(
+                    SelectionMode::Cell
+                ))
+            ));
+            // Mouse-reporting applications keep Ctrl events unless the user
+            // explicitly bypasses reporting with the configured modifier.
+            assert!(map
+                .lookup_mouse(
+                    release,
+                    MouseEventTriggerMods {
+                        mouse_reporting: true,
+                        ..ctrl
+                    }
+                )
+                .is_none());
+        }
     }
 }

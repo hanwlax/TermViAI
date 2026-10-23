@@ -1,5 +1,46 @@
 # TermViAI UI 验证
 
+
+## 2026-10-23 Ctrl + 单击打开终端链接
+
+TermViAI 默认鼠标绑定中，普通左键、Shift 左键和 Alt+Shift 左键释放只完成文本选择，不再在空选区时打开链接；Ctrl 左键按下建立新选区，拖动扩展选区，释放后有选区则复制、无选区才打开链接。覆盖自动识别 URL 和 OSC 超链接。手形链接光标要求 Ctrl；原有显式自定义绑定、禁用默认绑定、非 TermViAI UI 及鼠标报告模式保留原语义。
+
+Windows GUI 140 项测试通过，新增真实 InputMap 查找回归覆盖主/备用屏幕、各选择修饰键、Ctrl 按下/拖动/释放、鼠标报告模式。试用包为 `releases/ctrl-click-links-20261023.zip`，包含此前主题、线条及广播顺序修复。浏览器真实拉起仍需原生人工验收。
+
+## 2026-10-23 广播成员按屏幕顺序排列
+
+截图中的四路终端显示为 209 / 212（上排）、216 / 217（下排），底栏此前跟随分屏树逐列遍历，得到 209、216、212、217。绘制前按实际 `(top, left)` 坐标排序，底栏现在为 209、212、216、217；每帧使用最新布局，拖动重排后同步更新。标签与点击目标使用同一排序后的 pane 列表，保持成员身份；不修改 Mux 拓扑或广播路由顺序。
+
+Windows GUI 原有 139 项回归测试通过。修正版试用包为 `releases/broadcast-order-20261023.zip`，包含上一轮线条与图标修正；真实原生拖动后的视觉仍待试用验收。
+
+## 2026-10-23 主题试用版截图对齐修正
+
+用户截图显示 pane 外框与 header 不对齐、横向分屏和广播条有多层线、Tab 三点过细。根因是 frame 已针对字符宽高补偿分隔区域，但 header 仍使用原始字符网格坐标；每个 pane 单独描边，叠加标题激活线与底栏额外分隔线。
+
+header 改为锚定 frame，标题视觉高度不超过 35 px，保留独立的实际内容起点用于动画裁切；PTY 网格和输入坐标未改动。工作区只画一个整体圆角外框，内部共享 1 px 分隔线；标题使用 Terminal 图标。广播条与紧凑状态栏统一画布背景，取消重复横线和成员常驻底色。More 图标圆点直径从 2 增至 4 个矢量单位；Tab 菜单对齐标签左侧，使用卡片背景和细边框。
+
+Windows GUI 139 项测试通过；新增回归覆盖 100% / 125% / 150% / 200% DPI、不同字格宽高下 header/frame 对齐、内容边界、四分屏单线和单终端无内部线。原生截图对照已人工读取；修改后的 Windows 窗口视觉仍需用户试用验收。
+
+试用包 `releases/themes-chrome-alignment-20261023.zip`，构建日志和校验记录在同级 `verify-themes-chrome-alignment-20261023/`，保留 beta.5 版本字符串。
+
+## 2026-10-23 三套主题与紧凑终端工作区
+
+按照已确认的 terminal-space UX 接入 Ink / Navy / Light 三套语义配色，覆盖所有原生库页面、表单、菜单、确认界面与终端默认色/ANSI 16 色。Settings 加入主题缩略卡片：窗口内预览、保存到现有 settings.json、取消恢复；保存通知其他窗口，其他窗口未提交的预览保持独立。缺失/未知主题回退 Ink，不覆盖损坏文件，保留其他字段与显式终端调色板覆盖。
+
+广播启动时默认收起为 34 px 状态栏；展开增加 52 px 成员条，Select all / Clear all、单成员开关和窄宽度翻页。无独立暂停开关，灰色成员被选中时只启用该成员，不恢复暂停前的其他目标。单终端显示连接摘要，不占用展开条高度。Tab 新增 ⋯ 菜单，提供重命名、保存工作区、按需重连离线成员、关闭；离线时保留广播与独立重连按钮。侧栏 176 px，pane 间距 2 px，激活项顶部细线和主题化嵌套悬浮；原有 PTY/render/mouse/IME 同步及远程布局兼容路径保留。
+
+最终 Windows Release GUI **137 项测试通过**，Release 编译成功；nightly rustfmt、git diff --check 通过。新增验证覆盖主题持久化/兼容、取消预览、480–1080 高度 Settings 可达性、三主题文字对比度、OSC 与扩展色保留、单/组广播条高度以及关闭广播后的精确成员选择。保留此前 Recent connections、Keychain 编辑和删除布局修复。
+
+试用包 `releases/themes-workspace-20261023.zip`，保留 beta.5 版本字符串，不修改公开 Release。构建日志、源码摘要和包摘要保存在同级 `verify-themes-workspace-20261023/`；包内附 THEMES.md。Windows 原生视觉、DPI、鼠标/IME 与真实 SSH 验收尚未执行，步骤见 [THEMES.md](THEMES.md)。
+
+## 2026-10-23 Recent connections、New Tab 与 Keychain 编辑
+
+Recent connections 删除 X 纳入父行的几何包含悬浮逻辑，仅实际所属行保持高亮。New Tab 与邻接加号拆为 NewTab / AddTab 两个 Action；点击入口行为相同，但按下反馈和释放匹配互不联动。Identity 卡片按钮取消自动居中图标，仅保留既有左侧图标。
+
+Key 卡片按原始索引（先枚举后过滤）打开编辑页，可修改名称和路径，删除采用与 Identity 相同的二次点击确认和 Host 引用阻止策略。保存/删除重读文件，拒绝过期快照；删除不动真实私钥文件。Key 改名更新保存的 Host，旧名称保留为同一 Key 的别名供最近连接、保存工作区和其他窗口引用；历史名称不能被另一把 Key 占用。原有无别名字段的库正常加载。两个编辑页为删除按钮预留字段之外的区域，按钮底部距页脚分隔线 18 px，不再交叠。
+
+Windows GUI 131 项测试通过（新增 3 项，扩展既有 tab 测试），含旧引用解析、更改路径、名字冲突、过期编辑/删除、引用阻止、私钥文件保留和 400–900 逻辑像素高度的布局。Release 构建成功，rustfmt 与 diff 检查通过，两份修改的 Rust 文件与 Windows 副本逐字节一致。独立试用包 `releases/keychain-interaction-20261023.zip` 的 ZIP CRC、逐文件哈希与 x64 PE 校验通过；版本仍为 beta.5，未更新已发布附件。构建证据保存在同级 `keychain-interaction-20261023-verification`。原生鼠标反馈、DPI 视觉和真实 SSH 仍待试用确认。
+
 ## 2026-10-23 tab 与卡片内部按钮悬浮
 
 旧逻辑仅按单一 Action 相等高亮，进入子按钮就让父容器淡出；New Tab 页签和加号又共用 Action，造成跨控件联动。动画缓存改为 Action 加实际控件矩形，使用当前指针、有效顶层命中和几何包含关系计算父子悬浮。Tab 的关闭/广播/重连、New Tab 的关闭、Group 与 Host 卡片的菜单保留父容器高亮；其他同 ID 控件不继承。只有实际命中的图标高亮，嵌套菜单/广播/重连使用 #5a5c76 的独立悬浮面；关闭 X 保持透明底色和红色悬浮。点击分发、拖动及广播状态未改变。
@@ -220,3 +261,7 @@ Computer Use 对该应用返回 `product policy blocks this app`，没有绕过�
 - [修改前文件备份](/mnt/c/Users/h00893113/Documents/Codex/2026-09-08/outputs/termviai-drawer/before.tar.gz)。
 
 首版 UI 的历史构建结果、原生窗口响应检查及旧产物记录保留在 [首版证据目录](/mnt/c/Users/h00893113/Documents/Codex/2026-09-08/outputs/termviai-ui/REPORT.md)。本轮不沿用旧产物的运行检查作为验收依据。
+
+## 2026-10-23 beta.6 发布验证
+
+Windows 原生 SSH 19、window 5、终端核心 54、mux 42、广播 12、GUI 140，共 272 项通过，Release 编译成功。CLI/PE 版本为 beta.6，数值版本 0.1.0.6，10 个嵌入图标与源文件一致；557 个构建输入核对通过。归档内容、校验值、审查范围与人工验收边界见 [beta.6 验证记录](RELEASE_V0.1.0_BETA.6_VALIDATION.md)。历史试用记录保留，不代表正式版本字符串。

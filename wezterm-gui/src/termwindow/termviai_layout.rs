@@ -19,9 +19,9 @@ const HEADER_HEIGHT: f32 = 32.0;
 /// A single visual gutter in logical pixels. Mux separators occupy one cell,
 /// but a terminal cell is taller than it is wide; drawing that cell verbatim
 /// made horizontal gaps much larger than vertical ones.
-const PANE_GUTTER: f32 = 12.0;
-pub(super) const BROADCAST_TRAY_HEIGHT: f32 = 76.0;
-pub(super) const BROADCAST_SURFACE_TOP_INSET: f32 = 8.0;
+const PANE_GUTTER: f32 = 1.0;
+pub(super) const BROADCAST_STATUS_HEIGHT: f32 = 34.0;
+pub(super) const BROADCAST_TRAY_HEIGHT: f32 = 52.0;
 /// Breathing room between the terminal grid and its pane frame. Keeping this
 /// independent from the cell aspect ratio makes all four edges feel balanced.
 const PANE_CONTENT_PADDING: f32 = 10.0;
@@ -79,10 +79,10 @@ impl TermviaiLayout {
                         from: header.frame,
                         target: header.frame,
                         displayed: header.frame,
-                        header_height: header.rect.h,
+                        header_height: header.reserved_header_height,
                         motion: Tween::new(1.),
                     });
-            motion.header_height = header.rect.h;
+            motion.header_height = header.reserved_header_height;
             motion.update(header.frame, animate, now);
         }
     }
@@ -115,6 +115,55 @@ pub(super) struct PaneHeader {
     pub is_active: bool,
     pub rect: Rect,
     pub frame: Rect,
+    reserved_header_height: f32,
+}
+
+/// Chrome shares the visual pane frame, not the underlying cell-grid bounds.
+/// Keep the terminal content origin unchanged; fractional rows remain padding.
+fn pane_header_rect(frame: Rect, content_top: f32) -> Rect {
+    Rect {
+        x: frame.x,
+        y: frame.y,
+        w: frame.w,
+        h: 35_f32.min((content_top - frame.y).max(0.)).min(frame.h),
+    }
+}
+
+pub(super) fn workspace_outline(headers: &[PaneHeader]) -> Option<Rect> {
+    let first = headers.first()?.frame;
+    Some(headers.iter().skip(1).fold(first, |bounds, header| {
+        let r = header.frame;
+        let x = bounds.x.min(r.x);
+        let y = bounds.y.min(r.y);
+        Rect {
+            x,
+            y,
+            w: (bounds.x + bounds.w).max(r.x + r.w) - x,
+            h: (bounds.y + bounds.h).max(r.y + r.h) - y,
+        }
+    }))
+}
+
+/// One separator per shared edge; individual panes have no enclosing outlines.
+pub(super) fn pane_dividers(frame: Rect, outer: Rect) -> Vec<Rect> {
+    let mut lines = vec![];
+    if frame.x + frame.w < outer.x + outer.w - 0.1 {
+        lines.push(Rect {
+            x: frame.x + frame.w,
+            y: frame.y,
+            w: PANE_GUTTER,
+            h: (frame.h + PANE_GUTTER).min(outer.y + outer.h - frame.y),
+        });
+    }
+    if frame.y + frame.h < outer.y + outer.h - 0.1 {
+        lines.push(Rect {
+            x: frame.x,
+            y: frame.y + frame.h,
+            w: (frame.w + PANE_GUTTER).min(outer.x + outer.w - frame.x),
+            h: PANE_GUTTER,
+        });
+    }
+    lines
 }
 
 fn header_rows(dpi: f32, cell_height: usize) -> usize {
@@ -129,8 +178,10 @@ fn content_inset(rows: usize, requested: usize) -> usize {
 /// The PTY remains cell-aligned; only its surrounding frame absorbs the
 /// otherwise variable partial-row remainder at the bottom of the window.
 fn workspace_frame_bottom(canvas_bottom: f32, tray_progress: f32) -> f32 {
-    let expanded_shift = BROADCAST_TRAY_HEIGHT - BROADCAST_SURFACE_TOP_INSET;
-    canvas_bottom - PANE_GUTTER - expanded_shift * tray_progress.clamp(0., 1.)
+    canvas_bottom
+        - BROADCAST_STATUS_HEIGHT
+        - PANE_GUTTER
+        - BROADCAST_TRAY_HEIGHT * tray_progress.clamp(0., 1.)
 }
 
 fn pane_frame(
@@ -204,6 +255,9 @@ impl TermWindow {
     /// Unchanged geometry never triggers a PTY resize.
     pub(super) fn termviai_sync_terminal_layout(&mut self) {
         let mux = Mux::get();
+        self.termviai_ui.tray_grouped = mux
+            .get_active_tab_for_window(self.mux_window_id)
+            .is_some_and(|tab| tab.iter_panes_ignoring_zoom().len() > 1);
         let tabs = mux
             .get_window(self.mux_window_id)
             .map(|window| window.iter_tabs().cloned().collect::<Vec<_>>())
@@ -386,7 +440,8 @@ impl TermWindow {
             - border.top.get() as f32
             - border.bottom.get() as f32)
             / scale;
-        let tray_progress = self.termviai_ui.broadcast_tray_height() / BROADCAST_TRAY_HEIGHT;
+        let tray_progress = (self.termviai_ui.broadcast_tray_height() - BROADCAST_STATUS_HEIGHT)
+            / BROADCAST_TRAY_HEIGHT;
         let outer_bottom = workspace_frame_bottom(canvas_bottom, tray_progress);
         let origin_x = padding_left + border.left.get() as f32;
         let origin_y = tab_height + padding_top;
@@ -411,18 +466,12 @@ impl TermWindow {
                     if pane.top + pane.height >= tab_dimensions.rows {
                         frame.h = (outer_bottom - frame.y).max(1.);
                     }
+                    let content_top = (origin_y + (pane.top + inset) as f32 * cell_h) / scale;
                     PaneHeader {
                         pane_id: pane.pane.pane_id(),
                         is_active: pane.is_active,
-                        rect: Rect {
-                            x: (padding_left
-                                + border.left.get() as f32
-                                + pane.left as f32 * cell_w)
-                                / scale,
-                            y: (tab_height + padding_top + pane.top as f32 * cell_h) / scale,
-                            w: pane.width as f32 * cell_w / scale,
-                            h: inset as f32 * cell_h / scale,
-                        },
+                        rect: pane_header_rect(frame, content_top),
+                        reserved_header_height: (content_top - frame.y).max(0.),
                         frame,
                     }
                 })
@@ -562,13 +611,111 @@ mod tests {
     }
 
     #[test]
+    fn header_chrome_tracks_visual_edges_at_every_grid_scale() {
+        for scale in [1., 1.25, 1.5, 2.] {
+            for (cw, ch) in [(8., 17.), (10., 20.), (15., 28.)] {
+                for (left, top, width, height) in [
+                    (0, 0, 49, 19),
+                    (50, 0, 50, 19),
+                    (0, 20, 49, 20),
+                    (50, 20, 50, 20),
+                ] {
+                    let frame = pane_frame(
+                        left,
+                        top,
+                        width,
+                        height,
+                        100,
+                        40,
+                        184. * scale,
+                        60. * scale,
+                        cw * scale,
+                        ch * scale,
+                        scale,
+                    );
+                    let inset = header_rows(96. * scale, (ch * scale) as usize);
+                    let content_top = 60. + (top + inset) as f32 * ch;
+                    let rect = pane_header_rect(frame, content_top);
+                    assert_eq!(rect.x, frame.x);
+                    assert_eq!(rect.y, frame.y);
+                    assert_eq!(rect.w, frame.w);
+                    assert!(rect.h <= 35.);
+                    assert!(rect.y + rect.h <= content_top);
+                    assert!(rect.y + rect.h <= frame.y + frame.h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_grid_draws_one_divider_instead_of_two_pane_outlines() {
+        for scale in [1., 1.25, 1.5, 2.] {
+            let panes = [
+                (0, 0, 49, 19),
+                (50, 0, 50, 19),
+                (0, 20, 49, 20),
+                (50, 20, 50, 20),
+            ];
+            let headers: Vec<_> = panes
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(id, (left, top, width, height))| {
+                    let frame = pane_frame(
+                        left,
+                        top,
+                        width,
+                        height,
+                        100,
+                        40,
+                        184. * scale,
+                        60. * scale,
+                        10. * scale,
+                        20. * scale,
+                        scale,
+                    );
+                    PaneHeader {
+                        pane_id: id,
+                        is_active: id == 0,
+                        rect: pane_header_rect(frame, frame.y + 40.),
+                        reserved_header_height: 40.,
+                        frame,
+                    }
+                })
+                .collect();
+            let outer = workspace_outline(&headers).unwrap();
+            let lines: Vec<_> = headers
+                .iter()
+                .flat_map(|h| pane_dividers(h.frame, outer))
+                .collect();
+            assert_eq!(lines.len(), 4);
+            for line in lines {
+                assert!(line.w == 1. || line.h == 1.);
+                assert!(line.x >= outer.x && line.y >= outer.y);
+                assert!(line.x + line.w <= outer.x + outer.w);
+                assert!(line.y + line.h <= outer.y + outer.h);
+            }
+            let top_left = headers[0].frame;
+            let top_right = headers[1].frame;
+            let bottom_left = headers[2].frame;
+            assert_eq!(top_right.x - (top_left.x + top_left.w), 1.);
+            assert_eq!(bottom_left.y - (top_left.y + top_left.h), 1.);
+            // A one-pane workspace has only the surrounding grid border.
+            assert!(pane_dividers(outer, outer).is_empty());
+        }
+    }
+
+    #[test]
     fn workspace_bottom_gutter_matches_the_broadcast_surface() {
         let canvas_bottom = 1000.;
         let collapsed_bottom = workspace_frame_bottom(canvas_bottom, 0.);
-        assert_eq!(canvas_bottom - collapsed_bottom, PANE_GUTTER);
+        assert_eq!(
+            canvas_bottom - collapsed_bottom,
+            BROADCAST_STATUS_HEIGHT + PANE_GUTTER
+        );
 
         let expanded_bottom = workspace_frame_bottom(canvas_bottom, 1.);
-        let surface_top = canvas_bottom - BROADCAST_TRAY_HEIGHT + BROADCAST_SURFACE_TOP_INSET;
+        let surface_top = canvas_bottom - BROADCAST_STATUS_HEIGHT - BROADCAST_TRAY_HEIGHT;
         assert_eq!(surface_top - expanded_bottom, PANE_GUTTER);
     }
 }

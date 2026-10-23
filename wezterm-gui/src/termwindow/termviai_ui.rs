@@ -1,10 +1,13 @@
 //! Native TermViAI application chrome and local SSH library.
 use super::box_model::*;
 use super::render::corners::*;
-use super::termviai_broadcast::{group_broadcasting, pane_broadcasting};
+use super::termviai_broadcast::{group_broadcasting, pane_broadcasting, toggle_participant};
 use super::termviai_icons::Icon;
-use super::termviai_layout::{BROADCAST_SURFACE_TOP_INSET, BROADCAST_TRAY_HEIGHT};
+use super::termviai_layout::{
+    pane_dividers, workspace_outline, BROADCAST_STATUS_HEIGHT, BROADCAST_TRAY_HEIGHT,
+};
 use super::termviai_motion::{frame_interval, Tween};
+use super::termviai_theme::Theme;
 use super::termviai_workspace::WorkspaceUi;
 use super::{TermWindow, TermWindowNotif};
 use crate::hosts::{
@@ -35,7 +38,7 @@ const SIGNAL_BG: &str = "#414256";
 const ICON_HOVER_BG: &str = "#5a5c76";
 const SIGNAL_INK: &str = "#b5a2d8";
 const RECONNECT: &str = "#89b4fa";
-const SIDEBAR_WIDTH: f32 = 220.;
+const SIDEBAR_WIDTH: f32 = 176.;
 const MIN_WINDOW_WIDTH: usize = 720;
 const MIN_WINDOW_HEIGHT: usize = 480;
 
@@ -64,7 +67,10 @@ enum Action {
     Hosts,
     Keys,
     Settings,
+    Theme(Theme),
+    TabMenu(usize),
     NewTab,
+    AddTab,
     CloseNewTab,
     TabBroadcast(usize),
     ToggleTray,
@@ -91,6 +97,8 @@ enum Action {
     AcceptHostPicker,
     CancelHostPicker,
     AddKey,
+    EditKey(usize),
+    DeleteKey,
     AddIdentity,
     EditIdentity(usize),
     DeleteIdentity,
@@ -120,7 +128,6 @@ enum Action {
     Close,
     Drag,
     Drawer,
-    Broadcast,
     BroadcastAll,
     BroadcastNone,
     Member(usize),
@@ -289,6 +296,9 @@ fn text_positions(
 }
 #[derive(Default)]
 struct AuthForm {
+    theme: Option<Theme>,
+    theme_focus: bool,
+    original_key: Option<KeyFile>,
     editing_identity: bool,
     original_identity: Option<Identity>,
     selected_identity: String,
@@ -323,6 +333,20 @@ struct DrawerLayout {
     footer: f32,
 }
 impl DrawerLayout {
+    fn delete_y(&self) -> f32 {
+        self.height - 148.
+    }
+    fn body_height(&self, form: &Form) -> f32 {
+        if form.has_delete() {
+            (self.delete_y() - 12. - 148.).max(78.)
+        } else if form.settings {
+            (self.footer + 8. - 148.).max(70.)
+        } else if form.is_host() {
+            (self.footer + 32. - 148.).max(70.)
+        } else {
+            self.rows as f32 * 70.
+        }
+    }
     fn new(width: f32, height: f32) -> Self {
         let drawer_width = 400_f32.min(width.max(0.));
         let footer = (height - 120.).max(210.);
@@ -362,6 +386,9 @@ impl DrawerLayout {
     }
 }
 impl Form {
+    fn has_delete(&self) -> bool {
+        self.auth.original_key.is_some() || self.auth.original_identity.is_some()
+    }
     fn is_host(&self) -> bool {
         !self.key
             && !self.settings
@@ -399,6 +426,9 @@ impl Form {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FormRow {
+    ThemeChoice(Theme),
+    SettingsSection(bool),
+    ThemeHint,
     Field(usize),
     Endpoint,
     AuthMode,
@@ -414,6 +444,9 @@ enum FormRow {
 impl FormRow {
     fn height(&self) -> f32 {
         match self {
+            Self::ThemeChoice(_) => 60.,
+            Self::SettingsSection(_) => 32.,
+            Self::ThemeHint => 38.,
             Self::Field(_) | Self::Endpoint | Self::Picker => 78.,
             Self::AuthMode => 100.,
             Self::KeySource => 62.,
@@ -470,6 +503,17 @@ impl Form {
                 .is_some_and(|h| !h.own_credential_ref().is_empty())
     }
     fn drawer_rows(&self, _store: &HostStore) -> Vec<FormRow> {
+        if self.settings {
+            let mut rows = vec![FormRow::SettingsSection(true)];
+            rows.extend(Theme::ALL.map(FormRow::ThemeChoice));
+            rows.extend([
+                FormRow::ThemeHint,
+                FormRow::SettingsSection(false),
+                FormRow::Field(0),
+                FormRow::Field(1),
+            ]);
+            return rows;
+        }
         if !self.is_host() {
             return (0..self.fields.len()).map(FormRow::Field).collect();
         }
@@ -497,7 +541,7 @@ impl Form {
         rows
     }
     fn visible_drawer_rows(&mut self, rows: &[FormRow], height: f32) -> std::ops::Range<usize> {
-        if !self.is_host() {
+        if !self.is_host() && !self.settings {
             return self.visible_rows((height / 78.).floor().max(1.) as usize);
         }
         let mut last_start = rows.len();
@@ -2132,11 +2176,15 @@ impl Tile {
                 Some(Action::Tab(parent)),
                 Action::CloseTab(child)
                 | Action::TabBroadcast(child)
-                | Action::ReconnectGroup(child),
+                | Action::ReconnectGroup(child)
+                | Action::TabMenu(child),
             ) => parent == child,
             (Some(Action::NewTab), Action::CloseNewTab) => !self.text.is_empty(),
             (Some(Action::Group(parent)), Action::GroupMenu(child)) => parent == child,
             (Some(Action::Connect(parent)), Action::HostMenu(child)) => parent == child,
+            (Some(Action::ConnectRecent(parent)), Action::RemoveRecent(child, _)) => {
+                parent == child
+            }
             _ => false,
         }
     }
@@ -2196,14 +2244,20 @@ pub struct TermviaiUi {
     pub(super) new_tab_open: bool,
     tab_menu: Option<(usize, f32, f32)>,
     tray_expanded: bool,
+    pub(super) tray_grouped: bool,
     tray_motion: Tween,
-    broadcast_motion: Tween,
-    broadcast_motion_tab: Option<usize>,
+    broadcast_tab: Option<usize>,
     notice: Option<(String, Instant)>,
     pane_scroll: usize,
     confirm_keys: CloseKeyLatch,
 }
 impl TermviaiUi {
+    pub(super) fn preview_theme(&self) -> Option<Theme> {
+        self.form
+            .as_ref()
+            .filter(|f| f.settings)
+            .and_then(|f| f.auth.theme)
+    }
     pub fn new() -> Self {
         let (store, error) = match HostStore::load() {
             Ok(s) => (s, String::new()),
@@ -2250,10 +2304,10 @@ impl TermviaiUi {
             workspace: WorkspaceUi::default(),
             new_tab_open: false,
             tab_menu: None,
-            tray_expanded: true,
-            tray_motion: Tween::new(1.),
-            broadcast_motion: Tween::new(0.),
-            broadcast_motion_tab: None,
+            tray_expanded: false,
+            tray_grouped: false,
+            tray_motion: Tween::new(0.),
+            broadcast_tab: None,
             notice: None,
             pane_scroll: 0,
             confirm_keys: CloseKeyLatch::default(),
@@ -2275,7 +2329,12 @@ impl TermviaiUi {
     }
     pub(super) fn broadcast_tray_height(&self) -> f32 {
         if self.page == Page::Terminal {
-            BROADCAST_TRAY_HEIGHT * self.tray_motion.value(Instant::now())
+            BROADCAST_STATUS_HEIGHT
+                + if self.tray_grouped {
+                    BROADCAST_TRAY_HEIGHT * self.tray_motion.value(Instant::now())
+                } else {
+                    0.
+                }
         } else {
             0.
         }
@@ -2317,10 +2376,14 @@ impl TermviaiUi {
             rename_tab: None,
             settings: true,
             first_row: 0,
-            reveal_focus: true,
+            reveal_focus: false,
             new_group_parent: None,
             host_group_target: None,
-            auth: AuthForm::default(),
+            auth: AuthForm {
+                theme: Some(Theme::default()),
+                theme_focus: true,
+                ..AuthForm::default()
+            },
         });
         self.form.as_mut().unwrap().fields[0].select_all();
         self.drawer_motion
@@ -2362,7 +2425,10 @@ impl TermviaiUi {
             return None;
         }
         if let Some(f) = &mut self.form {
-            if f.auth.picker_open || !f.focusable_fields().contains(&f.focus) {
+            if f.auth.picker_open
+                || (f.settings && f.auth.theme_focus)
+                || !f.focusable_fields().contains(&f.focus)
+            {
                 return None;
             }
             f.reveal_focus = true;
@@ -2578,7 +2644,13 @@ impl TermviaiUi {
             }
             if let Some(host) = &form.original {
                 form.auth.selected_identity = host.identity_id.clone();
-                form.auth.selected_key = host.key_label.clone();
+                form.auth.selected_key = self
+                    .store
+                    .keys
+                    .iter()
+                    .find(|key| key.matches_label(&host.key_label))
+                    .map(|key| key.label.clone())
+                    .unwrap_or_else(|| host.key_label.clone());
                 form.auth.mode = host.authentication_mode();
                 form.auth.keychain_key = !host.key_label.is_empty();
             }
@@ -2618,6 +2690,31 @@ impl TermviaiUi {
         self.host_menu = None;
         self.group_menu = None;
         self.error.clear();
+    }
+
+    fn open_key(&mut self, key: Option<KeyFile>) {
+        self.open_form(true, None);
+        if let Some(key) = key {
+            let form = self.form.as_mut().unwrap();
+            form.fields = vec![Input::new(key.label.clone()), Input::new(key.path.clone())];
+            form.auth.original_key = Some(key);
+        }
+    }
+
+    fn delete_key_at(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        let original = self
+            .form
+            .as_ref()
+            .and_then(|f| f.auth.original_key.as_ref())
+            .context("No key open")?;
+        let mut store = HostStore::load_from(path)?;
+        store.remove_key(original)?;
+        store.save_to(path)?;
+        self.store = store;
+        self.close_form();
+        self.error.clear();
+        self.generation += 1;
+        Ok(())
     }
 
     fn open_identity(&mut self, identity: Option<Identity>) {
@@ -2711,21 +2808,11 @@ impl TermviaiUi {
                 pending_password = Some((id, f.fields[2].value.clone(), true));
             }
         } else if f.key {
-            let label = f.fields[0].value.trim();
-            let path = f.fields[1].value.trim();
-            anyhow::ensure!(!label.is_empty(), "Enter a key name.");
-            anyhow::ensure!(
-                std::path::Path::new(path).is_file(),
-                "Enter an existing private key file path."
-            );
-            anyhow::ensure!(
-                !store.keys.iter().any(|k| k.label == label),
-                "A key with this name already exists."
-            );
-            store.keys.push(KeyFile {
-                label: label.into(),
-                path: path.into(),
-            });
+            store.save_key(
+                f.auth.original_key.as_ref(),
+                &f.fields[0].value,
+                &f.fields[1].value,
+            )?;
         } else {
             let v: Vec<String> = f.fields.iter().map(|v| v.value.clone()).collect();
             let mut host = Host {
@@ -2905,8 +2992,8 @@ fn button(
         Action::Keys | Action::AddKey | Action::UseKey(_) => Some(Icon::Key),
         Action::Settings => Some(Icon::Settings),
 
-        Action::EditIdentity(_) | Action::UseIdentity(_) => Some(Icon::Identity),
-        Action::NewTab if text.is_empty() => Some(Icon::Plus),
+        Action::UseIdentity(_) => Some(Icon::Identity),
+        Action::AddTab => Some(Icon::Plus),
         Action::NewTab | Action::Tab(_) | Action::FocusPane(_) => Some(Icon::Terminal),
         Action::AddHost | Action::AddHostMenu | Action::NewGroupHost | Action::AddIdentity => {
             Some(Icon::Plus)
@@ -2920,18 +3007,20 @@ fn button(
         Action::NextTab | Action::NextGroup => Some(Icon::ChevronRight),
         Action::Minimize => Some(Icon::Minimize),
         Action::Maximize => Some(Icon::Maximize),
-        Action::HostMenu(_) | Action::GroupMenu(_) => Some(Icon::More),
+        Action::HostMenu(_) | Action::GroupMenu(_) | Action::TabMenu(_) => Some(Icon::More),
         Action::ExistingGroupHosts => Some(Icon::ListPlus),
         Action::CancelHostPicker => Some(Icon::Close),
         Action::PickHost(_) => Some(Icon::Checkbox),
         Action::AcceptHostPicker => Some(Icon::Check),
         Action::AddGroup => Some(Icon::FolderPlus),
-        Action::DeleteHost | Action::DeleteGroup => Some(Icon::Trash),
+        Action::DeleteHost | Action::DeleteGroup | Action::DeleteKey | Action::DeleteIdentity => {
+            Some(Icon::Trash)
+        }
         Action::Search => Some(Icon::Search),
         Action::QuickConnect => Some(Icon::ArrowRight),
         Action::Save => Some(Icon::Check),
         Action::Cancel if text.is_empty() => Some(Icon::ArrowRight),
-        Action::Broadcast | Action::TabBroadcast(_) => Some(Icon::Broadcast),
+        Action::TabBroadcast(_) => Some(Icon::Broadcast),
         Action::ReconnectPane(_) | Action::ReconnectGroup(_) => Some(Icon::Refresh),
         Action::ToggleTray => Some(Icon::ChevronDown),
         Action::RenameTab(_) | Action::EditMenuHost => Some(Icon::Edit),
@@ -3023,45 +3112,20 @@ fn pane_header_controls(x: f32, width: f32, grouped: bool, has_error: bool) -> P
     }
 }
 
-/// Lay out the three toolbar clusters together so none can overlap at a
-/// responsive breakpoint. The switch and collapse control always have priority.
+/// The expanded member strip reserves its right edge for select-all / clear.
 struct TrayLayout {
-    title_width: f32,
     members_x: f32,
     members_width: f32,
-    selection_x: Option<f32>,
-    switch_x: f32,
-    switch_width: f32,
-    collapse_x: f32,
+    selection_x: f32,
 }
-
 impl TrayLayout {
     fn new(width: f32, content_left: f32) -> Self {
-        let collapse_x = width - 48.;
-        let switch_width = if width >= 560. { 96. } else { 40. };
-        let switch_x = collapse_x - 8. - switch_width;
-        let selection_x = (width >= 900.).then_some(switch_x - 16. - 108.);
-        let right = selection_x.unwrap_or(switch_x) - 16.;
-        let content_start = content_left + 24.;
-        let available = (right - content_start).max(0.);
-        let title_width = if available >= 340. {
-            166.
-        } else if available >= 286. {
-            132.
-        } else if available >= 190. {
-            36.
-        } else {
-            available.min(166.)
-        };
-        let members_x = content_start + title_width + 18.;
+        let members_x = content_left + 12.;
+        let selection_x = (width - 140.).max(members_x);
         Self {
-            title_width,
             members_x,
-            members_width: (right - members_x).max(0.),
+            members_width: (selection_x - 12. - members_x).max(0.),
             selection_x,
-            switch_x,
-            switch_width,
-            collapse_x,
         }
     }
 }
@@ -3668,7 +3732,7 @@ impl TermWindow {
                 .trim()
                 .parse()
                 .context("Enter the SSH keepalive interval in seconds.")?;
-            self.termviai_set_preferences(size, keepalive)?;
+            self.termviai_set_preferences(size, keepalive, self.termviai_theme())?;
             self.termviai_ui.close_form();
             return Ok(());
         }
@@ -3764,7 +3828,7 @@ impl TermWindow {
                 self.termviai_ui.search_focus = true;
                 self.termviai_ui.reload();
             }
-            Action::NewTab => {
+            Action::NewTab | Action::AddTab => {
                 self.termviai_ui.discard_form();
                 self.termviai_ui.new_tab_open = true;
                 self.termviai_ui.page = Page::NewTab;
@@ -3882,8 +3946,28 @@ impl TermWindow {
             Action::Settings => {
                 let size = self.termviai_global_font_size();
                 let keepalive = self.termviai_ssh_keepalive_interval();
+                let theme = self.termviai_fonts.theme();
                 self.termviai_ui.open_settings(size, keepalive);
+                self.termviai_ui.form.as_mut().unwrap().auth.theme = Some(theme);
             }
+            Action::Theme(theme) => {
+                if let Some(form) = self.termviai_ui.form.as_mut().filter(|f| f.settings) {
+                    form.auth.theme = Some(theme);
+                    form.auth.theme_focus = true;
+                    form.reveal_focus = false;
+                }
+            }
+            Action::TabMenu(id) => {
+                if let Some(hit) = self
+                    .termviai_ui
+                    .hits
+                    .iter()
+                    .find(|h| h.action == Action::Tab(id))
+                {
+                    self.termviai_ui.tab_menu = Some((id, hit.x, hit.y + hit.h + 7.));
+                }
+            }
+
             Action::AddHost => self.termviai_ui.open_form(false, None),
             Action::AddHostMenu => {
                 let group = self.termviai_ui.group.clone();
@@ -3935,7 +4019,25 @@ impl TermWindow {
                 self.termviai_ui.error.clear();
             }
             Action::AddGroup => self.termviai_ui.open_group(),
-            Action::AddKey => self.termviai_ui.open_form(true, None),
+            Action::AddKey => self.termviai_ui.open_key(None),
+            Action::EditKey(index) => {
+                let key = self
+                    .termviai_ui
+                    .store
+                    .keys
+                    .get(index)
+                    .context("Key no longer exists")?
+                    .clone();
+                self.termviai_ui.open_key(Some(key));
+            }
+            Action::DeleteKey => {
+                let form = self.termviai_ui.form.as_mut().context("No key open")?;
+                if !form.auth.confirm_delete {
+                    form.auth.confirm_delete = true;
+                } else {
+                    self.termviai_ui.delete_key_at(&HostStore::path())?;
+                }
+            }
             Action::AddIdentity => self.termviai_ui.open_identity(None),
             Action::EditIdentity(index) => {
                 let identity = self
@@ -4040,6 +4142,7 @@ impl TermWindow {
             }
             Action::Field(i) => {
                 if let Some(f) = &mut self.termviai_ui.form {
+                    f.auth.theme_focus = false;
                     f.focus = i;
                     f.reveal_focus = true;
                 }
@@ -4108,8 +4211,7 @@ impl TermWindow {
                     self.close_requested(&w);
                 }
             }
-            Action::Broadcast
-            | Action::BroadcastAll
+            Action::BroadcastAll
             | Action::BroadcastNone
             | Action::Member(_)
             | Action::PaneBroadcast(_) => {
@@ -4120,11 +4222,13 @@ impl TermWindow {
                     .context("No active tab")?;
                 if let Some(state) = self.termviai_broadcast.tabs.get_mut(&tab.tab_id()) {
                     match action {
-                        Action::Broadcast => state.toggle_enabled(),
-                        Action::BroadcastAll => state.select_all(),
+                        Action::BroadcastAll => {
+                            state.select_all();
+                            state.set_enabled(true);
+                        }
                         Action::BroadcastNone => state.select_none(),
                         Action::Member(id) | Action::PaneBroadcast(id) => {
-                            state.toggle_member(id)?
+                            toggle_participant(state, id)?;
                         }
                         _ => unreachable!(),
                     }
@@ -4643,6 +4747,42 @@ impl TermWindow {
         if !event.key_is_down || self.termviai_ui.closing_form.is_some() {
             return true;
         }
+        if let Some(form) = self.termviai_ui.form.as_mut().filter(|f| f.settings) {
+            if form.auth.theme_focus
+                && matches!(
+                    event.key,
+                    KeyCode::LeftArrow
+                        | KeyCode::RightArrow
+                        | KeyCode::UpArrow
+                        | KeyCode::DownArrow
+                )
+            {
+                let current = form.auth.theme.unwrap_or_default() as usize;
+                let previous = matches!(event.key, KeyCode::LeftArrow | KeyCode::UpArrow);
+                form.auth.theme = Some(Theme::ALL[(current + if previous { 2 } else { 1 }) % 3]);
+                form.first_row = 0;
+                form.reveal_focus = false;
+                context.invalidate();
+                return true;
+            }
+            if event.key == KeyCode::Char('\t') {
+                let backwards = event.modifiers.contains(Modifiers::SHIFT);
+                if form.auth.theme_focus {
+                    form.auth.theme_focus = false;
+                    form.focus = if backwards { 1 } else { 0 };
+                    form.reveal_focus = true;
+                } else if (backwards && form.focus == 0) || (!backwards && form.focus == 1) {
+                    form.auth.theme_focus = true;
+                    form.first_row = 0;
+                    form.reveal_focus = false;
+                } else {
+                    form.focus = 1 - form.focus;
+                    form.reveal_focus = true;
+                }
+                context.invalidate();
+                return true;
+            }
+        }
         if self
             .termviai_ui
             .form
@@ -4869,6 +5009,7 @@ impl TermWindow {
             return Ok(());
         }
         let now = Instant::now();
+        let theme = self.termviai_theme();
         self.termviai_sync_sidebar_layout(now);
         let was_confirming = self.termviai_confirm.is_active();
         self.termviai_confirm.settle(now);
@@ -4893,10 +5034,13 @@ impl TermWindow {
         });
         self.termviai_sync_broadcast();
         let active_tab = Mux::get().get_active_tab_for_window(self.mux_window_id);
-        let pane_list = active_tab
+        let mut pane_list = active_tab
             .as_ref()
             .map(|tab| tab.iter_panes_ignoring_zoom())
             .unwrap_or_default();
+        // The split tree can traverse entire columns first. Present broadcast
+        // members in screen reading order, including after pane rearrangement.
+        pane_list.sort_by_key(|pane| (pane.top, pane.left));
         let disconnected_panes: HashSet<usize> = pane_list
             .iter()
             .filter_map(|positioned| {
@@ -5045,13 +5189,13 @@ impl TermWindow {
             Action::ToggleSidebar,
             &hover,
         );
-        tile(&mut tiles, 58., 9., 146., 34., "TermViAI", TOP, INK, false);
-        let available = (w - 220. - 170.).max(100.);
-        let visible = ((available - 66.) / 190.).floor().max(1.) as usize;
+        tile(&mut tiles, 58., 9., 110., 34., "TermViAI", TOP, INK, false);
+        let available = (w - SIDEBAR_WIDTH - 170.).max(100.);
+        let visible = ((available - 66.) / 240.).floor().max(1.) as usize;
         ui.tab_scroll = ui.tab_scroll.min(tabs.len().saturating_sub(visible));
-        let mut tx = 220.;
+        let mut tx = SIDEBAR_WIDTH;
         for (id, title, active, pane_count) in tabs.iter().skip(ui.tab_scroll).take(visible) {
-            let tw = ((available - 66.) / visible as f32).min(210.).max(70.);
+            let tw = ((available - 66.) / visible as f32).min(250.).max(70.);
             let label = title.clone();
             button(
                 &mut tiles,
@@ -5073,14 +5217,39 @@ impl TermWindow {
                 },
                 &hover,
             );
-            if *pane_count > 1 {
-                let reconnect = disconnected_groups.contains(id);
-                tiles.last_mut().unwrap().right_inset = 62.;
-                let t = tiles.last_mut().unwrap();
-                t.icon = (tw >= 120.).then_some(Icon::Grid);
-                if tw < 120. {
-                    t.text.clear();
-                }
+            let selected_tab = *active && (ui.page == Page::Terminal || *id == usize::MAX);
+            let reconnect = disconnected_groups.contains(id);
+            let controls = if *id == usize::MAX {
+                1
+            } else if *pane_count > 1 {
+                3 + usize::from(reconnect)
+            } else {
+                2 + usize::from(reconnect)
+            };
+            let t = tiles.last_mut().unwrap();
+            t.right_inset = controls as f32 * 30. + 6.;
+            if selected_tab {
+                t.bg = CARD;
+            }
+            t.icon = (*pane_count > 1 && tw > 160.).then_some(Icon::Grid);
+            if tw < t.right_inset + 52. {
+                t.text.clear();
+                t.icon = None;
+            }
+            if selected_tab {
+                tile(
+                    &mut tiles,
+                    tx + 10.,
+                    42.,
+                    (tw - 28.).max(1.),
+                    2.,
+                    "",
+                    ACCENT,
+                    INK,
+                    false,
+                );
+            }
+            if *id != usize::MAX {
                 button(
                     &mut tiles,
                     &mut hits,
@@ -5090,25 +5259,55 @@ impl TermWindow {
                     28.,
                     "",
                     TOP,
-                    if reconnect {
-                        Action::ReconnectGroup(*id)
-                    } else {
-                        Action::TabBroadcast(*id)
-                    },
+                    Action::TabMenu(*id),
                     &hover,
                 );
                 let t = tiles.last_mut().unwrap();
-                let broadcasting = !reconnect && group_states.get(id) == Some(&true);
                 t.transparent = true;
-                t.fg = if reconnect {
-                    RECONNECT
-                } else if broadcasting {
-                    SIGNAL_INK
-                } else {
-                    MUTED
-                };
-                // Match pane-header icons: 18 px also keeps a clear 2 px stroke at 100% DPI.
-                t.icon_size = if reconnect { 16. } else { 18. };
+                t.fg = MUTED;
+                t.icon_size = 18.;
+                t.corner_radius = 7.;
+                if *pane_count > 1 {
+                    button(
+                        &mut tiles,
+                        &mut hits,
+                        tx + tw - if reconnect { 126. } else { 96. },
+                        12.,
+                        26.,
+                        28.,
+                        "",
+                        TOP,
+                        Action::TabBroadcast(*id),
+                        &hover,
+                    );
+                    let t = tiles.last_mut().unwrap();
+                    t.transparent = true;
+                    t.fg = if group_states.get(id) == Some(&true) {
+                        SIGNAL_INK
+                    } else {
+                        MUTED
+                    };
+                    t.icon_size = 18.;
+                    t.corner_radius = 7.;
+                }
+            }
+            if reconnect && *id != usize::MAX {
+                button(
+                    &mut tiles,
+                    &mut hits,
+                    tx + tw - 96.,
+                    12.,
+                    26.,
+                    28.,
+                    "",
+                    TOP,
+                    Action::ReconnectGroup(*id),
+                    &hover,
+                );
+                let t = tiles.last_mut().unwrap();
+                t.transparent = true;
+                t.fg = RECONNECT;
+                t.icon_size = 16.;
                 t.corner_radius = 7.;
             }
             button(
@@ -5142,7 +5341,7 @@ impl TermWindow {
             32.,
             "",
             TOP,
-            Action::NewTab,
+            Action::AddTab,
             &hover,
         );
         if tabs.len() > visible {
@@ -5209,10 +5408,14 @@ impl TermWindow {
             &mut hits,
             12.,
             66.,
-            196.,
+            SIDEBAR_WIDTH - 24.,
             40.,
             "Hosts",
-            if ui.page == Page::Hosts { FIELD } else { SIDE },
+            if ui.page == Page::Hosts {
+                "#34314f"
+            } else {
+                SIDE
+            },
             Action::Hosts,
             &hover,
         );
@@ -5221,10 +5424,14 @@ impl TermWindow {
             &mut hits,
             12.,
             114.,
-            196.,
+            SIDEBAR_WIDTH - 24.,
             40.,
             "Keychain",
-            if ui.page == Page::Keys { FIELD } else { SIDE },
+            if ui.page == Page::Keys {
+                "#34314f"
+            } else {
+                SIDE
+            },
             Action::Keys,
             &hover,
         );
@@ -5233,7 +5440,7 @@ impl TermWindow {
             &mut hits,
             12.,
             162.,
-            196.,
+            SIDEBAR_WIDTH - 24.,
             40.,
             "Settings",
             SIDE,
@@ -5245,7 +5452,7 @@ impl TermWindow {
                 &mut tiles,
                 22.,
                 h - 80.,
-                180.,
+                SIDEBAR_WIDTH - 32.,
                 24.,
                 "LOCAL WORKSPACE",
                 SIDE,
@@ -5256,7 +5463,7 @@ impl TermWindow {
                 &mut tiles,
                 22.,
                 h - 52.,
-                180.,
+                SIDEBAR_WIDTH - 32.,
                 24.,
                 "SSH · stored on this device",
                 SIDE,
@@ -5265,6 +5472,14 @@ impl TermWindow {
             );
         }
         for tile in &mut tiles[sidebar_tile_start..] {
+            if matches!(tile.action, Some(Action::Hosts)) && ui.page == Page::Hosts
+                || matches!(tile.action, Some(Action::Keys)) && ui.page == Page::Keys
+                || matches!(tile.action, Some(Action::Settings))
+                    && ui.form.as_ref().is_some_and(|f| f.settings)
+            {
+                tile.bg = "#34314f";
+                tile.fg = ACCENT;
+            }
             tile.x += sidebar_shift;
         }
         for hit in &mut hits[sidebar_hit_start..] {
@@ -5284,27 +5499,15 @@ impl TermWindow {
                     true,
                 );
             }
+            let workspace_bounds = workspace_outline(&headers);
             for header in &headers {
-                let frame = header.frame;
-                tile(
-                    &mut tiles,
-                    frame.x,
-                    frame.y,
-                    frame.w,
-                    frame.h,
-                    "",
-                    if header.is_active {
-                        "#8d86d7"
-                    } else {
-                        "#3b3e52"
-                    },
-                    INK,
-                    true,
-                );
-                let t = tiles.last_mut().unwrap();
-                t.outline_width = if header.is_active { 1.5 } else { 1. };
-                t.corner_radius = 10.;
-                t.zindex = 29;
+                if let Some(outer) = workspace_bounds {
+                    for line in pane_dividers(header.frame, outer) {
+                        tile(
+                            &mut tiles, line.x, line.y, line.w, line.h, "", "#3b3e52", INK, false,
+                        );
+                    }
+                }
                 let rect = header.rect;
                 button(
                     &mut tiles,
@@ -5326,13 +5529,30 @@ impl TermWindow {
                 let has_error = pane_errors.contains_key(&header.pane_id);
                 let controls = pane_header_controls(rect.x, rect.w, grouped, has_error);
                 t.right_inset = controls.label_right_inset;
-                t.transparent = true;
-                t.fg = if header.is_active { ACCENT } else { MUTED };
-                t.icon = Some(Icon::Hosts);
+                t.bg = SIDE;
+                t.fg = INK;
+                t.icon = Some(Icon::Terminal);
+                t.icon_size = 18.;
                 t.rounded = false;
                 if rect.w < controls.label_right_inset + 52. || rect.h < 24. {
                     t.text.clear();
                     t.icon = None;
+                }
+                tile(
+                    &mut tiles,
+                    rect.x,
+                    rect.y + rect.h - 1.,
+                    rect.w,
+                    1.,
+                    "",
+                    "#3b3e52",
+                    INK,
+                    false,
+                );
+                if header.is_active {
+                    tile(
+                        &mut tiles, rect.x, rect.y, rect.w, 2., "", ACCENT, INK, false,
+                    );
                 }
                 if rect.h >= 20. && rect.w >= 76. {
                     let disconnected = disconnected_panes.contains(&header.pane_id);
@@ -5426,132 +5646,45 @@ impl TermWindow {
                     t.zindex = 34;
                 }
             }
-            let enabled = broadcast.as_ref().map(|s| s.enabled()).unwrap_or(false);
-            let target = if enabled { 1. } else { 0. };
-            if ui.broadcast_motion_tab != active_id {
-                ui.broadcast_motion_tab = active_id;
-                ui.broadcast_motion = Tween::new(target);
-                ui.pane_scroll = 0;
+            if let Some(outer) = workspace_bounds {
+                tile(
+                    &mut tiles, outer.x, outer.y, outer.w, outer.h, "", "#3b3e52", INK, true,
+                );
+                let t = tiles.last_mut().unwrap();
+                t.outline_width = 1.;
+                t.corner_radius = 5.;
+                t.zindex = 31;
             }
-            ui.broadcast_motion
-                .set_target(target, now, Duration::from_millis(160));
-            let switch_progress = ui.broadcast_motion.value(now);
-            let progress = ui.tray_motion.value(now);
-            let tray_top = h - BROADCAST_TRAY_HEIGHT * progress;
+            let progress = if ui.tray_grouped {
+                ui.tray_motion.value(now)
+            } else {
+                0.
+            };
+            let bar_top = h - BROADCAST_STATUS_HEIGHT;
+            let tray_top = bar_top - BROADCAST_TRAY_HEIGHT * progress;
             let layout = TrayLayout::new(w, content_left);
             shield_tray(&mut hits, w, h, ui.broadcast_tray_height(), content_left);
-            if progress > 0. {
-                tile(
-                    &mut tiles,
-                    content_left,
-                    tray_top,
-                    (w - content_left).max(1.),
-                    BROADCAST_TRAY_HEIGHT,
-                    "",
-                    BG,
-                    INK,
-                    false,
-                );
-                tiles.last_mut().unwrap().zindex = 31;
-                let start = tiles.len();
-                let body_x = if w - content_left < 130. {
-                    content_left
-                } else {
-                    content_left + 12.
-                };
-                let body_width = (w - body_x - 12.).max(1.);
-                // Subtle outline and inset surface keep all controls in one bar.
-                tile(
-                    &mut tiles,
-                    body_x,
-                    tray_top + 10.,
-                    body_width,
-                    58.,
-                    "",
-                    "#12131e",
-                    INK,
-                    true,
-                );
-                tiles.last_mut().unwrap().corner_radius = 14.;
-                tile(
-                    &mut tiles,
-                    body_x,
-                    tray_top + BROADCAST_SURFACE_TOP_INSET,
-                    body_width,
-                    58.,
-                    "",
-                    "#353648",
-                    INK,
-                    true,
-                );
-                tiles.last_mut().unwrap().corner_radius = 14.;
-                tile(
-                    &mut tiles,
-                    body_x + 1.,
-                    tray_top + 9.,
-                    body_width - 2.,
-                    56.,
-                    "",
-                    SIDE,
-                    INK,
-                    true,
-                );
-                tiles.last_mut().unwrap().corner_radius = 13.;
-                if layout.title_width >= 32. {
-                    tile(
-                        &mut tiles,
-                        content_left + 24.,
-                        tray_top + 22.,
-                        32.,
-                        32.,
-                        "",
-                        if enabled { "#34314f" } else { CARD },
-                        if enabled { ACCENT } else { MUTED },
-                        true,
-                    );
-                    tiles.last_mut().unwrap().icon = Some(Icon::Broadcast);
-                }
+            let start = tiles.len();
+            tile(
+                &mut tiles,
+                content_left,
+                tray_top,
+                (w - content_left).max(1.),
+                h - tray_top,
+                "",
+                BG,
+                INK,
+                false,
+            );
+            if ui.broadcast_tab != active_id {
+                ui.broadcast_tab = active_id;
+                ui.pane_scroll = 0;
+            }
+            // Controls appear only when their full height fits the animated strip.
+            // The reserved terminal area tracks the animation on every frame.
+            if progress * BROADCAST_TRAY_HEIGHT >= 40. {
                 if let Some(state) = &broadcast {
-                    if layout.title_width >= 120. {
-                        let title_text_x = content_left + 60.;
-                        tile(
-                            &mut tiles,
-                            title_text_x,
-                            tray_top + 17.,
-                            layout.title_width - 36.,
-                            22.,
-                            "Broadcast",
-                            SIDE,
-                            INK,
-                            false,
-                        );
-                        let status = if layout.title_width >= 166. {
-                            format!(
-                                "{}/{} {}",
-                                state.member_count(),
-                                state.pane_count(),
-                                if enabled { "active" } else { "selected" }
-                            )
-                        } else {
-                            format!(
-                                "{} {}",
-                                state.member_count(),
-                                if enabled { "active" } else { "selected" }
-                            )
-                        };
-                        tile(
-                            &mut tiles,
-                            title_text_x,
-                            tray_top + 38.,
-                            layout.title_width - 36.,
-                            18.,
-                            status,
-                            SIDE,
-                            MUTED,
-                            false,
-                        );
-                    }
-                    let member_labels: Vec<_> = pane_list
+                    let labels: Vec<_> = pane_list
                         .iter()
                         .map(|p| {
                             labels
@@ -5560,7 +5693,7 @@ impl TermWindow {
                                 .unwrap_or_else(|| "Terminal".into())
                         })
                         .collect();
-                    let widths: Vec<_> = member_labels
+                    let widths: Vec<_> = labels
                         .iter()
                         .map(|label| (tray_label_width(label) + 54.).clamp(68., 164.))
                         .collect();
@@ -5571,71 +5704,37 @@ impl TermWindow {
                         ui.pane_scroll,
                     );
                     ui.pane_scroll = members.start;
-                    if !members.chips.is_empty() {
-                        tile(
-                            &mut tiles,
-                            layout.members_x - 10.,
-                            tray_top + 24.,
-                            1.,
-                            28.,
-                            "",
-                            "#38394c",
-                            INK,
-                            false,
-                        );
-                    }
                     for (index, x, width) in &members.chips {
                         let id = pane_list[*index].pane.pane_id();
-                        let member = state.is_member(id);
-                        let broadcasting =
-                            !disconnected_panes.contains(&id) && pane_broadcasting(state, id);
-                        tile(
-                            &mut tiles,
-                            *x,
-                            tray_top + 22.,
-                            *width,
-                            32.,
-                            "",
-                            if broadcasting {
-                                "#4a436c"
-                            } else if member {
-                                "#414357"
-                            } else {
-                                "#343648"
-                            },
-                            INK,
-                            true,
-                        );
+                        let selected = pane_broadcasting(state, id);
                         button(
                             &mut tiles,
                             &mut hits,
-                            *x + 1.,
-                            tray_top + 23.,
-                            *width - 2.,
-                            30.,
-                            "",
-                            if broadcasting {
-                                "#302d47"
-                            } else if member {
-                                CARD
-                            } else {
-                                SIDE
-                            },
+                            *x,
+                            tray_top + 8.,
+                            *width,
+                            32.,
+                            tray_label(&labels[*index], *width - 52.),
+                            BG,
                             Action::Member(id),
                             &hover,
                         );
                         let t = tiles.last_mut().unwrap();
-                        t.corner_radius = 8.;
+                        t.text = tray_label(&labels[*index], *width - 52.);
+                        t.icon = Some(if selected {
+                            Icon::CheckboxChecked
+                        } else {
+                            Icon::Checkbox
+                        });
                         t.icon_size = 16.;
-                        t.fg = if broadcasting {
-                            "#b8b2ff"
-                        } else if member {
-                            INK
+                        t.corner_radius = 7.;
+                        t.fg = if disconnected_panes.contains(&id) {
+                            "#ed8193"
+                        } else if selected {
+                            ACCENT
                         } else {
                             MUTED
                         };
-                        t.text = tray_label(&member_labels[*index], *width - 52.);
-                        t.icon = Some(if member { Icon::Check } else { Icon::Checkbox });
                     }
                     if let Some(x) = members.pager_x {
                         for (x, action, icon, available) in [
@@ -5652,168 +5751,161 @@ impl TermWindow {
                                     &mut tiles,
                                     &mut hits,
                                     x,
-                                    tray_top + 22.,
+                                    tray_top + 8.,
                                     28.,
                                     32.,
                                     "",
-                                    SIDE,
+                                    BG,
                                     action,
                                     &hover,
                                 );
                             } else {
-                                tile(
-                                    &mut tiles,
-                                    x,
-                                    tray_top + 22.,
-                                    28.,
-                                    32.,
-                                    "",
-                                    SIDE,
-                                    "#53566c",
-                                    true,
-                                );
+                                tile(&mut tiles, x, tray_top + 8., 28., 32., "", BG, MUTED, true);
                             }
                             tiles.last_mut().unwrap().icon = Some(icon);
                         }
                     }
-                    if let Some(x) = layout.selection_x {
-                        tile(
-                            &mut tiles,
-                            x,
-                            tray_top + 22.,
-                            108.,
-                            32.,
-                            "",
-                            CARD,
-                            INK,
-                            true,
-                        );
-                        for (bx, width, label, action, selected) in [
-                            (
-                                x + 1.,
-                                48.,
-                                "All",
-                                Action::BroadcastAll,
-                                state.member_count() == state.pane_count(),
-                            ),
-                            (
-                                x + 50.,
-                                57.,
-                                "None",
-                                Action::BroadcastNone,
-                                state.member_count() == 0,
-                            ),
-                        ] {
-                            button(
-                                &mut tiles,
-                                &mut hits,
-                                bx,
-                                tray_top + 23.,
-                                width,
-                                30.,
-                                label,
-                                if selected { "#514b73" } else { CARD },
-                                action,
-                                &hover,
-                            );
-                            let t = tiles.last_mut().unwrap();
-                            t.corner_radius = 8.;
-                            t.transparent = !selected;
-                            t.fg = if selected { INK } else { MUTED };
-                        }
-                        tile(
-                            &mut tiles,
-                            layout.switch_x - 8.,
-                            tray_top + 26.,
-                            1.,
-                            24.,
-                            "",
-                            "#38394c",
-                            INK,
-                            false,
-                        );
-                    }
-                    // One hit target covers the label, track and thumb.
+                    let all = group_broadcasting(state);
                     button(
                         &mut tiles,
                         &mut hits,
-                        layout.switch_x,
-                        tray_top + 22.,
-                        layout.switch_width,
+                        layout.selection_x,
+                        tray_top + 8.,
+                        128.,
                         32.,
-                        if layout.switch_width > 40. {
-                            if enabled {
-                                "On"
-                            } else {
-                                "Off"
-                            }
+                        if all { "Clear all" } else { "Select all" },
+                        BG,
+                        if all {
+                            Action::BroadcastNone
                         } else {
-                            ""
+                            Action::BroadcastAll
                         },
-                        SIDE,
-                        Action::Broadcast,
                         &hover,
                     );
                     let t = tiles.last_mut().unwrap();
-                    t.icon = None;
-                    t.right_inset = 42.;
-                    t.fg = if enabled { INK } else { MUTED };
-                    let track_x = layout.switch_x + layout.switch_width - 39.;
-                    tile(
-                        &mut tiles,
-                        track_x,
-                        tray_top + 27.,
-                        38.,
-                        22.,
-                        "",
-                        if enabled { "#7568df" } else { "#45485e" },
-                        INK,
-                        true,
-                    );
-                    tiles.last_mut().unwrap().corner_radius = 11.;
-                    tile(
-                        &mut tiles,
-                        track_x + 3. + 16. * switch_progress,
-                        tray_top + 30.,
-                        16.,
-                        16.,
-                        "",
-                        if enabled { "#f1efff" } else { "#b5b8cc" },
-                        INK,
-                        true,
-                    );
-                    tiles.last_mut().unwrap().corner_radius = 8.;
-                }
-                for t in &mut tiles[start..] {
-                    t.zindex = 32;
+                    t.fg = MUTED;
+                    t.icon = Some(if all { Icon::Checkbox } else { Icon::Check });
+                    t.icon_size = 16.;
                 }
             }
-            let arrow_y = if progress > 0. {
-                (tray_top + 22.).min(h - 34.)
+            let selected = broadcast
+                .as_ref()
+                .map(|s| if s.enabled() { s.member_count() } else { 0 })
+                .unwrap_or(0);
+            if ui.tray_grouped {
+                button(
+                    &mut tiles,
+                    &mut hits,
+                    content_left + 8.,
+                    bar_top + 3.,
+                    192.,
+                    28.,
+                    format!("Broadcast · {}/{}", selected, pane_list.len()),
+                    BG,
+                    Action::ToggleTray,
+                    &hover,
+                );
+                let t = tiles.last_mut().unwrap();
+                t.icon = Some(Icon::Broadcast);
+                t.icon_size = 16.;
+                t.right_inset = 28.;
+                t.fg = if selected > 0 { ACCENT } else { MUTED };
+                tile(
+                    &mut tiles,
+                    content_left + 174.,
+                    bar_top + 7.,
+                    18.,
+                    20.,
+                    "",
+                    BG,
+                    MUTED,
+                    false,
+                );
+                let t = tiles.last_mut().unwrap();
+                t.transparent = true;
+                t.icon = Some(if ui.tray_expanded {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronUp
+                });
+                t.icon_size = 14.;
             } else {
-                h - 34.
-            };
-            button(
-                &mut tiles,
-                &mut hits,
-                layout.collapse_x,
-                arrow_y,
-                28.,
-                32.,
-                "",
-                SIDE,
-                Action::ToggleTray,
-                &hover,
-            );
-            let t = tiles.last_mut().unwrap();
-            t.zindex = 33;
-            t.fg = MUTED;
-            t.icon = Some(if ui.tray_expanded {
-                Icon::ChevronDown
-            } else {
-                Icon::ChevronUp
-            });
+                let summary = pane_list
+                    .first()
+                    .and_then(|p| ui.workspace.hosts.get(&p.pane.pane_id()))
+                    .map(|host| format!("SSH · {}@{}", host.username, host.address))
+                    .unwrap_or_else(|| "Terminal".into());
+                tile(
+                    &mut tiles,
+                    content_left + 12.,
+                    bar_top + 3.,
+                    (w - content_left - 188.).max(1.),
+                    28.,
+                    summary,
+                    BG,
+                    MUTED,
+                    false,
+                );
+            }
+            let offline = pane_list
+                .iter()
+                .filter(|p| disconnected_panes.contains(&p.pane.pane_id()))
+                .count();
+            if w - content_left >= 390. {
+                if offline > 0 {
+                    if let Some(id) = active_id {
+                        button(
+                            &mut tiles,
+                            &mut hits,
+                            w - 204.,
+                            bar_top + 3.,
+                            192.,
+                            28.,
+                            format!("{} offline · Reconnect", offline),
+                            BG,
+                            Action::ReconnectGroup(id),
+                            &hover,
+                        );
+                        tiles.last_mut().unwrap().fg = RECONNECT;
+                        tiles.last_mut().unwrap().icon = None;
+                    }
+                } else {
+                    tile(
+                        &mut tiles,
+                        w - 156.,
+                        bar_top + 3.,
+                        144.,
+                        28.,
+                        if ui.tray_grouped {
+                            format!("{} connected", pane_list.len())
+                        } else {
+                            "Connected".into()
+                        },
+                        BG,
+                        MUTED,
+                        false,
+                    );
+                }
+            }
+            if offline == 0 && w - content_left >= 390. {
+                tile(
+                    &mut tiles,
+                    w - 168.,
+                    bar_top + 14.,
+                    6.,
+                    6.,
+                    "",
+                    "#59b79e",
+                    INK,
+                    true,
+                );
+                tiles.last_mut().unwrap().corner_radius = 3.;
+            }
+            for t in &mut tiles[start..] {
+                t.zindex = 32;
+            }
         }
+
         if ui.page == Page::NewTab {
             tile(
                 &mut tiles,
@@ -6213,7 +6305,8 @@ impl TermWindow {
                     .store
                     .keys
                     .iter()
-                    .filter(|k| {
+                    .enumerate()
+                    .filter(|(_, k)| {
                         format!("{} {}", k.label, k.path)
                             .to_lowercase()
                             .contains(&query)
@@ -6276,7 +6369,12 @@ impl TermWindow {
                         let index = item_row * columns + col;
                         let (label, detail, icon, action) = if is_key {
                             match keys.get(index) {
-                                Some(k) => (k.label.clone(), k.path.clone(), Icon::Key, None),
+                                Some((id, k)) => (
+                                    k.label.clone(),
+                                    k.path.clone(),
+                                    Icon::Key,
+                                    Some(Action::EditKey(*id)),
+                                ),
                                 None => continue,
                             }
                         } else {
@@ -6450,11 +6548,15 @@ impl TermWindow {
                         "Add Identity"
                     }
                 } else if form.settings {
-                    "Terminal settings"
+                    "Settings"
                 } else if form.rename_tab.is_some() {
                     "Rename tab"
                 } else if form.key {
-                    "Add Key"
+                    if form.auth.original_key.is_some() {
+                        "Edit Key"
+                    } else {
+                        "Add Key"
+                    }
                 } else if form.original.is_some() {
                     "Edit Host"
                 } else {
@@ -6482,7 +6584,7 @@ impl TermWindow {
                     if form.auth.editing_identity {
                         "Username & password · Windows protected"
                     } else if form.settings {
-                        "Terminal & SSH · saved on this device"
+                        "Appearance, terminal & SSH"
                     } else if form.rename_tab.is_some() {
                         "A stable name for this tab or group"
                     } else if form.key {
@@ -6527,11 +6629,7 @@ impl TermWindow {
                     ]
                 };
                 let rows = form.drawer_rows(&ui.store);
-                let body_height = if form.is_host() {
-                    (layout.footer + 32. - 148.).max(70.)
-                } else {
-                    layout.rows as f32 * 70.
-                };
+                let body_height = layout.body_height(form);
                 let visible = form.visible_drawer_rows(&rows, body_height);
                 let mut row_y = 148.;
                 let mut picker_anchor = None;
@@ -6539,6 +6637,126 @@ impl TermWindow {
                     let y = row_y;
                     row_y += row.height();
                     match *row {
+                        FormRow::SettingsSection(appearance) => {
+                            tile(
+                                &mut tiles,
+                                fx,
+                                y,
+                                fw,
+                                24.,
+                                if appearance {
+                                    "Appearance"
+                                } else {
+                                    "Terminal & SSH"
+                                },
+                                SIDE,
+                                MUTED,
+                                false,
+                            );
+                        }
+                        FormRow::ThemeHint => {
+                            tile(
+                                &mut tiles,
+                                fx,
+                                y,
+                                fw,
+                                28.,
+                                "Preview instantly. Save to keep this theme.",
+                                SIDE,
+                                MUTED,
+                                false,
+                            );
+                        }
+                        FormRow::ThemeChoice(choice) => {
+                            let selected = form.auth.theme == Some(choice);
+                            button(
+                                &mut tiles,
+                                &mut hits,
+                                fx,
+                                y,
+                                fw,
+                                52.,
+                                choice.label(),
+                                if selected { "#474159" } else { CARD },
+                                Action::Theme(choice),
+                                &hover,
+                            );
+                            let t = tiles.last_mut().unwrap();
+                            t.text_padding = 78.;
+                            t.right_inset = 24.;
+                            let c = choice.colors();
+                            tile(
+                                &mut tiles,
+                                fx + 12.,
+                                y + 9.,
+                                54.,
+                                34.,
+                                "",
+                                c.bg,
+                                c.text,
+                                true,
+                            );
+                            tile(
+                                &mut tiles,
+                                fx + 14.,
+                                y + 11.,
+                                50.,
+                                6.,
+                                "",
+                                c.top,
+                                c.text,
+                                false,
+                            );
+                            tile(
+                                &mut tiles,
+                                fx + 14.,
+                                y + 17.,
+                                9.,
+                                24.,
+                                "",
+                                c.side,
+                                c.text,
+                                false,
+                            );
+                            tile(
+                                &mut tiles,
+                                fx + 27.,
+                                y + 21.,
+                                32.,
+                                16.,
+                                "",
+                                c.card,
+                                c.text,
+                                true,
+                            );
+                            tile(
+                                &mut tiles,
+                                fx + 27.,
+                                y + 21.,
+                                32.,
+                                2.,
+                                "",
+                                c.accent,
+                                c.text,
+                                false,
+                            );
+                            if selected {
+                                tile(
+                                    &mut tiles,
+                                    fx + fw - 30.,
+                                    y + 14.,
+                                    20.,
+                                    24.,
+                                    "",
+                                    "#474159",
+                                    SIGNAL_INK,
+                                    false,
+                                );
+                                let t = tiles.last_mut().unwrap();
+                                t.icon = Some(Icon::Check);
+                                t.transparent = true;
+                            }
+                        }
                         FormRow::Field(i) => draw_form_field(
                             &mut tiles,
                             &mut hits,
@@ -6618,45 +6836,26 @@ impl TermWindow {
                     );
                     tile(&mut tiles, w - 7., sy, 3., thumb, "", MUTED, MUTED, true);
                 }
-                if form.settings {
-                    tile(
-                        &mut tiles,
-                        fx,
-                        300.,
-                        fw,
-                        28.,
-                        "Keepalive changes apply to new SSH connections.",
-                        SIDE,
-                        MUTED,
-                        false,
-                    );
-                    tile(
-                        &mut tiles,
-                        fx,
-                        328.,
-                        fw,
-                        28.,
-                        "Ctrl + wheel session font changes stay temporary.",
-                        SIDE,
-                        MUTED,
-                        false,
-                    );
-                }
-                if form.auth.editing_identity && form.auth.original_identity.is_some() {
+                if form.has_delete() {
                     button(
                         &mut tiles,
                         &mut hits,
                         fx,
-                        layout.footer,
+                        layout.delete_y(),
                         fw,
                         30.,
-                        if form.auth.confirm_delete {
-                            "Confirm delete identity"
-                        } else {
-                            "Delete identity"
+                        match (form.key, form.auth.confirm_delete) {
+                            (true, false) => "Delete key",
+                            (true, true) => "Confirm delete key",
+                            (false, false) => "Delete identity",
+                            (false, true) => "Confirm delete identity",
                         },
                         CARD,
-                        Action::DeleteIdentity,
+                        if form.key {
+                            Action::DeleteKey
+                        } else {
+                            Action::DeleteIdentity
+                        },
                         &hover,
                     );
                     tiles.last_mut().unwrap().fg = "#ed8193";
@@ -6801,8 +7000,17 @@ impl TermWindow {
             }
         }
         if let Some((id, mx, my)) = ui.tab_menu {
-            let x = mx.min(w - 196.).max(8.);
-            let y = my.min(h - 132.).max(52.);
+            let mut actions = vec![
+                ("Rename tab", Action::RenameTab(id)),
+                ("Save workspace", Action::SaveWorkspace(id)),
+            ];
+            if disconnected_groups.contains(&id) {
+                actions.push(("Reconnect offline", Action::ReconnectGroup(id)));
+            }
+            actions.push(("Close tab", Action::CloseTab(id)));
+            let height = actions.len() as f32 * 38. + 12.;
+            let x = mx.min(w - 220.).max(8.);
+            let y = my.min(h - height - 8.).max(52.);
             hits.clear();
             hits.push(Hit {
                 x: 0.,
@@ -6812,48 +7020,27 @@ impl TermWindow {
                 action: Action::DismissMenu,
             });
             let start = tiles.len();
-            tile(&mut tiles, x, y, 188., 124., "", SIDE, INK, true);
-            button(
-                &mut tiles,
-                &mut hits,
-                x + 6.,
-                y + 6.,
-                176.,
-                34.,
-                "Rename tab",
-                SIDE,
-                Action::RenameTab(id),
-                &hover,
-            );
-            if tabs
-                .iter()
-                .any(|(tab, _, _, panes)| *tab == id && *panes > 1)
-            {
+            tile(&mut tiles, x, y, 212., height, "", CARD, INK, true);
+            tile(&mut tiles, x, y, 212., height, "", "#3b3e52", INK, true);
+            tiles.last_mut().unwrap().outline_width = 1.;
+            for (row, (label, action)) in actions.into_iter().enumerate() {
+                let danger = matches!(action, Action::CloseTab(_));
                 button(
                     &mut tiles,
                     &mut hits,
                     x + 6.,
-                    y + 44.,
-                    176.,
+                    y + 6. + row as f32 * 38.,
+                    200.,
                     34.,
-                    "Save group · Ctrl+S",
-                    SIDE,
-                    Action::SaveWorkspace(id),
+                    label,
+                    CARD,
+                    action,
                     &hover,
                 );
+                if danger {
+                    tiles.last_mut().unwrap().fg = "#ed8193";
+                }
             }
-            button(
-                &mut tiles,
-                &mut hits,
-                x + 6.,
-                y + 82.,
-                176.,
-                34.,
-                "Close tab",
-                SIDE,
-                Action::CloseTab(id),
-                &hover,
-            );
             for t in &mut tiles[start..] {
                 t.zindex = 60;
             }
@@ -7044,7 +7231,6 @@ impl TermWindow {
             || ui.page_motion.is_active(now)
             || (ui.dock_preview.is_some() && ui.dock_motion.is_active(now))
             || ui.tray_motion.is_active(now)
-            || ui.broadcast_motion.is_active(now)
             || self.termviai_confirm.motion.is_active(now);
         let mut visible_actions = std::collections::HashSet::new();
         for t in &mut tiles {
@@ -7088,6 +7274,7 @@ impl TermWindow {
             .as_ref()
             .context("Renderer not initialized")?;
         let mut input_hits = Vec::new();
+        let color = |value: &str| color(theme.resolve(value));
         for mut t in tiles {
             let hover = t
                 .hover_key()
@@ -7125,6 +7312,7 @@ impl TermWindow {
                         Action::GroupMenu(_)
                             | Action::HostMenu(_)
                             | Action::TabBroadcast(_)
+                            | Action::TabMenu(_)
                             | Action::ReconnectGroup(_)
                     )
                 ) {
@@ -7373,6 +7561,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recent_remove_retains_only_its_own_row_hover() {
+        let mut tiles = vec![];
+        let mut hits = vec![];
+        for (x, y, w, h, action) in [
+            (20., 200., 500., 40., Action::ConnectRecent(0)),
+            (488., 206., 24., 28., Action::RemoveRecent(0, 123)),
+            (20., 248., 500., 40., Action::ConnectRecent(1)),
+            (488., 254., 24., 28., Action::RemoveRecent(1, 124)),
+        ] {
+            button(&mut tiles, &mut hits, x, y, w, h, "", CARD, action, &None);
+        }
+        assert_eq!(
+            hit_action(&hits, 500., 215.),
+            Some(Action::RemoveRecent(0, 123))
+        );
+        assert!(tiles[0].hovered_by(Some(&hits[1])));
+        assert!(!tiles[2].hovered_by(Some(&hits[1])));
+        assert!(!tiles[1].hovered_by(Some(&hits[0])));
+    }
+
+    #[test]
+    fn key_edit_persists_references_and_rejects_stale_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("hosts.json");
+        let key_path = dir.path().join("private-key");
+        let new_path = dir.path().join("replacement-key");
+        std::fs::write(&key_path, "synthetic test key").unwrap();
+        std::fs::write(&new_path, "synthetic replacement").unwrap();
+        let mut ui = TermviaiUi::with_store(HostStore::default(), String::new());
+        ui.open_key(None);
+        let form = ui.form.as_mut().unwrap();
+        form.fields[0] = Input::new("original".into());
+        form.fields[1] = Input::new(key_path.to_string_lossy().into_owned());
+        ui.save_form_at(&library).unwrap();
+        let original = ui.store.keys[0].clone();
+        let snapshot = Host {
+            label: "test".into(),
+            address: "example.org".into(),
+            port: 22,
+            username: "user".into(),
+            authentication: Some(Authentication::Key),
+            key_label: "original".into(),
+            ..Default::default()
+        };
+        ui.store.hosts.push(snapshot.clone());
+        ui.store.save_to(&library).unwrap();
+        ui.open_key(Some(original.clone()));
+        let form = ui.form.as_mut().unwrap();
+        assert_eq!(form.fields[1].value, original.path);
+        form.fields[0] = Input::new("renamed".into());
+        form.fields[1] = Input::new(new_path.to_string_lossy().into_owned());
+        ui.save_form_at(&library).unwrap();
+        let saved = HostStore::load_from(&library).unwrap();
+        assert_eq!(saved.hosts[0].key_label, "renamed");
+        let mut recent_or_workspace = snapshot;
+        recent_or_workspace.resolve_identity(&saved).unwrap();
+        assert_eq!(
+            recent_or_workspace.identity_file,
+            new_path.to_string_lossy()
+        );
+        // Old names cannot accidentally select a newly created, different key.
+        ui.open_key(None);
+        let form = ui.form.as_mut().unwrap();
+        form.fields[0] = Input::new("original".into());
+        form.fields[1] = Input::new(original.path.clone());
+        assert!(ui.save_form_at(&library).is_err());
+        ui.open_key(Some(original));
+        assert!(ui.save_form_at(&library).is_err());
+        assert!(ui.delete_key_at(&library).is_err());
+        ui.open_key(Some(saved.keys[0].clone()));
+        assert!(ui.delete_key_at(&library).is_err());
+        let mut unlinked = saved;
+        unlinked.hosts.clear();
+        unlinked.save_to(&library).unwrap();
+        ui.delete_key_at(&library).unwrap();
+        assert!(HostStore::load_from(&library).unwrap().keys.is_empty());
+        assert!(key_path.is_file() && new_path.is_file());
+    }
+
+    #[test]
+    fn key_and_identity_delete_controls_clear_fields_and_footer() {
+        let mut ui = TermviaiUi::with_store(HostStore::default(), String::new());
+        for key in [false, true] {
+            if key {
+                ui.open_key(Some(KeyFile::default()));
+            } else {
+                ui.open_identity(Some(Identity::default()));
+            }
+            let form = ui.form.as_mut().unwrap();
+            for height in [400., 480., 600., 720., 900.] {
+                let layout = DrawerLayout::new(1000., height);
+                let rows = form.drawer_rows(&HostStore::default());
+                for focus in 0..form.fields.len() {
+                    form.focus = focus;
+                    form.reveal_focus = true;
+                    let visible = form.visible_drawer_rows(&rows, layout.body_height(form));
+                    assert!(visible.contains(&focus));
+                    let bottom = 148. + rows[visible].iter().map(FormRow::height).sum::<f32>();
+                    assert!(bottom + 12. <= layout.delete_y());
+                    assert!(layout.delete_y() + 30. + 12. <= height - 100.);
+                }
+            }
+        }
+        let mut tiles = vec![];
+        let mut hits = vec![];
+        for action in [Action::EditKey(0), Action::EditIdentity(0)] {
+            button(
+                &mut tiles, &mut hits, 0., 0., 200., 72., "", CARD, action, &None,
+            );
+            assert!(tiles.last().unwrap().icon.is_none());
+        }
+    }
+
+    #[test]
     fn tab_children_keep_parent_hover_without_linking_other_controls() {
         let mut tiles = vec![];
         let mut hits = vec![];
@@ -7382,7 +7684,7 @@ mod tests {
             (170., 24., "", Action::CloseTab(1)),
             (210., 200., "New Tab", Action::NewTab),
             (380., 24., "", Action::CloseNewTab),
-            (420., 32., "", Action::NewTab),
+            (420., 32., "", Action::AddTab),
         ] {
             button(
                 &mut tiles, &mut hits, x, 8., width, 36., label, TOP, action, &None,
@@ -7397,6 +7699,10 @@ mod tests {
         assert!(!tiles[5].hovered_by(Some(&hits[4])));
         assert!(!tiles[3].hovered_by(Some(&hits[5])));
         assert_ne!(tiles[3].hover_key(), tiles[5].hover_key());
+        // Press feedback and release activation are action-based: these must differ.
+        assert_ne!(tiles[3].action, tiles[5].action);
+        assert_eq!(hit_action(&hits, 440., 20.), Some(Action::AddTab));
+        assert_eq!(hit_action(&hits, 240., 20.), Some(Action::NewTab));
         assert!(!tiles[1].hovered_by(Some(&hits[0])));
         assert!(!tiles[2].hovered_by(Some(&hits[0])));
         assert!(!tiles[0].hovered_by(None));
@@ -7964,6 +8270,7 @@ mod tests {
                 .map(|i| KeyFile {
                     label: format!("Key {i}"),
                     path: format!("key-{i}"),
+                    ..Default::default()
                 })
                 .collect(),
             ..Default::default()
@@ -8034,6 +8341,7 @@ mod tests {
             keys: vec![KeyFile {
                 label: "Selected key".into(),
                 path: key.path().to_string_lossy().into_owned(),
+                ..Default::default()
             }],
             identities: vec![Identity {
                 id: "test-identity-ref".into(),
@@ -8193,6 +8501,7 @@ mod tests {
             keys: vec![KeyFile {
                 label: "key".into(),
                 path: "key.pem".into(),
+                ..Default::default()
             }],
             identities: vec![Identity {
                 id: "identity".into(),
@@ -8427,18 +8736,9 @@ mod tests {
             for width in (320..=1920).step_by(5) {
                 let width = width as f32;
                 let layout = TrayLayout::new(width, content_left);
-                assert!(layout.switch_x >= content_left);
-                assert!(layout.switch_x + layout.switch_width < layout.collapse_x);
-                assert!(layout.collapse_x + 28. <= width - 12.);
-                if layout.title_width > 0. {
-                    assert!(content_left + 24. + layout.title_width < layout.switch_x);
-                }
-                if let Some(x) = layout.selection_x {
-                    assert!(x + 108. < layout.switch_x);
-                    assert!(layout.members_x + layout.members_width < x);
-                } else if layout.members_width > 0. {
-                    assert!(layout.members_x + layout.members_width < layout.switch_x);
-                }
+                assert!(layout.selection_x >= content_left);
+                assert!(layout.selection_x + 128. <= width);
+                assert!(layout.members_x + layout.members_width <= layout.selection_x);
                 let members = TrayMembers::new(
                     &[72., 164., 88., 72., 120.],
                     layout.members_x,
@@ -8465,7 +8765,7 @@ mod tests {
         for content_left in [0., SIDEBAR_WIDTH] {
             let layout = TrayLayout::new(width as f32, content_left);
             assert!(layout.members_width >= 68.);
-            assert!(layout.switch_x + layout.switch_width < layout.collapse_x);
+            assert!(layout.members_x + layout.members_width < layout.selection_x);
         }
     }
 
@@ -8542,6 +8842,53 @@ mod tests {
     }
 
     #[test]
+    fn appearance_preview_reverts_on_close_and_all_settings_are_reachable() {
+        let mut ui = TermviaiUi::with_store(HostStore::default(), String::new());
+        assert_eq!(ui.preview_theme(), None);
+        ui.open_settings(13., 30);
+        for theme in Theme::ALL {
+            ui.form.as_mut().unwrap().auth.theme = Some(theme);
+            assert_eq!(ui.preview_theme(), Some(theme));
+        }
+        let form = ui.form.as_mut().unwrap();
+        let rows = form.drawer_rows(&HostStore::default());
+        for height in [480., 600., 720., 1080.] {
+            let layout = DrawerLayout::new(720., height);
+            let mut seen = std::collections::HashSet::new();
+            for first in 0..rows.len() {
+                form.first_row = first;
+                form.reveal_focus = false;
+                let visible = form.visible_drawer_rows(&rows, layout.body_height(form));
+                let used: f32 = rows[visible.clone()].iter().map(FormRow::height).sum();
+                assert!(used <= layout.body_height(form));
+                seen.extend(visible);
+            }
+            assert_eq!(seen.len(), rows.len());
+        }
+        ui.close_form();
+        assert!(ui.closing_form.is_some());
+        assert_eq!(ui.preview_theme(), None);
+    }
+
+    #[test]
+    fn broadcast_starts_collapsed_and_reserves_only_the_status_strip() {
+        let mut ui = TermviaiUi::with_store(HostStore::default(), String::new());
+        assert!(!ui.tray_expanded);
+        assert_eq!(ui.broadcast_tray_height(), 0.);
+        ui.page = Page::Terminal;
+        assert_eq!(ui.broadcast_tray_height(), BROADCAST_STATUS_HEIGHT);
+        ui.tray_motion = Tween::new(1.);
+        assert_eq!(ui.broadcast_tray_height(), BROADCAST_STATUS_HEIGHT);
+        ui.tray_grouped = true;
+        assert_eq!(
+            ui.broadcast_tray_height(),
+            BROADCAST_STATUS_HEIGHT + BROADCAST_TRAY_HEIGHT
+        );
+        ui.page = Page::Hosts;
+        assert_eq!(ui.broadcast_tray_height(), 0.);
+    }
+
+    #[test]
     fn settings_drawer_keeps_session_and_exposes_keepalive() {
         let mut ui = TermviaiUi::with_store(HostStore::default(), String::new());
         ui.page = Page::Terminal;
@@ -8551,6 +8898,8 @@ mod tests {
         assert!(form.settings);
         assert_eq!(form.fields.len(), 2);
         assert_eq!(form.fields[1].value, "30");
+        assert!(ui.input().is_none());
+        ui.form.as_mut().unwrap().auth.theme_focus = false;
         ui.input().unwrap().insert("16");
         assert_eq!(ui.form.as_ref().unwrap().fields[0].value, "16");
         ui.close_form();
