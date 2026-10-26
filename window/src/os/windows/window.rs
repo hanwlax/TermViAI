@@ -52,6 +52,9 @@ use windows::UI::ViewManagement::{UIColorType, UISettings};
 use winreg::enums::HKEY_CURRENT_USER;
 use winreg::RegKey;
 
+const FRAME_TIMER: usize = 0x54564149;
+const MODAL_TIMER: usize = FRAME_TIMER + 1;
+
 const GCS_RESULTSTR: DWORD = 0x800;
 const GCS_COMPSTR: DWORD = 0x8;
 const ISC_SHOWUICOMPOSITIONWINDOW: DWORD = 0x80000000;
@@ -115,6 +118,7 @@ pub(crate) struct WindowInner {
 
     last_size: Option<Dimensions>,
     in_size_move: bool,
+    frame_pacer: super::frame_pacer::FramePacer,
     dead_pending: Option<(Modifiers, u32)>,
     saved_placement: Option<WINDOWPLACEMENT>,
     track_mouse_leave: bool,
@@ -540,6 +544,7 @@ impl Window {
             keyboard_info: KeyboardLayoutInfo::new(),
             last_size: None,
             in_size_move: false,
+            frame_pacer: Default::default(),
             dead_pending: None,
             saved_placement: None,
             track_mouse_leave: false,
@@ -1125,6 +1130,8 @@ unsafe fn wm_ncdestroy(
     _wparam: WPARAM,
     _lparam: LPARAM,
 ) -> Option<LRESULT> {
+    KillTimer(hwnd, FRAME_TIMER);
+    KillTimer(hwnd, MODAL_TIMER);
     let raw = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as LPVOID;
     if !raw.is_null() {
         let inner = take_rc_from_pointer(raw);
@@ -1716,10 +1723,21 @@ unsafe fn wm_enter_exit_size_move(
         let mut inner = inner.borrow_mut();
         inner.in_size_move = msg == WM_ENTERSIZEMOVE;
         should_size = !inner.in_size_move;
+        if inner.config.termviai_ui {
+            if inner.in_size_move {
+                crate::resize_diagnostics::begin();
+                SetTimer(hwnd, MODAL_TIMER, 16, None);
+            } else {
+                inner.frame_pacer.take_resize();
+                KillTimer(hwnd, FRAME_TIMER);
+                KillTimer(hwnd, MODAL_TIMER);
+            }
+        }
     }
 
     if should_size {
-        wm_size(hwnd, 0, 0, 0)?;
+        // wm_size returns None to allow DefWindowProc; that is not a failure.
+        wm_size(hwnd, 0, 0, 0);
         // WM_WINDOWPOSCHANGED may already have reported the final dimensions
         // while the modal size/move loop was active. Deliver the transition out
         // of live resizing even when the pixel size itself did not change.
@@ -1735,6 +1753,9 @@ unsafe fn wm_enter_exit_size_move(
         }
     }
 
+    if should_size {
+        crate::resize_diagnostics::end();
+    }
     Some(0)
 }
 
@@ -1782,6 +1803,13 @@ unsafe fn wm_size(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> O
 
     if let Some(inner) = rc_from_hwnd(hwnd) {
         let mut inner = inner.borrow_mut();
+        if inner.config.termviai_ui && inner.in_size_move {
+            inner.frame_pacer.request_resize(std::time::Instant::now());
+            crate::resize_diagnostics::resize_requested();
+            inner.invalidated = true;
+            InvalidateRect(hwnd, null(), 0);
+            return Some(0);
+        }
         should_paint = inner.check_and_call_resize_if_needed();
         should_pump = inner.in_size_move;
     }
@@ -1794,6 +1822,25 @@ unsafe fn wm_size(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> O
     }
 
     None
+}
+
+unsafe fn wm_frame_timer(hwnd: HWND, timer: usize) -> Option<LRESULT> {
+    if timer == FRAME_TIMER {
+        KillTimer(hwnd, FRAME_TIMER);
+    }
+    let inner = rc_from_hwnd(hwnd)?;
+    let live = inner.borrow().in_size_move;
+    if live && timer == MODAL_TIMER {
+        let _queue = crate::resize_diagnostics::Span::new("modal_queue");
+        crate::spawn::SPAWN_QUEUE.run_for_size_move();
+    }
+    // A queued task can close the window; resolve the handle again.
+    let inner = rc_from_hwnd(hwnd)?;
+    let inner = inner.borrow();
+    if inner.invalidated || inner.frame_pacer.has_resize() {
+        InvalidateRect(hwnd, null(), 0);
+    }
+    Some(0)
 }
 
 unsafe fn wm_set_focus(
@@ -1826,6 +1873,37 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
 
+    if inner.config.termviai_ui {
+        // Validate even when throttled; an unvalidated update region repeatedly
+        // generates WM_PAINT and can starve other modal-loop messages.
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        BeginPaint(hwnd, &mut ps);
+        EndPaint(hwnd, &ps);
+        let now = std::time::Instant::now();
+        let delay = inner.frame_pacer.delay(now, inner.config.max_fps);
+        if !delay.is_zero() {
+            inner.invalidated = true;
+            SetTimer(
+                hwnd,
+                FRAME_TIMER,
+                delay.as_millis().saturating_add(1).min(u32::MAX as u128) as u32,
+                None,
+            );
+            return Some(0);
+        }
+        inner.frame_pacer.start(now);
+        inner.invalidated = false;
+        let _frame = crate::resize_diagnostics::Span::new("frame_callback");
+        let resize_requested = inner.frame_pacer.take_resize();
+        if resize_requested.is_some() {
+            inner.check_and_call_resize_if_needed();
+        }
+        inner.events.dispatch(WindowEvent::NeedRepaint);
+        if let Some(at) = resize_requested {
+            crate::resize_diagnostics::record("resize_to_repaint_return", at.elapsed());
+        }
+        return Some(0);
+    }
     if inner.paint_throttled {
         inner.invalidated = true;
         return Some(0);
@@ -3165,6 +3243,7 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         WM_NCCALCSIZE => wm_nccalcsize(hwnd, msg, wparam, lparam),
         WM_NCHITTEST => wm_nchittest(hwnd, msg, wparam, lparam),
         WM_PAINT => wm_paint(hwnd, msg, wparam, lparam),
+        WM_TIMER if wparam == FRAME_TIMER || wparam == MODAL_TIMER => wm_frame_timer(hwnd, wparam),
         WM_GETMINMAXINFO => wm_get_min_max_info(hwnd, msg, wparam, lparam),
         WM_ENTERSIZEMOVE | WM_EXITSIZEMOVE => wm_enter_exit_size_move(hwnd, msg, wparam, lparam),
         WM_WINDOWPOSCHANGED => wm_windowposchanged(hwnd, msg, wparam, lparam),
@@ -3174,7 +3253,11 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         | WM_SYSKEYDOWN => key(hwnd, msg, wparam, lparam),
         WM_SIZING => {
             // Process a bounded amount of work before the next pointer update.
-            crate::spawn::SPAWN_QUEUE.run_for_size_move();
+            let termviai =
+                rc_from_hwnd(hwnd).is_some_and(|inner| inner.borrow().config.termviai_ui);
+            if !termviai {
+                crate::spawn::SPAWN_QUEUE.run_for_size_move();
+            }
             None
         }
         WM_SETTINGCHANGE | WM_DWMCOMPOSITIONCHANGED => apply_theme(hwnd),

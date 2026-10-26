@@ -53,3 +53,5 @@ pub fn is_running_in_rdp_session() -> bool {
         }
     }
 }
+
+mod frame_pacer;

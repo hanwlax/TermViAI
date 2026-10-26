@@ -1,4 +1,6 @@
 //! Native TermViAI application chrome and local SSH library.
+#[path = "termviai_monitor.rs"]
+mod monitor_ui;
 use super::box_model::*;
 use super::render::corners::*;
 use super::termviai_broadcast::{group_broadcasting, pane_broadcasting, toggle_participant};
@@ -56,6 +58,7 @@ pub fn sidebar_width(config: &config::ConfigHandle, dpi: f32) -> f32 {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Page {
+    Monitor,
     Hosts,
     Keys,
     NewTab,
@@ -63,11 +66,13 @@ pub enum Page {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Action {
+    Monitor(monitor_ui::Command),
     ToggleSidebar,
     Hosts,
     Keys,
     Settings,
     Theme(Theme),
+    ToggleCloseConfirmation,
     TabMenu(usize),
     NewTab,
     AddTab,
@@ -79,6 +84,7 @@ enum Action {
     RenameTab(usize),
     SaveWorkspace(usize),
     OpenSaved(String),
+    RemoveSaved(String, u64),
     ConnectRecent(usize),
     RemoveRecent(usize, u64),
     DismissMenu,
@@ -298,6 +304,7 @@ fn text_positions(
 struct AuthForm {
     theme: Option<Theme>,
     theme_focus: bool,
+    confirm_close_tabs: bool,
     original_key: Option<KeyFile>,
     editing_identity: bool,
     original_identity: Option<Identity>,
@@ -429,6 +436,7 @@ enum FormRow {
     ThemeChoice(Theme),
     SettingsSection(bool),
     ThemeHint,
+    CloseConfirmation,
     Field(usize),
     Endpoint,
     AuthMode,
@@ -447,6 +455,7 @@ impl FormRow {
             Self::ThemeChoice(_) => 60.,
             Self::SettingsSection(_) => 32.,
             Self::ThemeHint => 38.,
+            Self::CloseConfirmation => 78.,
             Self::Field(_) | Self::Endpoint | Self::Picker => 78.,
             Self::AuthMode => 100.,
             Self::KeySource => 62.,
@@ -461,6 +470,7 @@ impl FormRow {
         matches!(self, Self::Field(i) if *i == index)
             || (*self == Self::Endpoint && matches!(index, 1 | 2))
             || (*self == Self::KeyInput && index == 5)
+            || (*self == Self::CloseConfirmation && index == 2)
     }
 }
 impl Form {
@@ -511,6 +521,7 @@ impl Form {
                 FormRow::SettingsSection(false),
                 FormRow::Field(0),
                 FormRow::Field(1),
+                FormRow::CloseConfirmation,
             ]);
             return rows;
         }
@@ -1932,6 +1943,7 @@ fn draw_host_picker(
             MUTED,
             true,
         );
+        tiles.last_mut().unwrap().content_centered = true;
     } else {
         button(
             tiles,
@@ -2134,6 +2146,12 @@ struct Tile {
     action: Option<Action>,
     right_inset: f32,
     text_padding: f32,
+    text_size: Option<u16>,
+    text_bold: bool,
+    text_centered: bool,
+    content_centered: bool,
+    text_right_aligned: bool,
+    border_color: Option<&'static str>,
     opacity: f32,
     transparent: bool,
     zindex: i8,
@@ -2182,6 +2200,15 @@ impl Tile {
             (Some(Action::NewTab), Action::CloseNewTab) => !self.text.is_empty(),
             (Some(Action::Group(parent)), Action::GroupMenu(child)) => parent == child,
             (Some(Action::Connect(parent)), Action::HostMenu(child)) => parent == child,
+            (
+                Some(Action::Monitor(monitor_ui::Command::Host(a))),
+                Action::Monitor(
+                    monitor_ui::Command::Menu(b)
+                    | monitor_ui::Command::Pause(b)
+                    | monitor_ui::Command::Retry(b),
+                ),
+            ) => a == b,
+            (Some(Action::OpenSaved(parent)), Action::RemoveSaved(child, _)) => parent == child,
             (Some(Action::ConnectRecent(parent)), Action::RemoveRecent(child, _)) => {
                 parent == child
             }
@@ -2206,6 +2233,7 @@ struct HostPicker {
 }
 
 pub struct TermviaiUi {
+    monitor: monitor_ui::MonitorUi,
     pub page: Page,
     store: HostStore,
     query: Input,
@@ -2267,6 +2295,7 @@ impl TermviaiUi {
     }
     fn with_store(store: HostStore, error: String) -> Self {
         Self {
+            monitor: monitor_ui::MonitorUi::default(),
             page: Page::Hosts,
             store,
             query: Input::default(),
@@ -2382,6 +2411,7 @@ impl TermviaiUi {
             auth: AuthForm {
                 theme: Some(Theme::default()),
                 theme_focus: true,
+                confirm_close_tabs: true,
                 ..AuthForm::default()
             },
         });
@@ -2966,6 +2996,12 @@ fn tile(
             action: None,
             right_inset: 0.,
             text_padding: 12.,
+            text_size: None,
+            text_bold: false,
+            text_centered: false,
+            content_centered: false,
+            text_right_aligned: false,
+            border_color: None,
             opacity: 1.,
             transparent: false,
             zindex: 30,
@@ -2987,6 +3023,8 @@ fn button(
 ) {
     let text = text.into();
     let icon = match &action {
+        Action::Monitor(monitor_ui::Command::Open) => Some(Icon::Activity),
+        Action::Monitor(monitor_ui::Command::Add) => Some(Icon::Plus),
         Action::ToggleSidebar => Some(Icon::Menu),
         Action::Hosts => Some(Icon::Hosts),
         Action::Keys | Action::AddKey | Action::UseKey(_) => Some(Icon::Key),
@@ -3002,7 +3040,8 @@ fn button(
         | Action::CloseNewTab
         | Action::Close
         | Action::RemovePane(_)
-        | Action::RemoveRecent(..) => Some(Icon::Close),
+        | Action::RemoveRecent(..)
+        | Action::RemoveSaved(..) => Some(Icon::Close),
         Action::PrevTab | Action::PrevGroup => Some(Icon::ChevronLeft),
         Action::NextTab | Action::NextGroup => Some(Icon::ChevronRight),
         Action::Minimize => Some(Icon::Minimize),
@@ -3047,6 +3086,7 @@ fn button(
         let t = tiles.last_mut().unwrap();
         t.icon = icon;
         t.action = Some(action.clone());
+        t.content_centered = centered_button_action(&action);
         if matches!(action, Action::Tab(_)) {
             t.right_inset = 32.;
         }
@@ -3054,6 +3094,149 @@ fn button(
     let _ = hover; // Motion is sampled once per frame for all matching controls.
     hits.push(Hit { x, y, w, h, action });
 }
+fn workspace_shortcut_row(
+    tiles: &mut Vec<Tile>,
+    hits: &mut Vec<Hit>,
+    cx: f32,
+    y: f32,
+    cw: f32,
+    label: String,
+    detail: String,
+    action: Action,
+    remove: Option<Action>,
+    hover: &Option<Action>,
+) {
+    let show_remove = hover.as_ref() == Some(&action) || hover == &remove;
+    let trailing = if remove.is_some() { 36. } else { 0. };
+    button(tiles, hits, cx, y, cw, 40., label, CARD, action, hover);
+    tiles.last_mut().unwrap().right_inset = trailing;
+    if cw > 400. {
+        tiles.last_mut().unwrap().right_inset = 182. + trailing;
+        tile(
+            tiles,
+            cx + cw - 182. - trailing,
+            y,
+            174.,
+            40.,
+            detail,
+            CARD,
+            MUTED,
+            false,
+        );
+        tiles.last_mut().unwrap().transparent = true;
+    }
+    if let Some(remove) = remove {
+        button(
+            tiles,
+            hits,
+            cx + cw - 32.,
+            y + 6.,
+            24.,
+            28.,
+            "",
+            CARD,
+            remove,
+            hover,
+        );
+        let close = tiles.last_mut().unwrap();
+        close.transparent = true;
+        close.fg = MUTED;
+        close.icon_size = 18.;
+        close.opacity = if show_remove { 1. } else { 0. };
+    }
+}
+
+// Navigation, editable fields, cards and menu rows retain their leading edge.
+fn centered_button_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Save
+            | Action::Cancel
+            | Action::ConfirmAccept
+            | Action::ConfirmCancel
+            | Action::AddHost
+            | Action::AddHostMenu
+            | Action::AddGroup
+            | Action::AddKey
+            | Action::AddIdentity
+            | Action::DeleteKey
+            | Action::DeleteIdentity
+            | Action::AuthMode(_)
+            | Action::KeySource(_)
+            | Action::AcceptHostPicker
+            | Action::CancelHostPicker
+            | Action::BroadcastAll
+            | Action::BroadcastNone
+            | Action::Monitor(
+                monitor_ui::Command::Add
+                    | monitor_ui::Command::AcceptAdd
+                    | monitor_ui::Command::Filter(_)
+                    | monitor_ui::Command::Pause(_)
+                    | monitor_ui::Command::Retry(_)
+                    | monitor_ui::Command::Interval
+                    | monitor_ui::Command::SetInterval(_)
+                    | monitor_ui::Command::Close
+                    | monitor_ui::Command::StopScope
+                    | monitor_ui::Command::StopHost
+                    | monitor_ui::Command::StopPid(_)
+                    | monitor_ui::Command::CancelStop
+                    | monitor_ui::Command::AcceptStop
+                    | monitor_ui::Command::AcceptRemove
+            )
+    )
+}
+
+// Center the combined icon and shaped label, keeping a separate clipping gutter.
+// Do not shift text independently of its icon, or center a truncated long label
+// beyond the usable content box. Coordinates remain logical pixels until paint.
+fn centered_button_content(t: &Tile, advance: f32, scale: f32) -> (f32, f32, f32) {
+    let available = (t.w - 2. * t.text_padding - t.right_inset).max(0.);
+    let icon = if t.icon.is_some() {
+        t.icon_size.min(t.h - 4.).min(t.w - 4.).max(1.)
+    } else {
+        0.
+    };
+    let leading = if icon > 0. { icon + 8. } else { 0. };
+    let gutter = (2. / scale).min((available - leading).max(0.));
+    let label = advance.max(0.).min((available - leading - gutter).max(0.));
+    let left = t.x + t.text_padding + ((available - leading - label) / 2.).max(0.);
+    (left, left + leading, label + gutter)
+}
+
+// A full opaque layout preview replaces the old workspace while lifting a
+// pane. It deliberately does not resize or reflow any running terminal.
+fn paint_pane_drag_layout(
+    tiles: &mut Vec<Tile>,
+    bounds: super::termviai_dock::Rect,
+    panes: &[super::termviai_tab_drag::PaneDragPreview],
+) {
+    let start = tiles.len();
+    tile(
+        tiles, bounds.x, bounds.y, bounds.w, bounds.h, "", BG, INK, false,
+    );
+    for pane in panes {
+        let r = pane.frame;
+        tile(tiles, r.x, r.y, r.w, r.h, "", BG, INK, true);
+        tiles.last_mut().unwrap().border_color =
+            Some(if pane.incoming { "#59b79e" } else { "#353648" });
+        tile(
+            tiles,
+            r.x + 1.,
+            r.y + 1.,
+            (r.w - 2.).max(1.),
+            32_f32.min((r.h - 2.).max(1.)),
+            &pane.title,
+            CARD,
+            INK,
+            true,
+        );
+        tiles.last_mut().unwrap().icon = Some(Icon::Terminal);
+    }
+    for t in &mut tiles[start..] {
+        t.zindex = 48;
+    }
+}
+
 fn action_hint(
     action: &Action,
     broadcast: Option<&termviai_broadcast::BroadcastState<usize>>,
@@ -3074,21 +3257,114 @@ fn action_hint(
         }
         Action::ReconnectPane(_) => "Reconnect this SSH session",
         Action::ReconnectGroup(_) => "Reconnect offline SSH sessions in this tab",
-        Action::FocusPane(_) => "Drag onto another session to swap positions",
+        Action::FocusPane(_) => "Drag to the left, right, top or bottom of another session",
         Action::Tab(_) => "Drag to reorder tabs",
         _ => return None,
     })
 }
 
-fn wrap_hint(text: &str, columns: usize) -> Vec<String> {
+// Measure with the same shaped font as the renderer. Prefer Unicode line-break
+// opportunities; emergency breaks must preserve entire grapheme clusters.
+fn wrap_text(
+    font: &wezterm_font::LoadedFont,
+    text: &str,
+    width: f32,
+    scale: f32,
+) -> anyhow::Result<Vec<String>> {
+    use unicode_segmentation::UnicodeSegmentation;
     let mut lines = Vec::new();
-    for paragraph in text.lines() {
-        let chars: Vec<char> = paragraph.chars().collect();
-        for chunk in chars.chunks(columns.max(1)) {
-            lines.push(chunk.iter().collect());
+    if text.is_empty() {
+        return Ok(lines);
+    }
+    let available = (width - 2. / scale).max(0.);
+    for paragraph in text.split('\n') {
+        let paragraph = paragraph.strip_suffix('\r').unwrap_or(paragraph);
+        if paragraph.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let positions = text_positions(font, paragraph, scale)?;
+        let mut char_offset = 0;
+        let mut boundaries = vec![(0, 0.)];
+        for (byte, grapheme) in paragraph.grapheme_indices(true) {
+            char_offset += grapheme.chars().count();
+            boundaries.push((byte + grapheme.len(), positions[char_offset]));
+        }
+        let mut preferred = HashSet::new();
+        let mut byte = 0;
+        for word in textwrap::WordSeparator::new().find_words(paragraph) {
+            byte += word.word.len();
+            preferred.insert(byte);
+            byte += word.whitespace.len();
+            preferred.insert(byte);
+        }
+        let mut start = 0;
+        while start + 1 < boundaries.len() {
+            let mut fit = start;
+            while fit + 1 < boundaries.len()
+                && boundaries[fit + 1].1 - boundaries[start].1 <= available
+            {
+                fit += 1;
+            }
+            let mut end = fit.max(start + 1);
+            if end + 1 < boundaries.len() {
+                if let Some(word_end) = (start + 1..=end)
+                    .rev()
+                    .find(|i| preferred.contains(&boundaries[*i].0))
+                {
+                    end = word_end;
+                }
+            }
+            // Isolated line shaping can differ slightly at the new boundaries.
+            // Verify it rather than relying on paragraph kerning at the edge.
+            loop {
+                let line = paragraph[boundaries[start].0..boundaries[end].0].trim_end();
+                let measured = *text_positions(font, line, scale)?.last().unwrap_or(&0.);
+                if measured <= available || end == start + 1 {
+                    lines.push(line.to_owned());
+                    break;
+                }
+                end = (start + 1..end)
+                    .rev()
+                    .find(|i| preferred.contains(&boundaries[*i].0))
+                    .unwrap_or(end - 1);
+            }
+            start = end;
+            while start + 1 < boundaries.len()
+                && paragraph[boundaries[start].0..boundaries[start + 1].0]
+                    .chars()
+                    .all(char::is_whitespace)
+            {
+                start += 1;
+            }
         }
     }
-    lines
+    Ok(lines)
+}
+
+#[derive(Default)]
+struct TextWrapCache {
+    entries: HashMap<(usize, u32, u32, String), Vec<String>>,
+}
+impl TextWrapCache {
+    fn wrap(
+        &mut self,
+        font: &wezterm_font::LoadedFont,
+        text: &str,
+        width: f32,
+        scale: f32,
+    ) -> anyhow::Result<Vec<String>> {
+        let key = (font.id(), width.to_bits(), scale.to_bits(), text.to_owned());
+        if let Some(lines) = self.entries.get(&key) {
+            return Ok(lines.clone());
+        }
+        let lines = wrap_text(font, text, width, scale)?;
+        if self.entries.len() >= 64 {
+            self.entries.clear();
+        }
+        self.entries.insert(key, lines.clone());
+        Ok(lines)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3641,6 +3917,18 @@ fn mix_color(
     )
 }
 
+fn is_monitor_danger(action: Option<&Action>) -> bool {
+    matches!(
+        action,
+        Some(Action::Monitor(
+            monitor_ui::Command::StopHost
+                | monitor_ui::Command::StopScope
+                | monitor_ui::Command::StopPid(_)
+                | monitor_ui::Command::AcceptStop
+        ))
+    )
+}
+
 fn color(s: &str) -> window::color::LinearRgba {
     s.parse::<window::color::SrgbaTuple>()
         .expect("valid TermViAI palette color")
@@ -3717,12 +4005,18 @@ impl TermWindow {
     }
 
     fn termviai_save_form(&mut self) -> anyhow::Result<()> {
-        if let Some((size_value, keepalive_value)) = self
+        if let Some((size_value, keepalive_value, confirm_close_tabs)) = self
             .termviai_ui
             .form
             .as_ref()
             .filter(|form| form.settings)
-            .map(|form| (form.fields[0].value.clone(), form.fields[1].value.clone()))
+            .map(|form| {
+                (
+                    form.fields[0].value.clone(),
+                    form.fields[1].value.clone(),
+                    form.auth.confirm_close_tabs,
+                )
+            })
         {
             let size: f64 = size_value
                 .trim()
@@ -3732,7 +4026,12 @@ impl TermWindow {
                 .trim()
                 .parse()
                 .context("Enter the SSH keepalive interval in seconds.")?;
-            self.termviai_set_preferences(size, keepalive, self.termviai_theme())?;
+            self.termviai_set_preferences(
+                size,
+                keepalive,
+                self.termviai_theme(),
+                confirm_close_tabs,
+            )?;
             self.termviai_ui.close_form();
             return Ok(());
         }
@@ -3807,6 +4106,32 @@ impl TermWindow {
     fn termviai_action(&mut self, action: Action) -> anyhow::Result<()> {
         self.termviai_ui.generation += 1;
         match action {
+            Action::Monitor(command) => {
+                if matches!(
+                    command,
+                    monitor_ui::Command::Open
+                        | monitor_ui::Command::Add
+                        | monitor_ui::Command::Retry(_)
+                ) {
+                    self.termviai_ui.reload();
+                }
+                if command == monitor_ui::Command::Open {
+                    self.termviai_ui.discard_form();
+                    self.termviai_ui.page = Page::Monitor;
+                }
+                if matches!(
+                    command,
+                    monitor_ui::Command::Open | monitor_ui::Command::Add
+                ) {
+                    self.termviai_ui.query = Input::default();
+                }
+                let ui = &mut self.termviai_ui;
+                if let Err(error) = ui.monitor.handle(command, &ui.store) {
+                    ui.monitor.error = format!("{error:#}");
+                }
+                ui.search_focus = ui.monitor.dialog == Some(monitor_ui::Dialog::Picker)
+                    && (ui.monitor.focus.is_none() || ui.monitor.focus == Some(Action::Search));
+            }
             Action::ToggleSidebar => {
                 let now = Instant::now();
                 self.termviai_ui.toggle_sidebar(now);
@@ -3897,6 +4222,41 @@ impl TermWindow {
                 self.termviai_open_workspace(group.layout, Some(group.name), Some(id), None)?;
                 self.termviai_ui.new_tab_open = false;
             }
+            Action::RemoveSaved(id, stamp) => {
+                let entry = self
+                    .termviai_ui
+                    .workspace
+                    .data
+                    .saved
+                    .iter()
+                    .find(|entry| entry.id == id && entry.updated_at_ms == stamp)
+                    .context("This workspace changed. Reopen New Tab.")?
+                    .clone();
+                self.termviai_ui.workspace.data.remove_saved(&entry)?;
+                self.termviai_ui
+                    .workspace
+                    .saved_ids
+                    .retain(|_, saved| saved != &id);
+                for other in crate::frontend::front_end().gui_windows() {
+                    let id = id.clone();
+                    other
+                        .window
+                        .notify(super::TermWindowNotif::Apply(Box::new(move |window| {
+                            window
+                                .termviai_ui
+                                .workspace
+                                .saved_ids
+                                .retain(|_, saved| saved != &id);
+                            match crate::workspaces::WorkspaceStore::load() {
+                                Ok(data) => window.termviai_ui.workspace.data = data,
+                                Err(error) => window.termviai_ui.error = format!("{error:#}"),
+                            }
+                            if let Some(window) = &window.window {
+                                window.invalidate();
+                            }
+                        })));
+                }
+            }
             Action::ConnectRecent(index) => {
                 let host = self
                     .termviai_ui
@@ -3949,6 +4309,20 @@ impl TermWindow {
                 let theme = self.termviai_fonts.theme();
                 self.termviai_ui.open_settings(size, keepalive);
                 self.termviai_ui.form.as_mut().unwrap().auth.theme = Some(theme);
+                self.termviai_ui
+                    .form
+                    .as_mut()
+                    .unwrap()
+                    .auth
+                    .confirm_close_tabs = self.termviai_fonts.confirm_close_tabs();
+            }
+            Action::ToggleCloseConfirmation => {
+                if let Some(form) = self.termviai_ui.form.as_mut().filter(|f| f.settings) {
+                    form.auth.confirm_close_tabs = !form.auth.confirm_close_tabs;
+                    form.auth.theme_focus = false;
+                    form.focus = 2;
+                    form.reveal_focus = true;
+                }
             }
             Action::Theme(theme) => {
                 if let Some(form) = self.termviai_ui.form.as_mut().filter(|f| f.settings) {
@@ -4373,6 +4747,21 @@ impl TermWindow {
             return false;
         }
         self.current_mouse_event = Some(event.clone());
+        if self.termviai_ui.page == Page::Monitor
+            && self.termviai_ui.form.is_none()
+            && self.termviai_ui.monitor.scrollbar_mouse(
+                &event.kind,
+                x,
+                y,
+                event.mouse_buttons.contains(window::MouseButtons::LEFT),
+            )
+        {
+            self.termviai_ui.pressed = None;
+            self.termviai_ui.hover = None;
+            context.set_cursor(Some(CursorIcon::Default));
+            context.invalidate();
+            return true;
+        }
         if matches!(
             event.kind,
             MouseEventKind::Move | MouseEventKind::Release(MousePress::Left)
@@ -4531,6 +4920,17 @@ impl TermWindow {
                 context.invalidate();
             }
             MouseEventKind::VertWheel(amount) => {
+                if self.termviai_ui.page == Page::Monitor && self.termviai_ui.form.is_none() {
+                    let m = &mut self.termviai_ui.monitor;
+                    let step = amount.unsigned_abs().max(1) as usize;
+                    m.scroll_by(if amount > 0 {
+                        -(step as isize)
+                    } else {
+                        step as isize
+                    });
+                    context.invalidate();
+                    return true;
+                }
                 if let Some(picker) = &mut self.termviai_ui.host_picker {
                     let step = amount.unsigned_abs().max(1) as usize;
                     picker.scroll = if amount > 0 {
@@ -4667,6 +5067,12 @@ impl TermWindow {
             context.invalidate();
             return true;
         }
+        if self.termviai_ui.page == Page::Monitor
+            && self.termviai_ui.form.is_none()
+            && self.termviai_monitor_key(event, context)
+        {
+            return true;
+        }
         if let Some(picker) = &mut self.termviai_ui.host_picker {
             if !event.key_is_down {
                 return true;
@@ -4748,6 +5154,14 @@ impl TermWindow {
             return true;
         }
         if let Some(form) = self.termviai_ui.form.as_mut().filter(|f| f.settings) {
+            if !form.auth.theme_focus
+                && form.focus == 2
+                && matches!(event.key, KeyCode::Char(' ' | '\r'))
+            {
+                form.auth.confirm_close_tabs = !form.auth.confirm_close_tabs;
+                context.invalidate();
+                return true;
+            }
             if form.auth.theme_focus
                 && matches!(
                     event.key,
@@ -4769,14 +5183,18 @@ impl TermWindow {
                 let backwards = event.modifiers.contains(Modifiers::SHIFT);
                 if form.auth.theme_focus {
                     form.auth.theme_focus = false;
-                    form.focus = if backwards { 1 } else { 0 };
+                    form.focus = if backwards { 2 } else { 0 };
                     form.reveal_focus = true;
-                } else if (backwards && form.focus == 0) || (!backwards && form.focus == 1) {
+                } else if (backwards && form.focus == 0) || (!backwards && form.focus == 2) {
                     form.auth.theme_focus = true;
                     form.first_row = 0;
                     form.reveal_focus = false;
                 } else {
-                    form.focus = 1 - form.focus;
+                    form.focus = if backwards {
+                        form.focus - 1
+                    } else {
+                        form.focus + 1
+                    };
                     form.reveal_focus = true;
                 }
                 context.invalidate();
@@ -5008,7 +5426,15 @@ impl TermWindow {
         if !self.config.termviai_ui {
             return Ok(());
         }
+        let ui_layout = ::window::resize_diagnostics::Span::new("ui_layout");
         let now = Instant::now();
+        let keepalive = self.termviai_ssh_keepalive_interval();
+        self.termviai_ui
+            .monitor
+            .tick(&self.termviai_ui.store, keepalive);
+        if self.termviai_ui.monitor.active() {
+            self.update_next_frame_time(Some(now + Duration::from_millis(200)));
+        }
         let theme = self.termviai_theme();
         self.termviai_sync_sidebar_layout(now);
         let was_confirming = self.termviai_confirm.is_active();
@@ -5021,7 +5447,7 @@ impl TermWindow {
         let confirmation_progress = self.termviai_confirm.motion.value(now);
         let confirmation_focus = self.termviai_confirm.focused_confirm;
         let scale = self.dimensions.dpi as f32 / 96.;
-        let ui_font = self.fonts.title_font()?;
+        let ui_font = self.fonts.ui_font(14, false)?;
         let w = self.dimensions.pixel_width as f32 / scale;
         let border = self.get_os_border();
         let top = border.top.get() as f32;
@@ -5190,6 +5616,7 @@ impl TermWindow {
             &hover,
         );
         tile(&mut tiles, 58., 9., 110., 34., "TermViAI", TOP, INK, false);
+        tiles.last_mut().unwrap().text_bold = true;
         let available = (w - SIDEBAR_WIDTH - 170.).max(100.);
         let visible = ((available - 66.) / 240.).floor().max(1.) as usize;
         ui.tab_scroll = ui.tab_scroll.min(tabs.len().saturating_sub(visible));
@@ -5442,6 +5869,18 @@ impl TermWindow {
             162.,
             SIDEBAR_WIDTH - 24.,
             40.,
+            "Monitor",
+            SIDE,
+            Action::Monitor(monitor_ui::Command::Open),
+            &hover,
+        );
+        button(
+            &mut tiles,
+            &mut hits,
+            12.,
+            210.,
+            SIDEBAR_WIDTH - 24.,
+            40.,
             "Settings",
             SIDE,
             Action::Settings,
@@ -5474,6 +5913,10 @@ impl TermWindow {
         for tile in &mut tiles[sidebar_tile_start..] {
             if matches!(tile.action, Some(Action::Hosts)) && ui.page == Page::Hosts
                 || matches!(tile.action, Some(Action::Keys)) && ui.page == Page::Keys
+                || matches!(
+                    tile.action,
+                    Some(Action::Monitor(monitor_ui::Command::Open))
+                ) && ui.page == Page::Monitor
                 || matches!(tile.action, Some(Action::Settings))
                     && ui.form.as_ref().is_some_and(|f| f.settings)
             {
@@ -6040,51 +6483,23 @@ impl TermWindow {
             {
                 let y = 184. + row as f32 * 48.;
                 if let Some(action) = action {
-                    let remove = match action {
+                    let remove = match &action {
                         Action::ConnectRecent(index) => Some(Action::RemoveRecent(
-                            index,
-                            ui.workspace.data.recent[index].last_connected_ms,
+                            *index,
+                            ui.workspace.data.recent[*index].last_connected_ms,
                         )),
+                        Action::OpenSaved(id) => ui
+                            .workspace
+                            .data
+                            .saved
+                            .iter()
+                            .find(|entry| &entry.id == id)
+                            .map(|entry| Action::RemoveSaved(id.clone(), entry.updated_at_ms)),
                         _ => None,
                     };
-                    let trailing = if remove.is_some() { 36. } else { 0. };
-                    button(
-                        &mut tiles, &mut hits, cx, y, cw, 40., label, CARD, action, &hover,
+                    workspace_shortcut_row(
+                        &mut tiles, &mut hits, cx, y, cw, label, detail, action, remove, &hover,
                     );
-                    tiles.last_mut().unwrap().right_inset = trailing;
-                    if cw > 400. {
-                        tiles.last_mut().unwrap().right_inset = 182. + trailing;
-                        tile(
-                            &mut tiles,
-                            cx + cw - 182. - trailing,
-                            y,
-                            174.,
-                            40.,
-                            detail,
-                            CARD,
-                            MUTED,
-                            false,
-                        );
-                        tiles.last_mut().unwrap().transparent = true;
-                    }
-                    if let Some(remove) = remove {
-                        button(
-                            &mut tiles,
-                            &mut hits,
-                            cx + cw - 32.,
-                            y + 6.,
-                            24.,
-                            28.,
-                            "",
-                            CARD,
-                            remove,
-                            &hover,
-                        );
-                        let close = tiles.last_mut().unwrap();
-                        close.transparent = true;
-                        close.fg = MUTED;
-                        close.icon_size = 18.;
-                    }
                 } else {
                     tile(&mut tiles, cx, y, cw, 40., label, BG, MUTED, false);
                 }
@@ -6175,6 +6590,7 @@ impl TermWindow {
                     INK,
                     false,
                 );
+                tiles.last_mut().unwrap().text_bold = true;
                 button(
                     &mut tiles,
                     &mut hits,
@@ -6451,6 +6867,19 @@ impl TermWindow {
                 tile(&mut tiles, w - 7., sy, 4., 60., "", MUTED, MUTED, true);
             }
         }
+        if ui.page == Page::Monitor {
+            monitor_ui::draw(
+                ui,
+                &mut tiles,
+                &mut hits,
+                content_left,
+                w,
+                h,
+                &hover,
+                &self.fonts,
+                scale,
+            )?;
+        }
         // A separate renderer layer is required: backgrounds and glyphs are
         // batched independently within each layer, so draw order alone cannot
         // cover the library text behind the drawer.
@@ -6563,6 +6992,7 @@ impl TermWindow {
                     "New Host"
                 };
                 tile(&mut tiles, fx, 70., fw - 44., 38., title, SIDE, INK, false);
+                tiles.last_mut().unwrap().text_bold = true;
                 button(
                     &mut tiles,
                     &mut hits,
@@ -6649,6 +7079,41 @@ impl TermWindow {
                                 } else {
                                     "Terminal & SSH"
                                 },
+                                SIDE,
+                                MUTED,
+                                false,
+                            );
+                        }
+                        FormRow::CloseConfirmation => {
+                            button(
+                                &mut tiles,
+                                &mut hits,
+                                fx,
+                                y,
+                                fw,
+                                40.,
+                                "Confirm before closing tabs",
+                                FIELD,
+                                Action::ToggleCloseConfirmation,
+                                &hover,
+                            );
+                            let control = tiles.last_mut().unwrap();
+                            control.icon = Some(if form.auth.confirm_close_tabs {
+                                Icon::CheckboxChecked
+                            } else {
+                                Icon::Checkbox
+                            });
+                            control.content_centered = false;
+                            if !form.auth.theme_focus && form.focus == 2 {
+                                control.border_color = Some(ACCENT);
+                            }
+                            tile(
+                                &mut tiles,
+                                fx,
+                                y + 44.,
+                                fw,
+                                26.,
+                                "Ask before disconnecting a tab or tab group.",
                                 SIDE,
                                 MUTED,
                                 false,
@@ -7075,6 +7540,9 @@ impl TermWindow {
                 .set_target(1., now, Duration::from_millis(100));
         }
         if let Some(drag) = drag_visuals {
+            if let Some((bounds, panes)) = &drag.layout {
+                paint_pane_drag_layout(&mut tiles, *bounds, panes);
+            }
             if let Some(x) = drag.insertion_x {
                 tile(&mut tiles, x - 2., 7., 3., 38., "", "#a6a0ff", INK, false);
                 if let Some(t) = tiles.last_mut() {
@@ -7100,25 +7568,17 @@ impl TermWindow {
                 tile(
                     &mut tiles,
                     rect.x + 12.,
-                    rect.y + 12.,
+                    rect.y + if drag.layout.is_some() { 42. } else { 12. },
                     (rect.w - 24.).clamp(1., 240.),
                     32.,
-                    if drag.swapping {
-                        "Release to swap sessions"
-                    } else {
-                        "Release to place session"
-                    },
+                    "Release to place session",
                     "#285d53",
                     INK,
                     true,
                 );
                 if let Some(t) = tiles.last_mut() {
                     t.zindex = 51;
-                    t.icon = Some(if drag.swapping {
-                        Icon::Grid
-                    } else {
-                        Icon::Plus
-                    });
+                    t.icon = Some(Icon::Plus);
                 }
             }
             let label_width = 210_f32.min(w - 16.);
@@ -7148,7 +7608,16 @@ impl TermWindow {
             && ui.form.is_none()
             && ui.closing_form.is_none()
         {
-            if let Some((action, hint)) = hover.as_ref().and_then(|action| {
+            if let Some(Action::Monitor(monitor_ui::Command::Npu(n))) = &hover {
+                let due = ui.hover_started + Duration::from_millis(220);
+                if now >= due {
+                    if let Some(hit) = hits.iter().find(|h| Some(&h.action) == hover.as_ref()) {
+                        monitor_ui::draw_preview(&ui.monitor, *n, hit, &mut tiles, w, h);
+                    }
+                } else {
+                    hint_due = Some(due);
+                }
+            } else if let Some((action, hint)) = hover.as_ref().and_then(|action| {
                 let hint = match action {
                     Action::PaneError(id) => pane_errors
                         .get(id)
@@ -7169,7 +7638,7 @@ impl TermWindow {
                         let mut lines = if natural_width + 40. <= width {
                             hint.lines().map(str::to_owned).collect::<Vec<_>>()
                         } else {
-                            wrap_hint(&hint, ((width - 40.) / 8.).max(1.) as usize)
+                            wrap_text(&ui_font, &hint, width - 40., scale)?
                         };
                         let max_lines = ((h - 48.) / 22.).max(1.) as usize;
                         if lines.len() > max_lines {
@@ -7226,7 +7695,8 @@ impl TermWindow {
                     .find(|hit| x >= hit.x && x < hit.x + hit.w && y >= hit.y && y < hit.y + hit.h)
             })
             .filter(|hit| hover.as_ref() == Some(&hit.action));
-        let mut moving = ui.sidebar_motion.is_active(now)
+        let mut moving = (ui.page == Page::Monitor && ui.monitor.scrolling(now))
+            || ui.sidebar_motion.is_active(now)
             || ui.drawer_motion.is_active(now)
             || ui.page_motion.is_active(now)
             || (ui.dock_preview.is_some() && ui.dock_motion.is_active(now))
@@ -7238,11 +7708,12 @@ impl TermWindow {
                 let key = t.hover_key().unwrap();
                 visible_actions.insert(key.clone());
                 let motion = ui.hover_motion.entry(key).or_insert_with(|| Tween::new(0.));
-                motion.set_target(
-                    if t.hovered_by(hovered_hit) { 1. } else { 0. },
-                    now,
-                    Duration::from_millis(120),
-                );
+                let target = if t.hovered_by(hovered_hit) { 1. } else { 0. };
+                if is_monitor_danger(Some(action)) {
+                    motion.set_target_smooth(target, now, Duration::from_millis(220));
+                } else {
+                    motion.set_target(target, now, Duration::from_millis(120));
+                }
                 moving |= motion.is_active(now);
                 if matches!(action, Action::Maximize)
                     && self.window_state.contains(WindowState::MAXIMIZED)
@@ -7267,15 +7738,22 @@ impl TermWindow {
         if moving {
             self.update_next_frame_time(Some(now + frame_interval(self.config.max_fps as u64)));
         }
-        let font = self.fonts.title_font()?;
-        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+        let font = self.fonts.ui_font(14, false)?;
         let gl_state = self
             .render_state
             .as_ref()
             .context("Renderer not initialized")?;
         let mut input_hits = Vec::new();
         let color = |value: &str| color(theme.resolve(value));
+        drop(ui_layout);
+        let _elements = ::window::resize_diagnostics::Span::new("ui_elements");
         for mut t in tiles {
+            let font = if t.text_size.is_some() || t.text_bold {
+                self.fonts.ui_font(t.text_size.unwrap_or(14), t.text_bold)?
+            } else {
+                font.clone()
+            };
+            let metrics = RenderMetrics::with_font_metrics(&font.metrics());
             let hover = t
                 .hover_key()
                 .as_ref()
@@ -7283,12 +7761,23 @@ impl TermWindow {
                 .copied()
                 .unwrap_or(0.);
             let pressed = t.action.is_some() && t.action == self.termviai_ui.pressed;
+            let monitor_danger = is_monitor_danger(t.action.as_ref());
             let mut bg = mix_color(
                 color(t.bg),
                 color(
                     if matches!(
                         t.action,
-                        Some(Action::Close | Action::ConfirmAccept | Action::RemovePane(_))
+                        Some(
+                            Action::Close
+                                | Action::ConfirmAccept
+                                | Action::RemovePane(_)
+                                | Action::Monitor(
+                                    monitor_ui::Command::StopHost
+                                        | monitor_ui::Command::StopScope
+                                        | monitor_ui::Command::StopPid(_)
+                                        | monitor_ui::Command::AcceptStop
+                                )
+                        )
                     ) {
                         "#b84e64"
                     } else {
@@ -7297,11 +7786,30 @@ impl TermWindow {
                 ),
                 hover * 0.58,
             );
-            if matches!(t.action, Some(Action::Save | Action::AcceptHostPicker)) {
+            if matches!(
+                t.action,
+                Some(
+                    Action::Save
+                        | Action::AcceptHostPicker
+                        | Action::Monitor(monitor_ui::Command::AcceptAdd)
+                )
+            ) {
                 bg = mix_color(color(t.bg), color("#474159"), hover);
             }
             if pressed {
                 bg = mix_color(bg, color(ACCENT), 0.28);
+            }
+            if monitor_danger {
+                bg = mix_color(
+                    color(t.bg),
+                    color("#ed8193"),
+                    if pressed { 0.18 } else { hover * 0.10 },
+                );
+            }
+            // Editing fields keep a stable surface during hover and selection
+            // drags, so the text selection remains distinct from the field.
+            if t.input.as_ref().map_or(false, |paint| paint.focused) {
+                bg = color(t.bg);
             }
             if t.transparent {
                 // Header broadcast controls are bare icons at rest. Only the
@@ -7314,6 +7822,11 @@ impl TermWindow {
                             | Action::TabBroadcast(_)
                             | Action::TabMenu(_)
                             | Action::ReconnectGroup(_)
+                            | Action::Monitor(
+                                monitor_ui::Command::Menu(_)
+                                    | monitor_ui::Command::Pause(_)
+                                    | monitor_ui::Command::Retry(_)
+                            )
                     )
                 ) {
                     color(ICON_HOVER_BG).mul_alpha(if pressed { 1. } else { hover })
@@ -7333,12 +7846,20 @@ impl TermWindow {
                             | Action::CloseNewTab
                             | Action::RemovePane(_)
                             | Action::RemoveRecent(..)
+                            | Action::RemoveSaved(..)
                             | Action::CancelHostPicker
                             | Action::Cancel
                             | Action::ConfirmCancel
+                            | Action::Monitor(monitor_ui::Command::Close)
                     )
                 );
             let fg = if close_icon {
+                mix_color(
+                    color(t.fg),
+                    color("#ed8193"),
+                    if pressed { 1. } else { hover },
+                )
+            } else if monitor_danger {
                 mix_color(
                     color(t.fg),
                     color("#ed8193"),
@@ -7378,7 +7899,11 @@ impl TermWindow {
             if let Some(paint) = &t.input {
                 let input = &paint.input;
                 let left = if t.icon.is_some() {
-                    38.
+                    if t.text_size.is_some() {
+                        t.text_padding + t.icon_size + 8.
+                    } else {
+                        38.
+                    }
                 } else {
                     t.text_padding
                 };
@@ -7424,7 +7949,7 @@ impl TermWindow {
                                 positions[b] - positions[a],
                                 text_height,
                                 ElementContent::Children(vec![]),
-                                color("#575078"),
+                                color(theme.colors().input_selection),
                                 false,
                             ));
                         }
@@ -7462,12 +7987,34 @@ impl TermWindow {
                     });
                 }
             }
+            let centered = if t.content_centered && t.input.is_none() && !t.text.is_empty() {
+                let window = self.window.as_ref().unwrap().clone();
+                let glyphs = self.ui_text_cache.borrow_mut().shape(
+                    &font,
+                    &t.text,
+                    self.shape_generation,
+                    move || window.notify(TermWindowNotif::InvalidateShapeCache),
+                )?;
+                let advance = glyphs
+                    .iter()
+                    .map(|g| g.x_advance.get() as f32 / scale)
+                    .sum();
+                Some(centered_button_content(&t, advance, scale))
+            } else {
+                None
+            };
             if let Some(icon) = t.icon {
                 let size = t.icon_size.min(t.h - 4.).min(t.w - 4.).max(1.);
-                let ix = if t.text.is_empty() && t.input.is_none() {
+                let ix = if let Some((icon_x, _, _)) = centered {
+                    icon_x
+                } else if t.text.is_empty() && t.input.is_none() {
                     t.x + (t.w - size) / 2.
                 } else {
-                    t.x + 12.
+                    t.x + if t.text_size.is_some() {
+                        t.text_padding
+                    } else {
+                        12.
+                    }
                 };
                 parts.push((
                     ix,
@@ -7481,17 +8028,47 @@ impl TermWindow {
             }
             if !t.text.is_empty() {
                 let left = if t.icon.is_some() {
-                    38.
+                    if t.text_size.is_some() {
+                        t.text_padding + t.icon_size + 8.
+                    } else {
+                        38.
+                    }
                 } else {
                     t.text_padding
                 };
                 let text_width = (t.w - left - t.text_padding - t.right_inset).max(0.);
                 if text_width > 0. {
                     let text_height = metrics.cell_size.height as f32 / scale;
+                    let aligned = t.text_centered || t.text_right_aligned;
+                    let content_width = if let Some((_, _, width)) = centered {
+                        width
+                    } else if aligned {
+                        // The glyph renderer clips ink touching the right bound.
+                        // Keep a physical-pixel gutter beyond the shaped advance.
+                        (text_positions(&font, &t.text, scale)?
+                            .last()
+                            .copied()
+                            .unwrap_or(0.)
+                            + 2. / scale)
+                            .min(text_width)
+                    } else {
+                        text_width
+                    };
                     parts.push((
-                        t.x + left,
+                        if let Some((_, text_x, _)) = centered {
+                            text_x
+                        } else {
+                            t.x + left
+                                + if t.text_right_aligned {
+                                    text_width - content_width
+                                } else if t.text_centered {
+                                    (text_width - content_width) / 2.
+                                } else {
+                                    0.
+                                }
+                        },
                         t.y + (t.h - text_height).max(0.) / 2.,
-                        text_width,
+                        content_width,
                         text_height,
                         ElementContent::Text(t.text),
                         transparent,
@@ -7548,7 +8125,29 @@ impl TermWindow {
                     },
                     &e,
                 )?;
-                self.render_element(&computed, gl_state, None)?;
+                self.render_element_with_pixel_snap(&computed, gl_state, None, true)?;
+            }
+            if let Some(border) = if t.transparent { None } else { t.border_color } {
+                let layer = gl_state
+                    .layer_for_zindex(t.zindex)
+                    .context("UI border layer")?;
+                self.rounded_rectangle_outline(
+                    &mut layer.quad_allocator(),
+                    0,
+                    euclid::rect(t.x * scale, t.y * scale + top, t.w * scale, t.h * scale),
+                    t.corner_radius * scale,
+                    scale,
+                    if monitor_danger {
+                        mix_color(
+                            color(border),
+                            color("#ed8193"),
+                            if pressed { 0.7 } else { hover * 0.45 },
+                        )
+                        .mul_alpha(t.opacity)
+                    } else {
+                        color(border).mul_alpha(t.opacity)
+                    },
+                )?;
             }
         }
         self.termviai_ui.input_hits = input_hits;
@@ -7559,6 +8158,203 @@ impl TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifted_pane_preview_covers_the_old_workspace_and_draws_only_projected_frames() {
+        use super::super::termviai_dock::Rect;
+        use super::super::termviai_tab_drag::PaneDragPreview;
+        let bounds = Rect {
+            x: 180.,
+            y: 64.,
+            w: 800.,
+            h: 600.,
+        };
+        let frames = vec![
+            PaneDragPreview {
+                frame: Rect {
+                    x: 180.,
+                    y: 64.,
+                    w: 399.,
+                    h: 299.,
+                },
+                title: "209".into(),
+                incoming: false,
+            },
+            PaneDragPreview {
+                frame: Rect {
+                    x: 180.,
+                    y: 364.,
+                    w: 399.,
+                    h: 300.,
+                },
+                title: "216".into(),
+                incoming: false,
+            },
+            PaneDragPreview {
+                frame: Rect {
+                    x: 580.,
+                    y: 64.,
+                    w: 400.,
+                    h: 600.,
+                },
+                title: "217".into(),
+                incoming: false,
+            },
+        ];
+        let mut tiles = vec![];
+        paint_pane_drag_layout(&mut tiles, bounds, &frames);
+        assert_eq!(
+            (tiles[0].x, tiles[0].y, tiles[0].w, tiles[0].h),
+            (180., 64., 800., 600.)
+        );
+        assert_eq!(tiles[0].opacity, 1.);
+        assert!(!tiles[0].transparent);
+        assert!(tiles.iter().all(|t| t.action.is_none() && t.zindex == 48));
+        assert!(!tiles.iter().any(|t| t.text == "212"));
+        for pane in &frames {
+            assert_eq!(tiles.iter().filter(|t| t.text == pane.title).count(), 1);
+            assert!(tiles.iter().any(|t| t.x == pane.frame.x
+                && t.y == pane.frame.y
+                && t.w == pane.frame.w
+                && t.h == pane.frame.h
+                && t.border_color.is_some()));
+        }
+    }
+
+    #[test]
+    fn button_content_centers_icon_and_shaped_label_as_one_group() {
+        for dpi in [96, 120, 144] {
+            let scale = dpi as f32 / 96.;
+            let fonts = wezterm_font::FontConfiguration::new(
+                Some(config::ConfigHandle::default_config()),
+                dpi,
+            )
+            .unwrap();
+            for (action, label, width, size) in [
+                (Action::Cancel, "Cancel", 94., 14),
+                (Action::Save, "Save", 100., 14),
+                (Action::AddHost, "Add Host", 132., 14),
+                (Action::AddIdentity, "Add Identity", 154., 14),
+                (
+                    Action::Monitor(monitor_ui::Command::StopScope),
+                    "End all card tasks",
+                    166.,
+                    12,
+                ),
+                (Action::Save, "保存", 100., 14),
+                (Action::Save, "Long button label", 66., 14),
+            ] {
+                let mut tiles = vec![];
+                let mut hits = vec![];
+                button(
+                    &mut tiles,
+                    &mut hits,
+                    20.,
+                    30.,
+                    width,
+                    36.,
+                    label,
+                    CARD,
+                    action.clone(),
+                    &None,
+                );
+                let t = &mut tiles[0];
+                t.text_size = Some(size);
+                assert!(t.content_centered);
+                let advance = *text_positions(&fonts.ui_font(size, false).unwrap(), label, scale)
+                    .unwrap()
+                    .last()
+                    .unwrap();
+                let (icon_x, text_x, text_w) = centered_button_content(t, advance, scale);
+                let left = if t.icon.is_some() { icon_x } else { text_x };
+                let visible_advance = advance.min((text_w - 2. / scale).max(0.));
+                let right = text_x + visible_advance;
+                assert!(
+                    ((left - t.x) - (t.x + t.w - right)).abs() < 0.01,
+                    "unbalanced: {} at {} DPI",
+                    label,
+                    dpi
+                );
+                if t.icon.is_some() {
+                    assert!((text_x - icon_x - t.icon_size - 8.).abs() < 0.001);
+                }
+                assert!(text_x + text_w <= t.x + t.w);
+                assert_eq!(hit_action(&hits, 21., 31.), Some(action));
+                assert_eq!(hits[0].w, width);
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_tabs_fields_and_menu_rows_keep_leading_alignment() {
+        for action in [
+            Action::Hosts,
+            Action::Keys,
+            Action::Settings,
+            Action::Monitor(monitor_ui::Command::Open),
+            Action::Monitor(monitor_ui::Command::Home),
+            Action::Tab(0),
+            Action::NewTab,
+            Action::FocusPane(0),
+            Action::ConnectRecent(0),
+            Action::Group("group".into()),
+            Action::Field(0),
+            Action::Search,
+            Action::UseIdentity(0),
+            Action::EditMenuHost,
+            Action::DuplicateHost,
+        ] {
+            assert!(
+                !centered_button_action(&action),
+                "unexpected alignment: {:?}",
+                action
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_shortcuts_reveal_close_only_on_their_own_row() {
+        for (open, remove) in [
+            (Action::ConnectRecent(0), Action::RemoveRecent(0, 123)),
+            (
+                Action::OpenSaved("saved".into()),
+                Action::RemoveSaved("saved".into(), 123),
+            ),
+        ] {
+            for hover in [
+                None,
+                Some(open.clone()),
+                Some(remove.clone()),
+                Some(Action::ConnectRecent(99)),
+            ] {
+                let mut tiles = vec![];
+                let mut hits = vec![];
+                workspace_shortcut_row(
+                    &mut tiles,
+                    &mut hits,
+                    20.,
+                    200.,
+                    500.,
+                    "Name".into(),
+                    "Detail".into(),
+                    open.clone(),
+                    Some(remove.clone()),
+                    &hover,
+                );
+                let close = tiles
+                    .iter()
+                    .find(|tile| tile.action.as_ref() == Some(&remove))
+                    .unwrap();
+                let revealed = hover.as_ref() == Some(&open) || hover.as_ref() == Some(&remove);
+                assert_eq!(close.opacity, if revealed { 1. } else { 0. });
+                assert!(close.transparent && close.icon == Some(Icon::Close));
+                assert_eq!(hit_action(&hits, 500., 215.), Some(remove.clone()));
+                assert_eq!(hit_action(&hits, 200., 215.), Some(open.clone()));
+                assert!(tiles[0].hovered_by(hits.iter().find(|h| h.action == remove)));
+                assert!(!close.hovered_by(hits.iter().find(|h| h.action == open)));
+            }
+        }
+    }
 
     #[test]
     fn recent_remove_retains_only_its_own_row_hover() {
@@ -8612,12 +9408,65 @@ mod tests {
     }
 
     #[test]
-    fn error_hints_wrap_unicode_and_preserve_separate_messages() {
-        assert_eq!(
-            wrap_hint("离线终端\nRetry", 2),
-            vec!["离线", "终端", "Re", "tr", "y"]
+    fn measured_wrapping_preserves_words_and_uses_proportional_widths() {
+        for dpi in [96, 120, 144] {
+            let fonts = wezterm_font::FontConfiguration::new(
+                Some(config::ConfigHandle::default_config()),
+                dpi,
+            )
+            .unwrap();
+            let scale = dpi as f32 / 96.;
+            let font = fonts.ui_font(12, false).unwrap();
+            let note = "Running tasks will be interrupted. Shared processes are ended once and affect all of their Dies.";
+            for width in [240., 512.] {
+                let lines = wrap_text(&font, note, width, scale).unwrap();
+                assert_eq!(lines.join(" "), note);
+                assert!(lines
+                    .iter()
+                    .any(|line| line.split_whitespace().any(|w| w == "once")));
+                for line in &lines {
+                    assert!(*text_positions(&font, line, scale).unwrap().last().unwrap() <= width);
+                }
+            }
+            let wide = wrap_text(&font, &"W".repeat(100), 120., scale).unwrap();
+            let narrow = wrap_text(&font, &"i".repeat(100), 120., scale).unwrap();
+            assert!(wide.len() > narrow.len());
+            assert_eq!(wide.concat(), "W".repeat(100));
+            assert_eq!(
+                wrap_text(&font, "first\n\nlast", 512., scale).unwrap(),
+                vec!["first", "", "last"]
+            );
+        }
+    }
+
+    #[test]
+    fn emergency_wrap_preserves_graphemes_and_long_commands() {
+        use unicode_segmentation::UnicodeSegmentation;
+        let fonts =
+            wezterm_font::FontConfiguration::new(Some(config::ConfigHandle::default_config()), 96)
+                .unwrap();
+        let font = fonts.ui_font(13, false).unwrap();
+        let cluster = "e\u{301}";
+        let text = cluster.repeat(20);
+        let lines = wrap_text(&font, &text, 15., 1.).unwrap();
+        assert_eq!(lines.concat(), text);
+        assert!(lines
+            .iter()
+            .all(|s| s.graphemes(true).all(|g| g == cluster)));
+        let command = format!(
+            "python /workspace/{} --tokens 800000",
+            "long-path/".repeat(200)
         );
-        assert_eq!(wrap_hint("ABC", 0), vec!["A", "B", "C"]);
+        let lines = wrap_text(&font, &command, 480., 1.).unwrap();
+        assert_eq!(lines.concat().replace(' ', ""), command.replace(' ', ""));
+        for line in lines {
+            assert!(*text_positions(&font, &line, 1.).unwrap().last().unwrap() <= 480.);
+        }
+        assert_eq!(
+            wrap_text(&font, "ABC", 0., 1.).unwrap(),
+            vec!["A", "B", "C"]
+        );
+        assert!(wrap_text(&font, "", 480., 1.).unwrap().is_empty());
     }
 
     #[test]
@@ -8898,10 +9747,21 @@ mod tests {
         assert!(form.settings);
         assert_eq!(form.fields.len(), 2);
         assert_eq!(form.fields[1].value, "30");
+        assert!(form.auth.confirm_close_tabs);
+        assert!(form
+            .drawer_rows(&ui.store)
+            .contains(&FormRow::CloseConfirmation));
         assert!(ui.input().is_none());
         ui.form.as_mut().unwrap().auth.theme_focus = false;
         ui.input().unwrap().insert("16");
         assert_eq!(ui.form.as_ref().unwrap().fields[0].value, "16");
+        ui.form.as_mut().unwrap().focus = 2;
+        assert!(ui.input().is_none());
+        let form = ui.form.as_mut().unwrap();
+        form.reveal_focus = true;
+        let rows = form.drawer_rows(&ui.store);
+        let visible = form.visible_drawer_rows(&rows, 200.);
+        assert!(rows[visible].contains(&FormRow::CloseConfirmation));
         ui.close_form();
         assert!(ui.input().is_none());
         assert!(ui.page == Page::Terminal);

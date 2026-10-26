@@ -4,6 +4,10 @@
 
 > 最新、精简且可执行的项目上下文见 [MEMORY.md](MEMORY.md)。后续工作应先读取该文件；下文保留完整历史记录。
 
+## 2026-10-26 TermViAI v0.1.0-beta.7
+
+第七个 Beta 汇总 NPU Monitor 与受保护的进程操作、Windows UI 字体和窗口缩放、Monitor 平滑滚动、组内自由重排与完整布局预览、广播接收端跟随、关闭标签确认设置、保存工作区删除与最近连接去重。见 [发布说明](RELEASE_V0.1.0_BETA.7.md) 和 [验证记录](RELEASE_V0.1.0_BETA.7_VALIDATION.md)。
+
 ## 2026-10-23 TermViAI v0.1.0-beta.6
 
 第六个 Beta 汇总三套主题及 Settings 预览/持久化、默认收起的广播面板、屏幕顺序成员列表、Tab 工作区菜单、统一边框与嵌套悬浮、Keychain Key 编辑/删除，以及终端 Ctrl + 单击链接。Windows 原生 272 项测试通过。实现、发布包验证和人工验收边界见 [MEMORY.md](MEMORY.md)、[发布说明](RELEASE_V0.1.0_BETA.6.md) 与 [验证记录](RELEASE_V0.1.0_BETA.6_VALIDATION.md)。

@@ -212,6 +212,13 @@ impl TermWindow {
         ) {
             return;
         }
+        if matches!(target, CloseTarget::Tab(_)) && !self.termviai_fonts.confirm_close_tabs() {
+            if let Err(error) = self.termviai_close_target(target, self.mux_window_id) {
+                log::error!("closing TermViAI tab: {error:#}");
+                self.termviai_ui.error = format!("{error:#}");
+            }
+            return;
+        }
         let (title, detail, summary, confirm_label) = match target {
             CloseTarget::DeleteGroup(ref group) => (
                 "Delete Group?".to_string(),

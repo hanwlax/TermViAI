@@ -424,6 +424,14 @@ impl TermWindow {
         if self.tab_state(tab.tab_id()).overlay.is_some() {
             return vec![];
         }
+        self.termviai_headers_for_layout(&tab, tab.iter_panes())
+    }
+
+    pub(super) fn termviai_headers_for_layout(
+        &self,
+        tab: &Tab,
+        panes: Vec<PositionedPane>,
+    ) -> Vec<PaneHeader> {
         let scale = self.dimensions.dpi as f32 / 96.0;
         let (padding_left, padding_top) = self.padding_left_top();
         let border = self.get_os_border();
@@ -445,7 +453,7 @@ impl TermWindow {
         let outer_bottom = workspace_frame_bottom(canvas_bottom, tray_progress);
         let origin_x = padding_left + border.left.get() as f32;
         let origin_y = tab_height + padding_top;
-        tab.iter_panes()
+        panes
             .into_iter()
             .filter_map(|pane| {
                 let inset = content_inset(pane.height, requested);

@@ -1,4 +1,4 @@
-//! Reorder whole tabs, or dock a single-session tab, without reconnecting.
+//! Reorder tabs or dock existing sessions beside another pane without reconnecting.
 
 use super::termviai_dock::{drag_threshold_reached, DockSide, Rect};
 use super::{TermWindow, TermWindowNotif};
@@ -32,12 +32,18 @@ pub(super) struct TabDrag {
     reorder: Option<(Option<usize>, f32)>,
 }
 
+pub(super) struct PaneDragPreview {
+    pub frame: Rect,
+    pub title: String,
+    pub incoming: bool,
+}
+
 pub(super) struct DragVisuals {
+    pub layout: Option<(Rect, Vec<PaneDragPreview>)>,
     pub preview: Option<Rect>,
     pub pointer: (f32, f32),
     pub title: String,
     pub insertion_x: Option<f32>,
-    pub swapping: bool,
 }
 
 impl TabDrag {
@@ -98,18 +104,26 @@ fn reorder_target(
     (from != to).then_some((before, marker))
 }
 
-fn valid_source(mux: &Mux, window_id: usize, tab_id: usize, pane_id: usize) -> bool {
+fn valid_source(
+    mux: &Mux,
+    window_id: usize,
+    tab_id: usize,
+    pane_id: usize,
+    within_group: bool,
+) -> bool {
     let Some(tab) = mux.get_tab(tab_id) else {
         return false;
     };
     let panes = tab.iter_panes_ignoring_zoom();
-    panes.len() == 1
-        && panes[0].pane.pane_id() == pane_id
-        && !panes[0].pane.is_dead()
-        && panes[0].pane.downcast_ref::<LocalPane>().is_some()
+    let Some(source) = panes.iter().find(|p| p.pane.pane_id() == pane_id) else {
+        return false;
+    };
+    (within_group || panes.len() == 1)
+        && (within_group || !source.pane.is_dead())
+        && source.pane.downcast_ref::<LocalPane>().is_some()
         && mux.resolve_pane_id(pane_id).map(|(_, w, t)| (w, t)) == Some((window_id, tab_id))
         && mux
-            .get_domain(panes[0].pane.domain_id())
+            .get_domain(source.pane.domain_id())
             .map(|domain| domain.state() == DomainState::Attached)
             .unwrap_or(false)
 }
@@ -122,12 +136,18 @@ fn preflight_drop(
     target: DropTarget,
 ) -> anyhow::Result<usize> {
     anyhow::ensure!(
-        valid_source(mux, window_id, drag.source_tab, drag.source_pane),
-        "The source session was closed, moved, or split. Drag a single-session tab."
+        valid_source(
+            mux,
+            window_id,
+            drag.source_tab,
+            drag.source_pane,
+            drag.pane_reorder
+        ),
+        "The source session was closed, moved, or cannot be docked."
     );
     anyhow::ensure!(
-        target.tab != drag.source_tab && target.pane != drag.source_pane,
-        "Choose another workspace to place this session."
+        (target.tab == drag.source_tab) == drag.pane_reorder && target.pane != drag.source_pane,
+        "Choose another session to dock beside."
     );
     anyhow::ensure!(
         target.tab == drag.destination_tab
@@ -157,7 +177,8 @@ fn preflight_drop(
         .find(|pane| pane.pane.pane_id() == target.pane)
         .context("The destination pane closed.")?;
     anyhow::ensure!(
-        !pane.pane.is_dead() && pane.pane.downcast_ref::<LocalPane>().is_some(),
+        (drag.pane_reorder || !pane.pane.is_dead())
+            && pane.pane.downcast_ref::<LocalPane>().is_some(),
         "This destination cannot accept a dragged session."
     );
     anyhow::ensure!(
@@ -167,7 +188,15 @@ fn preflight_drop(
         "The destination connection is detached."
     );
     anyhow::ensure!(
-        split_fits(&tab, pane.index, target.side),
+        if drag.pane_reorder {
+            tab.preview_pane_relocation(
+                drag.source_pane,
+                Some((target.pane, target.side.split_request())),
+            )
+            .is_ok()
+        } else {
+            split_fits(&tab, pane.index, target.side)
+        },
         "This pane is too small to split. Enlarge the window and try again."
     );
     Ok(domain)
@@ -220,7 +249,7 @@ impl TermWindow {
         let can_dock = !self.termviai_library_active()
             && destination.tab_id() != tab_id
             && destination.get_zoomed_pane().is_none()
-            && valid_source(&mux, self.mux_window_id, tab_id, source.pane_id())
+            && valid_source(&mux, self.mux_window_id, tab_id, source.pane_id(), false)
             && !source_tab_overlay
             && !destination_overlay
             && !source_pane_overlay;
@@ -264,7 +293,7 @@ impl TermWindow {
             title: self.termviai_pane_label(pane),
             moved: false,
             target: None,
-            can_dock: false,
+            can_dock: true,
             pane_reorder: true,
             reorder: None,
         });
@@ -275,35 +304,7 @@ impl TermWindow {
             return;
         };
         drag.update_pointer(x, y);
-        if drag.pane_reorder {
-            let tab = Mux::get().get_active_tab_for_window(self.mux_window_id);
-            if drag.moved
-                && !self.termviai_library_active()
-                && self.get_modal().is_none()
-                && tab.as_ref().is_some_and(|t| {
-                    t.tab_id() == drag.source_tab
-                        && t.get_zoomed_pane().is_none()
-                        && t.contains_pane(drag.source_pane)
-                })
-            {
-                drag.target = self
-                    .termviai_pane_headers()
-                    .into_iter()
-                    .find(|h| h.pane_id != drag.source_pane && h.frame.contains(x, y))
-                    .map(|h| DropTarget {
-                        tab: drag.source_tab,
-                        pane: h.pane_id,
-                        side: DockSide::Left,
-                        rect: h.frame,
-                    });
-            }
-            self.termviai_ui.tab_drag = Some(drag);
-            if let Some(window) = &self.window {
-                window.invalidate();
-            }
-            return;
-        }
-        if drag.moved && self.get_modal().is_none() {
+        if drag.moved && !drag.pane_reorder && self.get_modal().is_none() {
             let mux = Mux::get();
             let all = mux
                 .get_window(self.mux_window_id)
@@ -322,36 +323,34 @@ impl TermWindow {
                 if tab.tab_id() == drag.destination_tab
                     && tab.get_zoomed_pane().is_none()
                     && self.tab_state(tab.tab_id()).overlay.is_none()
-                    && valid_source(&mux, self.mux_window_id, drag.source_tab, drag.source_pane)
+                    && valid_source(
+                        &mux,
+                        self.mux_window_id,
+                        drag.source_tab,
+                        drag.source_pane,
+                        drag.pane_reorder,
+                    )
                 {
-                    let scale = self.dimensions.dpi as f32 / 96.0;
-                    let (padding_left, padding_top) = self.padding_left_top();
-                    let border = self.get_os_border();
-                    let tab_height = if self.show_tab_bar {
-                        self.tab_bar_pixel_height().unwrap_or(0.0)
+                    // Hit-test the stable layout with the lifted leaf removed,
+                    // not the final split preview (which would chase the cursor).
+                    let headers = if drag.pane_reorder {
+                        tab.preview_pane_relocation(drag.source_pane, None)
+                            .map(|panes| self.termviai_headers_for_layout(&tab, panes))
+                            .unwrap_or_default()
                     } else {
-                        0.0
+                        self.termviai_pane_headers()
                     };
-                    let cell_w = self.render_metrics.cell_size.width as f32;
-                    let cell_h = self.render_metrics.cell_size.height as f32;
-                    for pane in tab.iter_panes() {
-                        if self.pane_state(pane.pane.pane_id()).overlay.is_some() {
+                    for header in headers {
+                        if header.pane_id == drag.source_pane
+                            || self.pane_state(header.pane_id).overlay.is_some()
+                        {
                             continue;
                         }
-                        let rect = Rect {
-                            x: (padding_left
-                                + border.left.get() as f32
-                                + pane.left as f32 * cell_w)
-                                / scale,
-                            // termviai_mouse already subtracts the OS top border.
-                            y: (tab_height + padding_top + pane.top as f32 * cell_h) / scale,
-                            w: pane.width as f32 * cell_w / scale,
-                            h: pane.height as f32 * cell_h / scale,
-                        };
+                        let rect = header.frame;
                         if let Some(side) = rect.dock_side(x, y) {
                             let target = DropTarget {
                                 tab: tab.tab_id(),
-                                pane: pane.pane.pane_id(),
+                                pane: header.pane_id,
                                 side,
                                 rect,
                             };
@@ -380,29 +379,6 @@ impl TermWindow {
             return Ok(false);
         }
         if self.get_modal().is_some() {
-            return Ok(true);
-        }
-        if drag.pane_reorder {
-            if let Some(target) = drag.target {
-                let mux = Mux::get();
-                let tab = mux
-                    .get_active_tab_for_window(self.mux_window_id)
-                    .context("The group was closed")?;
-                anyhow::ensure!(
-                    tab.tab_id() == drag.source_tab && !self.termviai_library_active(),
-                    "The active group changed"
-                );
-                anyhow::ensure!(
-                    self.tab_state(tab.tab_id()).overlay.is_none()
-                        && self.pane_state(drag.source_pane).overlay.is_none()
-                        && self.pane_state(target.pane).overlay.is_none(),
-                    "A session has an open overlay"
-                );
-                tab.swap_panes_by_id(drag.source_pane, target.pane)?;
-                self.termviai_sync_terminal_layout();
-                self.termviai_workspace_changed();
-                self.update_title();
-            }
             return Ok(true);
         }
         if let Some((before, _)) = drag.reorder {
@@ -461,6 +437,7 @@ impl TermWindow {
                 }
                 tw.termviai_sync_broadcast();
                 if workspace_changed {
+                    tw.termviai_sync_terminal_layout();
                     tw.termviai_workspace_changed();
                 }
                 tw.update_title();
@@ -484,15 +461,57 @@ impl TermWindow {
 
     pub(super) fn termviai_tab_drag_visuals(&self) -> Option<DragVisuals> {
         let drag = self.termviai_ui.tab_drag.as_ref()?;
-        drag.moved.then(|| DragVisuals {
-            preview: drag.target.map(|target| {
-                if drag.pane_reorder {
-                    target.rect
-                } else {
-                    target.rect.preview(target.side)
-                }
-            }),
-            swapping: drag.pane_reorder,
+        if !drag.moved {
+            return None;
+        }
+        let mut preview = drag.target.map(|target| target.rect.preview(target.side));
+        let layout = if drag.pane_reorder && !self.termviai_library_active() {
+            Mux::get()
+                .get_active_tab_for_window(self.mux_window_id)
+                .filter(|tab| {
+                    tab.tab_id() == drag.source_tab
+                        && self.tab_state(tab.tab_id()).overlay.is_none()
+                })
+                .and_then(|tab| {
+                    let panes = tab
+                        .preview_pane_relocation(
+                            drag.source_pane,
+                            drag.target.map(|t| (t.pane, t.side.split_request())),
+                        )
+                        .ok()?;
+                    let original = self.termviai_headers_for_layout(&tab, tab.iter_panes());
+                    let mut bounds = original.first()?.frame;
+                    for h in &original[1..] {
+                        let right = (bounds.x + bounds.w).max(h.frame.x + h.frame.w);
+                        let bottom = (bounds.y + bounds.h).max(h.frame.y + h.frame.h);
+                        bounds.x = bounds.x.min(h.frame.x);
+                        bounds.y = bounds.y.min(h.frame.y);
+                        bounds.w = right - bounds.x;
+                        bounds.h = bottom - bounds.y;
+                    }
+                    let frames = self.termviai_headers_for_layout(&tab, panes);
+                    preview = frames
+                        .iter()
+                        .find(|h| h.pane_id == drag.source_pane)
+                        .map(|h| h.frame);
+                    Some((
+                        bounds,
+                        frames
+                            .into_iter()
+                            .map(|h| PaneDragPreview {
+                                frame: h.frame,
+                                title: self.termviai_pane_label(h.pane_id),
+                                incoming: h.pane_id == drag.source_pane,
+                            })
+                            .collect(),
+                    ))
+                })
+        } else {
+            None
+        };
+        Some(DragVisuals {
+            layout,
+            preview,
             pointer: drag.pointer,
             title: drag.title.clone(),
             insertion_x: drag.reorder.map(|(_, x)| x),

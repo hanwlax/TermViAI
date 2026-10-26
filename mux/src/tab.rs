@@ -1159,6 +1159,65 @@ impl Tab {
             .split_and_insert(pane_index, request, pane)
     }
 
+    /// Project a local leaf relocation without resizing PTYs, changing focus,
+    /// notifying the mux, or transferring pane ownership. None shows the layout
+    /// after lifting the source; Some shows the exact layout after dropping it.
+    pub fn preview_pane_relocation(
+        &self,
+        source: PaneId,
+        destination: Option<(PaneId, SplitRequest)>,
+    ) -> anyhow::Result<Vec<PositionedPane>> {
+        let inner = self.inner.lock();
+        anyhow::ensure!(inner.zoomed.is_none(), "cannot preview a zoomed tab");
+        let tree = inner
+            .pane
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("empty tab"))?;
+        anyhow::ensure!(
+            tree.num_leaves() > 1 && inner.contains_pane(source),
+            "invalid source pane"
+        );
+        if let Some((target, request)) = destination {
+            anyhow::ensure!(
+                target != source && inner.contains_pane(target) && !request.top_level,
+                "invalid preview destination"
+            );
+        }
+        let mut projection = TabInner {
+            id: inner.id,
+            pane: Some(clone_pane_tree(tree)),
+            size: inner.size,
+            size_before_zoom: inner.size_before_zoom,
+            pane_header_rows: inner.pane_header_rows,
+            pane_content_padding: inner.pane_content_padding,
+            proportional_resize: inner.proportional_resize,
+            resize_reference: inner.resize_reference.clone(),
+            pane_cell_sizes: inner.pane_cell_sizes.clone(),
+            active: inner.active,
+            zoomed: None,
+            title: inner.title.clone(),
+            recency: inner.recency.clone(),
+        };
+        let cell = projection.pane_cell_sizes.get(&source).copied();
+        let pane = projection
+            .remove_pane_if_impl(|_, p| p.pane_id() == source, false, false)
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("source pane disappeared"))?;
+        if let Some((target, request)) = destination {
+            if let Some(cell) = cell {
+                projection.pane_cell_sizes.insert(source, cell);
+            }
+            let index = projection
+                .iter_panes_ignoring_zoom()
+                .iter()
+                .find(|p| p.pane.pane_id() == target)
+                .unwrap()
+                .index;
+            projection.split_and_insert_impl(index, request, pane, false)?;
+        }
+        Ok(projection.iter_panes_ignoring_zoom())
+    }
+
     /// Keep the source owned by its tab until the destination accepts it.
     /// Lock ordering also makes this safe when two callers move in opposite directions.
     pub(crate) fn move_pane_from(
@@ -2248,6 +2307,13 @@ impl TabInner {
     where
         F: Fn(usize, &Arc<dyn Pane>) -> bool,
     {
+        self.remove_pane_if_impl(f, kill, true)
+    }
+
+    fn remove_pane_if_impl<F>(&mut self, f: F, kill: bool, resize_ptys: bool) -> Vec<Arc<dyn Pane>>
+    where
+        F: Fn(usize, &Arc<dyn Pane>) -> bool,
+    {
         let mut dead_panes = vec![];
         let zoomed_pane = self.zoomed.as_ref().map(|p| p.pane_id());
 
@@ -2309,13 +2375,15 @@ impl TabInner {
                         };
 
                         if let Some(unsplit) = cursor.leaf_mut() {
-                            unsplit
-                                .resize(self.pane_content_size(unsplit.pane_id(), size))
-                                .ok();
+                            if resize_ptys {
+                                unsplit
+                                    .resize(self.pane_content_size(unsplit.pane_id(), size))
+                                    .ok();
+                            }
                         } else {
                             self.apply_pane_size(size, &mut cursor);
                         }
-                    } else if !dead_panes.is_empty() {
+                    } else if resize_ptys && !dead_panes.is_empty() {
                         // Apply our revised size to the tty
                         pane.resize(self.pane_content_size(pane.pane_id(), pane_size))
                             .ok();
@@ -2625,6 +2693,20 @@ impl TabInner {
         request: SplitRequest,
         pane: Arc<dyn Pane>,
     ) -> anyhow::Result<usize> {
+        self.split_and_insert_impl(pane_index, request, pane, true)
+    }
+
+    fn split_and_insert_impl(
+        &mut self,
+        pane_index: usize,
+        request: SplitRequest,
+        pane: Arc<dyn Pane>,
+        resize_ptys: bool,
+    ) -> anyhow::Result<usize> {
+        anyhow::ensure!(
+            resize_ptys || !request.top_level,
+            "preview only supports leaf splits"
+        );
         if self.zoomed.is_some() {
             anyhow::bail!("cannot split while zoomed");
         }
@@ -2741,21 +2823,22 @@ impl TabInner {
                 (pane, Arc::clone(&existing_pane))
             };
 
-            if let Err(error) = pane1
-                .resize(self.pane_content_size(pane1.pane_id(), split_info.first))
-                .and_then(|()| {
-                    pane2.resize(self.pane_content_size(pane2.pane_id(), split_info.second))
-                })
-            {
-                // Never leave self.pane empty when a pty resize fails. In
-                // particular, an SSH disconnect can race a drag-and-drop split.
-                self.pane.replace(cursor.tree());
-                existing_pane
-                    .resize(self.pane_content_size(existing_pane.pane_id(), existing_size))
-                    .ok();
-                return Err(error);
+            if resize_ptys {
+                if let Err(error) = pane1
+                    .resize(self.pane_content_size(pane1.pane_id(), split_info.first))
+                    .and_then(|()| {
+                        pane2.resize(self.pane_content_size(pane2.pane_id(), split_info.second))
+                    })
+                {
+                    // Never leave self.pane empty when a pty resize fails. In
+                    // particular, an SSH disconnect can race a drag-and-drop split.
+                    self.pane.replace(cursor.tree());
+                    existing_pane
+                        .resize(self.pane_content_size(existing_pane.pane_id(), existing_size))
+                        .ok();
+                    return Err(error);
+                }
             }
-
             *cursor.leaf_mut().unwrap() = pane1;
 
             match cursor.split_leaf_and_insert_right(pane2) {
@@ -3123,6 +3206,171 @@ mod test {
                 ids.sort_unstable();
                 assert_eq!(ids, vec![1, 2, 3]);
             }
+        }
+    }
+
+    #[test]
+    fn relocation_preview_matches_commit_without_resizing_or_mutating_panes() {
+        for proportional in [false, true] {
+            for source in 1..=4 {
+                for target in (1..=4).filter(|id| *id != source) {
+                    for direction in [SplitDirection::Horizontal, SplitDirection::Vertical] {
+                        for target_is_second in [false, true] {
+                            let tab = proportional_test_grid();
+                            tab.inner.lock().proportional_resize = proportional;
+                            let before = pane_layout(&tab);
+                            let panes = tab.iter_panes_ignoring_zoom();
+                            let counts: Vec<_> = panes
+                                .iter()
+                                .map(|p| {
+                                    *p.pane
+                                        .downcast_ref::<FakePane>()
+                                        .unwrap()
+                                        .resize_count
+                                        .lock()
+                                })
+                                .collect();
+                            let sizes: Vec<_> = panes.iter().map(|p| fake_size(&p.pane)).collect();
+                            let active = tab.get_active_pane().unwrap().pane_id();
+                            let lifted = tab.preview_pane_relocation(source, None).unwrap();
+                            assert_eq!(lifted.len(), 3);
+                            assert!(lifted.iter().all(|p| p.pane.pane_id() != source));
+                            let request = SplitRequest {
+                                direction,
+                                target_is_second,
+                                ..Default::default()
+                            };
+                            let preview = tab
+                                .preview_pane_relocation(source, Some((target, request)))
+                                .unwrap();
+                            assert_eq!(pane_layout(&tab), before);
+                            assert_eq!(tab.get_active_pane().unwrap().pane_id(), active);
+                            for (i, p) in panes.iter().enumerate() {
+                                assert_eq!(
+                                    *p.pane
+                                        .downcast_ref::<FakePane>()
+                                        .unwrap()
+                                        .resize_count
+                                        .lock(),
+                                    counts[i]
+                                );
+                                assert_eq!(fake_size(&p.pane), sizes[i]);
+                                assert!(preview.iter().any(|v| Arc::ptr_eq(&v.pane, &p.pane)));
+                            }
+                            let expected: Vec<_> = preview
+                                .iter()
+                                .map(|p| (p.pane.pane_id(), p.left, p.top, p.width, p.height))
+                                .collect();
+                            tab.move_pane_from(&tab, source, target, request).unwrap();
+                            assert_eq!(pane_layout(&tab), expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn relocation_preview_rejects_invalid_targets_without_changes() {
+        let tab = proportional_test_grid();
+        let before = pane_layout(&tab);
+        for (source, target) in [(1, 1), (99, 2), (1, 99)] {
+            assert!(tab
+                .preview_pane_relocation(source, Some((target, SplitRequest::default())))
+                .is_err());
+            assert_eq!(pane_layout(&tab), before);
+        }
+        assert!(tab
+            .preview_pane_relocation(
+                1,
+                Some((
+                    2,
+                    SplitRequest {
+                        top_level: true,
+                        ..Default::default()
+                    }
+                ))
+            )
+            .is_err());
+        assert_eq!(pane_layout(&tab), before);
+    }
+
+    #[test]
+    fn docking_within_group_rebuilds_splits_in_all_four_directions() {
+        for source in 1..=4 {
+            for target in (1..=4).filter(|id| *id != source) {
+                for direction in [SplitDirection::Horizontal, SplitDirection::Vertical] {
+                    for target_is_second in [false, true] {
+                        let tab = proportional_test_grid();
+                        let before = tab.iter_panes_ignoring_zoom();
+                        tab.set_pane_cell_size(source, Some((20, 30)));
+                        let moved = tab
+                            .move_pane_from(
+                                &tab,
+                                source,
+                                target,
+                                SplitRequest {
+                                    direction,
+                                    target_is_second,
+                                    ..Default::default()
+                                },
+                            )
+                            .unwrap();
+                        let after = tab.iter_panes_ignoring_zoom();
+                        assert_eq!(after.len(), 4);
+                        for old in &before {
+                            let new = after
+                                .iter()
+                                .find(|p| p.pane.pane_id() == old.pane.pane_id())
+                                .unwrap();
+                            assert!(Arc::ptr_eq(&old.pane, &new.pane));
+                        }
+                        assert_eq!(moved.pane_id(), source);
+                        assert_eq!(
+                            tab.inner.lock().pane_cell_sizes.get(&source),
+                            Some(&(20, 30))
+                        );
+                        let source = after.iter().find(|p| p.pane.pane_id() == source).unwrap();
+                        let target = after.iter().find(|p| p.pane.pane_id() == target).unwrap();
+                        let (first, second) = if target_is_second {
+                            (target, source)
+                        } else {
+                            (source, target)
+                        };
+                        match direction {
+                            SplitDirection::Horizontal => {
+                                assert_eq!(first.left + first.width + 1, second.left);
+                                assert_eq!((first.top, first.height), (second.top, second.height));
+                            }
+                            SplitDirection::Vertical => {
+                                assert_eq!(first.top + first.height + 1, second.top);
+                                assert_eq!((first.left, first.width), (second.left, second.width));
+                            }
+                        }
+                        // Move again from the new nested layout, retaining every session.
+                        tab.move_pane_from(
+                            &tab,
+                            target.pane.pane_id(),
+                            source.pane.pane_id(),
+                            SplitRequest::default(),
+                        )
+                        .unwrap();
+                        assert_eq!(tab.iter_panes_ignoring_zoom().len(), 4);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn docking_within_group_rejects_closed_or_self_targets_without_removing_sessions() {
+        let tab = proportional_test_grid();
+        let before = pane_layout(&tab);
+        for (source, target) in [(1, 1), (1, usize::MAX), (usize::MAX, 1)] {
+            assert!(tab
+                .move_pane_from(&tab, source, target, SplitRequest::default())
+                .is_err());
+            assert_eq!(pane_layout(&tab), before);
         }
     }
 

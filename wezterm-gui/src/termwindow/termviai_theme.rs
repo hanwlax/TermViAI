@@ -21,6 +21,7 @@ pub(super) struct Colors {
     pub side: &'static str,
     pub card: &'static str,
     pub field: &'static str,
+    pub input_selection: &'static str,
     pub hover: &'static str,
     pub icon_hover: &'static str,
     pub line: &'static str,
@@ -52,6 +53,7 @@ impl Theme {
                 side: "#15161a",
                 card: "#1b1d22",
                 field: "#111216",
+                input_selection: "#6e50b4",
                 hover: "#25282f",
                 icon_hover: "#363a44",
                 line: "#30333b",
@@ -71,6 +73,7 @@ impl Theme {
                 side: "#0e1a28",
                 card: "#142335",
                 field: "#0a1522",
+                input_selection: "#356fa6",
                 hover: "#1e3249",
                 icon_hover: "#314b66",
                 line: "#2b4159",
@@ -90,6 +93,7 @@ impl Theme {
                 side: "#eceef2",
                 card: "#ffffff",
                 field: "#fafbfc",
+                input_selection: "#9d83ce",
                 hover: "#e8eaf0",
                 icon_hover: "#d6dae5",
                 line: "#d1d6df",
@@ -285,6 +289,8 @@ mod tests {
                 assert!(contrast(c.accent, bg) >= 3., "{:?} accent on {}", theme, bg);
             }
             assert_ne!(c.hover, c.icon_hover);
+            assert!(contrast(c.text, c.input_selection) >= 4.5);
+            assert!(contrast(c.field, c.input_selection) >= 3.);
         }
     }
 

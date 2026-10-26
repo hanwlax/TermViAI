@@ -1,8 +1,8 @@
 //! Local SSH workspace shortcuts. These contain connection metadata, never credentials.
-use crate::hosts::Host;
+use crate::hosts::{Authentication, Host, HostStore};
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -121,6 +121,8 @@ pub struct WorkspaceStore {
     source: Option<PathBuf>,
     #[serde(skip)]
     loaded_recent: Vec<RecentConnection>,
+    #[serde(skip)]
+    loaded_saved: Vec<String>,
 }
 
 impl Default for WorkspaceStore {
@@ -132,6 +134,7 @@ impl Default for WorkspaceStore {
             extra: BTreeMap::new(),
             source: None,
             loaded_recent: Vec::new(),
+            loaded_saved: Vec::new(),
         }
     }
 }
@@ -163,6 +166,7 @@ impl WorkspaceStore {
         store.validate()?;
         store.sort_and_trim();
         store.loaded_recent = store.recent.clone();
+        store.loaded_saved = store.saved.iter().map(|entry| entry.id.clone()).collect();
         Ok(store)
     }
 
@@ -172,7 +176,11 @@ impl WorkspaceStore {
         validate_host(host)?;
         self.mutate(|latest| {
             let stamp = latest.next_stamp();
-            latest.recent.retain(|entry| !same_host(&entry.host, host));
+            let library = latest.host_library();
+            let key = recent_key(host, &library);
+            latest
+                .recent
+                .retain(|entry| recent_key(&entry.host, &library) != key);
             latest.recent.push(RecentConnection {
                 host: host.clone(),
                 last_connected_ms: stamp,
@@ -185,6 +193,20 @@ impl WorkspaceStore {
     pub fn remove_recent(&mut self, entry: &RecentConnection) -> anyhow::Result<()> {
         self.mutate(|latest| {
             latest.recent.retain(|current| current != entry);
+            Ok(())
+        })
+    }
+
+    /// Delete this exact saved template; never overwrite a concurrent edit.
+    pub fn remove_saved(&mut self, entry: &SavedWorkspace) -> anyhow::Result<()> {
+        self.mutate(|latest| {
+            if let Some(current) = latest.saved.iter().find(|current| current.id == entry.id) {
+                anyhow::ensure!(
+                    current == entry,
+                    "This workspace changed. Reopen New Tab before removing it."
+                );
+            }
+            latest.saved.retain(|current| current.id != entry.id);
             Ok(())
         })
     }
@@ -246,26 +268,25 @@ impl WorkspaceStore {
         self.validate()?;
         let cache = self.clone();
         self.mutate(|latest| {
+            let library = latest.host_library();
             for incoming in cache.recent {
-                let existing = latest
-                    .recent
-                    .iter_mut()
-                    .find(|entry| same_host(&entry.host, &incoming.host));
+                let existing = latest.recent.iter_mut().find(|entry| {
+                    recent_key(&entry.host, &library) == recent_key(&incoming.host, &library)
+                });
                 match existing {
                     Some(existing) if incoming.last_connected_ms > existing.last_connected_ms => {
                         *existing = incoming;
                     }
-                    None if !cache
-                        .loaded_recent
-                        .iter()
-                        .any(|entry| same_host(&entry.host, &incoming.host)) =>
+                    None if !cache.loaded_recent.iter().any(|entry| {
+                        recent_key(&entry.host, &library) == recent_key(&incoming.host, &library)
+                    }) =>
                     {
                         latest.recent.push(incoming);
                     }
                     _ => {}
                 }
             }
-            merge_groups(&mut latest.saved, cache.saved);
+            merge_groups(&mut latest.saved, cache.saved, &cache.loaded_saved);
             for (key, value) in cache.extra {
                 latest.extra.entry(key).or_insert(value);
             }
@@ -289,6 +310,7 @@ impl WorkspaceStore {
         latest.validate()?;
         latest.write_to(&path)?;
         latest.loaded_recent = latest.recent.clone();
+        latest.loaded_saved = latest.saved.iter().map(|entry| entry.id.clone()).collect();
         *self = latest;
         Ok(result)
     }
@@ -328,9 +350,27 @@ impl WorkspaceStore {
         Ok(())
     }
 
+    fn host_library(&self) -> HostStore {
+        let path = self
+            .source
+            .clone()
+            .unwrap_or_else(Self::path)
+            .with_file_name("hosts.json");
+        // History remains usable when the host library is temporarily unavailable.
+        // Unresolved references stay distinct; never guess their usernames/keys.
+        HostStore::load_from(&path).unwrap_or_else(|error| {
+            log::warn!("Could not resolve recent connection metadata: {error:#}");
+            HostStore::default()
+        })
+    }
+
     fn sort_and_trim(&mut self) {
         self.recent
             .sort_by_key(|entry| std::cmp::Reverse(entry.last_connected_ms));
+        let library = self.host_library();
+        let mut seen = HashSet::new();
+        self.recent
+            .retain(|entry| seen.insert(recent_key(&entry.host, &library)));
         self.recent.truncate(MAX_RECENT);
         self.saved
             .sort_by_key(|entry| std::cmp::Reverse(entry.updated_at_ms));
@@ -353,12 +393,16 @@ impl WorkspaceStore {
     }
 }
 
-fn merge_groups(current: &mut Vec<SavedWorkspace>, incoming: Vec<SavedWorkspace>) {
+fn merge_groups(
+    current: &mut Vec<SavedWorkspace>,
+    incoming: Vec<SavedWorkspace>,
+    loaded_ids: &[String],
+) {
     for entry in incoming {
         let existing = current.iter_mut().find(|existing| existing.id == entry.id);
         match existing {
             Some(existing) if entry.updated_at_ms > existing.updated_at_ms => *existing = entry,
-            None => current.push(entry),
+            None if !loaded_ids.contains(&entry.id) => current.push(entry),
             _ => {}
         }
     }
@@ -403,11 +447,46 @@ fn normalized_address(host: &Host) -> String {
     }
 }
 
-fn same_host(a: &Host, b: &Host) -> bool {
-    a.port == b.port
-        && a.username == b.username
-        && a.identity_file == b.identity_file
-        && normalized_address(a) == normalized_address(b)
+// Match connection destinations, not display labels or unresolved form fields.
+// Keep the original Host in the history so Keychain references remain editable.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum RecentReference {
+    Value(String),
+    Unresolved(String),
+}
+
+fn recent_key(host: &Host, library: &HostStore) -> (String, u16, RecentReference, RecentReference) {
+    let uses_identity = !host.identity_id.is_empty()
+        && !matches!(
+            host.authentication,
+            Some(Authentication::Password | Authentication::Key)
+        );
+    let username = if uses_identity {
+        library
+            .identities
+            .iter()
+            .find(|identity| identity.id == host.identity_id)
+            .map(|identity| RecentReference::Value(identity.username.trim().into()))
+            .unwrap_or_else(|| RecentReference::Unresolved(host.identity_id.clone()))
+    } else {
+        RecentReference::Value(host.username.trim().into())
+    };
+    let key = if matches!(
+        host.authentication,
+        Some(Authentication::Password | Authentication::Identity)
+    ) {
+        RecentReference::Value(String::new())
+    } else if !host.key_label.is_empty() {
+        library
+            .keys
+            .iter()
+            .find(|key| key.matches_label(&host.key_label))
+            .map(|key| RecentReference::Value(key.path.trim().into()))
+            .unwrap_or_else(|| RecentReference::Unresolved(host.key_label.clone()))
+    } else {
+        RecentReference::Value(host.identity_file.trim().into())
+    };
+    (normalized_address(host), host.port, username, key)
 }
 
 #[cfg(test)]
@@ -453,6 +532,153 @@ mod tests {
     }
 
     #[test]
+    fn identity_recents_merge_with_explicit_user_on_load_connect_and_stale_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspaces.json");
+        let library = HostStore {
+            identities: vec![crate::hosts::Identity {
+                id: "identity-root".into(),
+                label: "Root".into(),
+                username: "root".into(),
+            }],
+            ..Default::default()
+        };
+        library.save_to(&path.with_file_name("hosts.json")).unwrap();
+        let explicit = host("root@192.168.25.209");
+        let identity = Host {
+            authentication: Some(Authentication::Identity),
+            identity_id: "identity-root".into(),
+            username: String::new(),
+            ..explicit.clone()
+        };
+        let mut legacy = WorkspaceStore::default();
+        legacy.recent = vec![
+            RecentConnection {
+                host: explicit.clone(),
+                last_connected_ms: 10,
+            },
+            RecentConnection {
+                host: host("alice@other"),
+                last_connected_ms: 20,
+            },
+            RecentConnection {
+                host: identity.clone(),
+                last_connected_ms: 30,
+            },
+        ];
+        legacy.write_to(&path).unwrap();
+        let mut current = WorkspaceStore::load_from(&path).unwrap();
+        assert_eq!(current.recent.len(), 2);
+        assert_eq!(current.recent[0].host, identity);
+        let mut stale = current.clone();
+        current.record_recent(&explicit).unwrap();
+        assert_eq!(current.recent.len(), 2);
+        stale.save().unwrap();
+        assert_eq!(stale.recent[0].host, explicit);
+        stale.record_recent(&identity).unwrap();
+        assert_eq!(stale.recent.len(), 2);
+        assert_eq!(stale.recent[0].host, identity);
+        current.save().unwrap();
+        let removed = current.recent[0].clone();
+        current.remove_recent(&removed).unwrap();
+        stale.save().unwrap();
+        assert_eq!(stale.recent.len(), 1);
+        assert_eq!(
+            WorkspaceStore::load_from(&path).unwrap().recent,
+            stale.recent
+        );
+    }
+
+    #[test]
+    fn recent_identity_matching_preserves_distinct_accounts_ports_and_missing_references() {
+        let mut library = HostStore {
+            identities: vec![crate::hosts::Identity {
+                id: "identity".into(),
+                username: "root".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let root = host("root@server");
+        let identity = Host {
+            identity_id: "identity".into(),
+            authentication: Some(Authentication::Identity),
+            username: String::new(),
+            ..root.clone()
+        };
+        assert_eq!(recent_key(&root, &library), recent_key(&identity, &library));
+        for other in [
+            host("alice@server"),
+            host("root@server:2222"),
+            host("root@other"),
+            Host {
+                identity_file: "/private/key".into(),
+                ..root.clone()
+            },
+            Host {
+                identity_id: "missing".into(),
+                ..identity.clone()
+            },
+        ] {
+            assert_ne!(recent_key(&root, &library), recent_key(&other, &library));
+        }
+        library.identities[0].username = "alice".into();
+        assert_ne!(recent_key(&root, &library), recent_key(&identity, &library));
+        library.identities.clear();
+        assert_ne!(
+            recent_key(&host("server"), &library),
+            recent_key(&identity, &library)
+        );
+        assert_ne!(
+            recent_key(&identity, &library),
+            recent_key(
+                &Host {
+                    identity_id: "other-missing".into(),
+                    ..identity
+                },
+                &library
+            )
+        );
+    }
+
+    #[test]
+    fn recent_keys_resolve_aliases_without_reading_private_key_files() {
+        let library = HostStore {
+            keys: vec![crate::hosts::KeyFile {
+                label: "Renamed".into(),
+                previous_labels: vec!["Old name".into()],
+                path: "/unmounted/private-key".into(),
+            }],
+            ..Default::default()
+        };
+        let direct = Host {
+            identity_file: "/unmounted/private-key".into(),
+            ..host("root@server")
+        };
+        let selected = Host {
+            key_label: "Old name".into(),
+            identity_file: String::new(),
+            ..direct.clone()
+        };
+        assert_eq!(
+            recent_key(&direct, &library),
+            recent_key(&selected, &library)
+        );
+        assert_ne!(
+            recent_key(&selected, &HostStore::default()),
+            recent_key(&direct, &HostStore::default())
+        );
+        let password = Host {
+            authentication: Some(Authentication::Password),
+            ..direct.clone()
+        };
+        assert_eq!(
+            recent_key(&password, &library),
+            recent_key(&host("root@server"), &library)
+        );
+    }
+
+    #[test]
     fn workspace_recents_deduplicate_identity_update_label_and_cap_entries() {
         let temporary = tempfile::tempdir().unwrap();
         let mut store =
@@ -487,6 +713,36 @@ mod tests {
         let loaded = WorkspaceStore::load_from(&path).unwrap();
         assert_eq!(loaded.recent.len(), 2);
         assert_eq!(loaded.saved[0].name, "Renamed");
+    }
+
+    #[test]
+    fn remove_saved_preserves_recents_concurrent_edits_and_stays_deleted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workspaces.json");
+        let mut first = WorkspaceStore::load_from(&path).unwrap();
+        let id = first.save_group(None, "Remove", group()).unwrap();
+        let selected = first.saved[0].clone();
+        let mut stale = WorkspaceStore::load_from(&path).unwrap();
+        first.record_recent(&host("one")).unwrap();
+        let kept = first.save_group(None, "Keep", group()).unwrap();
+        first.rename_saved(&id, "Changed elsewhere").unwrap();
+        assert!(stale.remove_saved(&selected).is_err());
+        let selected = first
+            .saved
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap()
+            .clone();
+        first.remove_saved(&selected).unwrap();
+        stale.save().unwrap();
+        assert_eq!(stale.saved.len(), 1);
+        assert_eq!(stale.saved[0].id, kept);
+        assert_eq!(stale.recent.len(), 1);
+        first.remove_saved(&selected).unwrap();
+        assert_eq!(WorkspaceStore::load_from(&path).unwrap().saved, stale.saved);
+        // An explicit save from a live tab may intentionally create it again.
+        first.save_group(Some(&id), "Saved again", group()).unwrap();
+        assert_eq!(first.saved.len(), 2);
     }
 
     #[test]

@@ -67,6 +67,8 @@ pub struct LoadedFont {
     /// Glyphs for which no font was found and for which we should
     /// stop searching
     tried_glyphs: RefCell<HashSet<char>>,
+    #[cfg(windows)]
+    native_ui: bool,
 }
 
 impl std::fmt::Debug for LoadedFont {
@@ -282,6 +284,15 @@ impl LoadedFont {
                 &(self.handles.borrow())[fallback],
                 self.pixel_geometry,
             )?;
+            #[cfg(windows)]
+            let raster = if self.native_ui {
+                crate::rasterizer::directwrite::with_native_ui(
+                    &(self.handles.borrow())[fallback],
+                    raster,
+                )
+            } else {
+                raster
+            };
             let result = raster.rasterize_glyph(glyph_pos, self.font_size, self.dpi);
             rasterizers.insert(fallback, raster);
             result
@@ -470,6 +481,7 @@ struct FontConfigInner {
     font_dirs: RefCell<Arc<FontDatabase>>,
     built_in: RefCell<Arc<FontDatabase>>,
     title_font: RefCell<Option<Rc<LoadedFont>>>,
+    ui_fonts: RefCell<HashMap<(u16, bool), Rc<LoadedFont>>>,
     pane_select_font: RefCell<Option<Rc<LoadedFont>>>,
     char_select_font: RefCell<Option<Rc<LoadedFont>>>,
     command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
@@ -491,6 +503,7 @@ impl FontConfigInner {
             locator,
             metrics: RefCell::new(None),
             title_font: RefCell::new(None),
+            ui_fonts: RefCell::new(HashMap::new()),
             pane_select_font: RefCell::new(None),
             char_select_font: RefCell::new(None),
             command_palette_font: RefCell::new(None),
@@ -509,6 +522,7 @@ impl FontConfigInner {
         // Config was reloaded, invalidate our caches
         fonts.clear();
         self.title_font.borrow_mut().take();
+        self.ui_fonts.borrow_mut().clear();
         self.pane_select_font.borrow_mut().take();
         self.char_select_font.borrow_mut().take();
         self.command_palette_font.borrow_mut().take();
@@ -596,6 +610,7 @@ impl FontConfigInner {
         &self,
         myself: &Rc<Self>,
         entity: Entity,
+        ui_size: Option<(u16, bool)>,
     ) -> anyhow::Result<Rc<LoadedFont>> {
         let config = self.config.borrow();
         let make_bold = entity != Entity::CommandPalette;
@@ -620,6 +635,35 @@ impl FontConfigInner {
         let text_style =
             text_style.unwrap_or(config.window_frame.font.as_ref().unwrap_or(&sys_font));
 
+        let mut text_style = text_style.clone();
+        let font_size = if let Some((pixels, bold)) = ui_size {
+            // Match the TermViAI UX's proportional UI stack. Keep an explicit
+            // window-frame override and the terminal's own font independent.
+            if config.window_frame.font.is_none() && cfg!(windows) {
+                text_style.font = ["Segoe UI", "Microsoft YaHei", "Roboto"]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, family)| FontAttributes {
+                        is_fallback: index != 0,
+                        ..FontAttributes::new(family)
+                    })
+                    .chain(config.font.font.iter().cloned().map(|mut font| {
+                        font.is_fallback = true;
+                        font
+                    }))
+                    .collect();
+            }
+            for font in &mut text_style.font {
+                font.weight = if bold {
+                    FontWeight::DEMIBOLD
+                } else {
+                    FontWeight::REGULAR
+                };
+            }
+            pixels as f64 * 72. / 96.
+        } else {
+            font_size
+        };
         let dpi = *self.dpi.borrow() as u32;
         let pixel_size = (font_size * dpi as f64 / 72.0) as u16;
 
@@ -645,6 +689,8 @@ impl FontConfigInner {
             font_config: Rc::downgrade(myself),
             pending_fallback: Arc::new(Mutex::new(vec![])),
             text_style: text_style.clone(),
+            #[cfg(windows)]
+            native_ui: ui_size.is_some() && config.window_frame.font.is_none(),
             id: alloc_font_id(),
             tried_glyphs: RefCell::new(HashSet::new()),
             pixel_geometry: config.display_pixel_geometry,
@@ -660,7 +706,7 @@ impl FontConfigInner {
             return Ok(Rc::clone(entry));
         }
 
-        let loaded = self.make_entity_font_impl(myself, Entity::Title)?;
+        let loaded = self.make_entity_font_impl(myself, Entity::Title, None)?;
 
         title_font.replace(Rc::clone(&loaded));
 
@@ -674,7 +720,7 @@ impl FontConfigInner {
             return Ok(Rc::clone(entry));
         }
 
-        let loaded = self.make_entity_font_impl(myself, Entity::CommandPalette)?;
+        let loaded = self.make_entity_font_impl(myself, Entity::CommandPalette, None)?;
 
         command_palette_font.replace(Rc::clone(&loaded));
 
@@ -688,7 +734,7 @@ impl FontConfigInner {
             return Ok(Rc::clone(entry));
         }
 
-        let loaded = self.make_entity_font_impl(myself, Entity::CharSelect)?;
+        let loaded = self.make_entity_font_impl(myself, Entity::CharSelect, None)?;
 
         char_select_font.replace(Rc::clone(&loaded));
 
@@ -702,7 +748,7 @@ impl FontConfigInner {
             return Ok(Rc::clone(entry));
         }
 
-        let loaded = self.make_entity_font_impl(myself, Entity::PaneSelect)?;
+        let loaded = self.make_entity_font_impl(myself, Entity::PaneSelect, None)?;
 
         pane_select_font.replace(Rc::clone(&loaded));
 
@@ -936,6 +982,8 @@ impl FontConfigInner {
             font_config: Rc::downgrade(myself),
             pending_fallback: Arc::new(Mutex::new(vec![])),
             text_style: style.clone(),
+            #[cfg(windows)]
+            native_ui: false,
             id: alloc_font_id(),
             tried_glyphs: RefCell::new(HashSet::new()),
             pixel_geometry: config.display_pixel_geometry,
@@ -955,6 +1003,7 @@ impl FontConfigInner {
         self.fonts.borrow_mut().clear();
         self.metrics.borrow_mut().take();
         self.title_font.borrow_mut().take();
+        self.ui_fonts.borrow_mut().clear();
 
         (prior_font, prior_dpi)
     }
@@ -1065,6 +1114,22 @@ impl FontConfiguration {
 
     pub fn title_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner.title_font(&self.inner)
+    }
+
+    /// Logical-pixel UI typography, independent of terminal font scaling.
+    pub fn ui_font(&self, pixels: u16, bold: bool) -> anyhow::Result<Rc<LoadedFont>> {
+        let key = (pixels, bold);
+        if let Some(font) = self.inner.ui_fonts.borrow().get(&key) {
+            return Ok(Rc::clone(font));
+        }
+        let font = self
+            .inner
+            .make_entity_font_impl(&self.inner, Entity::Title, Some(key))?;
+        self.inner
+            .ui_fonts
+            .borrow_mut()
+            .insert(key, Rc::clone(&font));
+        Ok(font)
     }
 
     pub fn command_palette_font(&self) -> anyhow::Result<Rc<LoadedFont>> {

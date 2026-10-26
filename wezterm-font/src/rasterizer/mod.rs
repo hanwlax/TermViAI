@@ -8,6 +8,8 @@ use image::{ImageBuffer, Rgba};
 pub(crate) const FAKE_ITALIC_SKEW: f64 = 0.2;
 
 pub mod colr;
+#[cfg(windows)]
+pub mod directwrite;
 pub mod freetype;
 pub mod harfbuzz;
 

@@ -7,6 +7,7 @@ pub(super) struct Tween {
     target: f32,
     started: Instant,
     duration: Duration,
+    smooth: bool,
 }
 
 impl Tween {
@@ -16,12 +17,21 @@ impl Tween {
             target: value,
             started: Instant::now(),
             duration: Duration::ZERO,
+            smooth: false,
         }
     }
 
     /// Retarget from the currently displayed value, even during a reversal.
     /// Repeated requests for the same target never restart the transition.
     pub(super) fn set_target(&mut self, target: f32, now: Instant, duration: Duration) {
+        self.retarget(target, now, duration, false);
+    }
+
+    pub(super) fn set_target_smooth(&mut self, target: f32, now: Instant, duration: Duration) {
+        self.retarget(target, now, duration, true);
+    }
+
+    fn retarget(&mut self, target: f32, now: Instant, duration: Duration, smooth: bool) {
         if target == self.target {
             return;
         }
@@ -29,6 +39,7 @@ impl Tween {
         self.target = target;
         self.started = now;
         self.duration = duration;
+        self.smooth = smooth;
     }
 
     pub(super) fn value(&self, now: Instant) -> f32 {
@@ -37,13 +48,94 @@ impl Tween {
         }
         let progress =
             now.saturating_duration_since(self.started).as_secs_f32() / self.duration.as_secs_f32();
-        let eased = 1. - (1. - progress).powi(3);
+        let eased = if self.smooth {
+            progress * progress * (3. - 2. * progress)
+        } else {
+            1. - (1. - progress).powi(3)
+        };
         self.from + (self.target - self.from) * eased
     }
 
     /// Only active transitions need another scheduled paint.
     pub(super) fn is_active(&self, now: Instant) -> bool {
         self.from != self.target && now.saturating_duration_since(self.started) < self.duration
+    }
+}
+
+/// Pixel scroll position with a critically damped response. Wheel bursts add to
+/// the destination; direct thumb manipulation bypasses the animation entirely.
+#[derive(Clone, Debug)]
+pub(super) struct SmoothScroll {
+    pub position: f32,
+    pub target: f32,
+    pub maximum: f32,
+    pub viewport: f32,
+    velocity: f32,
+    updated: Instant,
+}
+impl Default for SmoothScroll {
+    fn default() -> Self {
+        Self {
+            position: 0.,
+            target: 0.,
+            maximum: 0.,
+            viewport: 0.,
+            velocity: 0.,
+            updated: Instant::now(),
+        }
+    }
+}
+impl SmoothScroll {
+    pub fn active(&self) -> bool {
+        self.position != self.target || self.velocity != 0.
+    }
+    pub fn sample(&mut self, now: Instant) -> f32 {
+        let dt = now.saturating_duration_since(self.updated).as_secs_f32();
+        self.updated = now.max(self.updated);
+        if dt == 0. || !self.active() {
+            return self.position;
+        }
+        let before = self.target - self.position;
+        let displacement = -before;
+        let omega = 32.;
+        let decay = (-omega * dt).exp();
+        let c = self.velocity + omega * displacement;
+        self.position = self.target + (displacement + c * dt) * decay;
+        self.velocity = (self.velocity - omega * c * dt) * decay;
+        if (self.target - self.position) * before < 0.
+            || ((self.target - self.position).abs() < 0.05 && self.velocity.abs() < 0.5)
+        {
+            self.position = self.target;
+            self.velocity = 0.;
+        }
+        self.position = self.position.clamp(0., self.maximum);
+        self.position
+    }
+    pub fn bounds(&mut self, viewport: f32, content: f32, now: Instant) {
+        self.sample(now);
+        self.viewport = viewport.max(0.);
+        self.maximum = (content - self.viewport).max(0.);
+        self.target = self.target.clamp(0., self.maximum);
+        self.position = self.position.clamp(0., self.maximum);
+        if self.position == self.target {
+            self.velocity = 0.;
+        }
+    }
+    pub fn move_by(&mut self, pixels: f32, now: Instant) {
+        self.sample(now);
+        // Reversing input responds from the visible position, not a backlog of
+        // queued wheel ticks in the old direction.
+        if pixels * (self.target - self.position) < 0. {
+            self.target = self.position;
+            self.velocity = 0.;
+        }
+        self.target = (self.target + pixels).clamp(0., self.maximum);
+    }
+    pub fn jump_to(&mut self, pixels: f32, now: Instant) {
+        self.position = pixels.clamp(0., self.maximum);
+        self.target = self.position;
+        self.velocity = 0.;
+        self.updated = now;
     }
 }
 
@@ -56,6 +148,74 @@ pub(super) fn frame_interval(max_fps: u64) -> Duration {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scroll_converges_without_overshoot_at_different_frame_rates() {
+        let now = Instant::now();
+        for fps in [30, 60, 144] {
+            let mut s = SmoothScroll::default();
+            s.bounds(500., 5000., now);
+            s.move_by(96., now);
+            assert_eq!(s.position, 0.);
+            let mut previous = 0.;
+            for frame in 1..=fps {
+                let position = s.sample(now + Duration::from_secs_f64(frame as f64 / fps as f64));
+                assert!(position >= previous && position <= 96.);
+                previous = position;
+            }
+            assert_eq!(s.position, 96.);
+            assert!(!s.active());
+        }
+    }
+    #[test]
+    fn wheel_bursts_accumulate_and_reversing_does_not_follow_old_backlog() {
+        let now = Instant::now();
+        let mut s = SmoothScroll::default();
+        s.bounds(500., 5000., now);
+        s.move_by(96., now);
+        s.move_by(96., now + Duration::from_millis(16));
+        assert_eq!(s.target, 192.);
+        assert!(s.position > 0. && s.position < 96.);
+        let before = s.sample(now + Duration::from_millis(48));
+        s.move_by(-24., now + Duration::from_millis(48));
+        assert_eq!(s.position, before);
+        assert_eq!(s.target, (before - 24.).max(0.));
+        assert!(s.sample(now + Duration::from_millis(64)) < before);
+    }
+    #[test]
+    fn direct_drag_cancels_animation_and_content_shrink_clamps_position() {
+        let now = Instant::now();
+        let mut s = SmoothScroll::default();
+        s.bounds(500., 5000., now);
+        s.move_by(300., now);
+        s.jump_to(173.25, now + Duration::from_millis(16));
+        assert_eq!(s.position, 173.25);
+        assert_eq!(s.target, 173.25);
+        assert!(!s.active());
+        s.bounds(500., 550., now + Duration::from_millis(32));
+        assert_eq!(s.position, 50.);
+        assert_eq!(s.target, 50.);
+        s.bounds(500., 400., now + Duration::from_millis(48));
+        assert_eq!(s.position, 0.);
+        assert!(!s.active());
+    }
+
+    #[test]
+    fn gentle_hover_eases_in_and_out_and_reverses_without_a_jump() {
+        let now = Instant::now();
+        let duration = Duration::from_millis(220);
+        let mut tween = Tween::new(0.);
+        tween.set_target_smooth(1., now, duration);
+        assert!(tween.value(now + duration / 4) < 0.25);
+        assert_eq!(tween.value(now + duration / 2), 0.5);
+        assert!(tween.value(now + duration * 3 / 4) > 0.75);
+        let reverse = now + duration / 2;
+        tween.set_target_smooth(0., reverse, duration);
+        assert_eq!(tween.value(reverse), 0.5);
+        assert_eq!(tween.value(reverse + duration / 2), 0.25);
+        tween.set_target_smooth(0., reverse + duration / 2, duration);
+        assert_eq!(tween.value(reverse + duration), 0.);
+        assert!(!tween.is_active(reverse + duration));
+    }
     #[test]
     fn tween_reaches_endpoints_and_stops_requesting_frames() {
         let now = Instant::now();

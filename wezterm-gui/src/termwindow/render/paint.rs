@@ -23,6 +23,7 @@ impl crate::TermWindow {
         self.allow_images = AllowImage::Yes;
 
         let start = Instant::now();
+        let preparation = ::window::resize_diagnostics::Span::new("paint_prepare");
 
         {
             let diff = start.duration_since(self.last_fps_check_time);
@@ -105,7 +106,11 @@ impl crate::TermWindow {
         }
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
-        self.call_draw(frame).ok();
+        drop(preparation);
+        {
+            let _submit = ::window::resize_diagnostics::Span::new("draw_submit");
+            self.call_draw(frame).ok();
+        }
         self.last_frame_duration = start.elapsed();
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",

@@ -265,3 +265,176 @@ Computer Use 对该应用返回 `product policy blocks this app`，没有绕过�
 ## 2026-10-23 beta.6 发布验证
 
 Windows 原生 SSH 19、window 5、终端核心 54、mux 42、广播 12、GUI 140，共 272 项通过，Release 编译成功。CLI/PE 版本为 beta.6，数值版本 0.1.0.6，10 个嵌入图标与源文件一致；557 个构建输入核对通过。归档内容、校验值、审查范围与人工验收边界见 [beta.6 验证记录](RELEASE_V0.1.0_BETA.6_VALIDATION.md)。历史试用记录保留，不代表正式版本字符串。
+
+## 2026-10-23 输入框文字选区对比度修复
+
+截图与代码确认文字选区复用主题 soft 底色，且输入框通用悬浮/按下叠色降低其辨识度。现在 Ink/Navy/Light 各有独立 input_selection 配色；聚焦输入框在悬浮和拖动时保留原底色。统一输入绘制路径覆盖表单与搜索，保留原有选区、光标与密码掩码行为。
+
+扩展现有主题对比度回归：三套主题的选中文字/选区底色至少 4.5:1、选区/输入框至少 3:1。Windows 完整 GUI 140 项测试与 Release 编译通过；nightly rustfmt、git diff --check、两处 Rust 源码与构建副本一致性以及 ZIP CRC/逐文件 SHA-256 通过。构建日志 `termviai-input-selection.log`。未执行原生鼠标/DPI 实测，需在试用包确认悬浮、拖动、Ctrl+A 和密码框的实际效果。
+
+独立试用包 `TermViAI-input-selection-20261023.zip`；仍使用 beta.6 版本字符串，未替换 GitHub 发布附件。ZIP SHA-256：`511663d177cd0a0fba682191303a728431f5b9331b9a1aeda0a8b805acaa4a7e`；EXE SHA-256：`f3b8ba214119198a7e5eaa9614e583b5f3398ad744fd29b5bcb052257dc76594`。
+
+## 2026-10-23 组内终端四向停靠重排
+
+组内标题栏拖动不再调用固定位置互换，改为复用单终端 Tab 拖入的 DockSide 命中、半区预览、preflight 与 Mux MovePane 路径。命中和预览统一使用当前显示的 pane frame；松手按左/右/上/下方向移入目标分屏，原位置自动合并。自身/有效区域外/切换组/已关闭目标不会移动；Esc 取消；单 pane 放大时需恢复组视图。LocalPane 与已连接 Domain 的安全限制保持，远程管理的布局不会被直接修改。
+
+新增 mux 回归覆盖四终端所有不同来源/目标的四方向移动（48 组）、连续嵌套重排、原 pane 对象与独立字号保留、来源/目标关闭和自身落点。已有同组/跨组 resize 失败回滚、字体/标题留白、广播和 Tab 拖动回归保留。Windows mux 44 项、GUI 140 项共 184 项通过，Release 构建成功；nightly rustfmt、git diff --check、4 个修改过的 Rust 文件与 Windows 副本比对、ZIP CRC 和逐文件 SHA-256 通过。日志 `termviai-pane-docking.log`。真实鼠标拖动、SSH 会话和不同 DPI 仍需原生验收。
+
+试用包 `TermViAI-pane-docking-20261023.zip` 包含上一轮输入选区修复，版本字符串仍为 beta.6，未替换公开发布附件。ZIP SHA-256：`06113d45c8ee6bf090389677351a6c72f5741a2bb099e92260e395eb33c650fa`；EXE SHA-256：`15e99ed96b0f57718510b943b965cff58bd36fb4cdc97f2309aaeac8c74f2a72`。
+
+## 2026-10-24 NPU Monitor 试用
+
+按已确认的紧凑监控 UX 新增原生 Monitor 页面、已有 Hosts 多选、独立 SSH 后台采样、主机汇总及 NPU/Die 卡片。整张 NPU 卡片统一悬浮预览和点击，内部指标没有重复入口；右侧进程抽屉提供 Die 筛选与确认后的单个/范围进程结束。复用三套主题、认证和 UI 样式。详见 [MONITOR.md](MONITOR.md)。
+
+Windows 完整 GUI 149 项、Python 采集器 9 项测试通过，Release 编译成功。覆盖整卡单一命中、三种窗口尺寸下抽屉点击边界、去重、PID 重用、权限与排队操作取消。源码格式化、git diff --check、14 个变动构建输入与 Windows 副本哈希一致、ZIP CRC/逐文件 SHA-256 校验通过。打包 EXE 的 `--version` 成功，保留 `TermViAI 0.1.0-beta.6`。链接阶段存在依赖缺少调试 PDB 的既有警告，不影响 Release 构建成功。
+
+试用包：`/mnt/c/Users/h00893113/Documents/Codex/termviai-win/releases/TermViAI-monitor-20261024-windows-x86_64.zip`（30,040,271 字节）。ZIP SHA-256：`5ba6b5376022be26eb324732c730bcde30431d945ecd1211ad06bb0ec06f86b3`；EXE SHA-256：`744939de4d1e65831f50557f4e507f6a3fa9de0b36f8a0c998cd190002c7e02b`。相同 releases 目录保留 `termviai-monitor-20261024-build.log`、`monitor-20261024-validation.json` 和 ZIP 校验文件。包含此前未发布的输入框选区与组内四向停靠改动。
+
+未连接真实 SSH/NPU 主机，未结束任何真实进程；原生鼠标、DPI、远端设备表格版本与长时间运行仍待用户试用验证。本轮没有提交、推送或替换公开 Release 附件。
+
+## 2026-10-24 Monitor 首次采样失败与表格兼容修复
+
+用户反馈全部 Unavailable，详情 Remote collector failed。确认监控代码在 exec 启动后 drop stdin，而共享 SSH 桥把本地输入 EOF 处理为关闭整个通道；修复为保留 stdin 到输出及退出状态读完。状态文案改为等待首个样本/尚无成功样本，失败时保留退出码和远端 stderr，不再误报 Waiting for SSH。
+
+参考用户提供的 npus-usage 项目，新增其 25.5.1 Chip/Phy-Id 与 25.6 单 Die 表格样例。旧解析器在两个样例上均复现 Unsupported device table，修复后 11 项采集测试通过；保留非连续编号、未知 HBM、进程身份与权限保护。Windows GUI 151 项通过，其中新增 socketpair 回归验证命令完成前 stdin 仍打开，以及 stderr/退出码保留。Release 编译、EXE --version、16 个源码/样例构建输入比对、ZIP CRC/逐文件 SHA-256、git diff --check 通过。
+
+独立包 `TermViAI-monitor-fix-20261024-windows-x86_64.zip`，30,038,371 字节，位于此前相同 releases 目录。ZIP SHA-256：`ccd9ff515cec0f75166134ff5011467d4858ec95aee618c0908802e2639780f0`；EXE SHA-256：`4a716c64ae2581ee153fd394c9fd748a7b1152d4d4d9d9bae04864381fae9d69`。日志 `termviai-monitor-fix-20261024-build.log`，清单 `monitor-fix-20261024-validation.json`。保留 beta.6 版本字符串及旧试用包；没有连接真实远端或运行真实进程控制，需要用户更新后验证实际采集。
+
+## 2026-10-24 Monitor UX 对照修正
+
+用户提供的 UX/实现截图确认字号层级、主机图标、统计与设备信息、面包屑、错误空状态及操作入口存在偏差。按照既有 HTML 设计稿校正 Monitor 页面：独立 UI 字体尺寸和字重、卡片边框/指标布局、状态计数、采样间隔下拉框、错误时的重试与禁用操作、居中空状态及原因抽屉。卡片内 Retry/Resume 保留父卡高亮并有独立悬浮底色；设备拓扑未知时不填示例数值。详细规则见 MONITOR.md。
+
+Windows 完整 GUI 154 项通过，Release 编译成功。新增对照回归覆盖 720×480、1024×768、1488×814 三种尺寸的概览/错误详情、字体层级、操作禁用、父子悬浮、间隔选择与原因抽屉返回；实际加载字体并验证缓存、DPI 变化及终端字号独立性。17 个构建输入与 Windows 副本一致；EXE --version、ZIP CRC/逐文件 SHA-256、git diff --check 通过。后台与采集逻辑沿用已验证的修复，11 项 Python 测试本轮未变更。
+
+试用包 `TermViAI-monitor-ux-20261024-windows-x86_64.zip`，30,060,014 字节，位于 Windows 构建目录的 releases 中。ZIP SHA-256：`df0f6bebbfe1a9b4653d0c3337bac36c8c9378b912ac05a6605aa1801d99497a`；EXE SHA-256：`9cb244f153ee303ab8e50b081af340e36d12db554abf9b3bfbd9c9ee58006bc4`。日志 `termviai-monitor-ux-20261024-build.log`，清单 `monitor-ux-20261024-validation.json`，布局坐标 `monitor-ux-20261024-layout.json`。
+
+离线 GDI 排版图来自原生绘制函数生成的 Tile 坐标，图标使用名称占位，仅用于排版核对，未冒充应用截图。真实 Windows GPU/鼠标/DPI 外观尚需用户试用确认；本轮未连接远端或执行真实进程操作。保留 beta.6 版本字符串，没有提交、推送或发布新 Beta。
+
+## 2026-10-24 Monitor 进程工作目录
+
+- Python 采集器 14 项测试通过；新增同 PID 跨 Die 复用、路径空格/Unicode/已删除目录后缀、权限/目录消失不影响其他元数据、PID 重用不发布路径。未连接真实主机或发送真实信号。
+- Windows Release GUI 155 项测试通过；新增详情工作目录、Unavailable、长路径完整换行且不与启动命令重叠的原生布局验证。
+- 实际远端工作目录及原生窗口视觉效果仍待用户试用验收。
+- Windows Release 编译、EXE `--version`、17 个修改输入一致性及 ZIP 完整性/文件 SHA256 检查通过。试用包：`C:\Users\h00893113\Documents\Codex\termviai-win\releases\TermViAI-monitor-cwd-20261024-windows-x86_64.zip`；ZIP SHA256：`eca9310b54b6dc9a6688dc4b7a63f4ba438487d6cc1c6cb4584adbb9030d3e1c`。版本号维持 beta.6，非正式新发布。
+
+## 2026-10-24 NPU 悬浮预览与设计稿对齐
+
+- 对照用户最新两张截图以及原稿 `termviai-monitor.html` 的 mn-peek 样式，确认原生实现错误使用了通用文字 tooltip。改为分层进程预览卡片、220 ms 延迟、右对齐指标及一致的边框/颜色。
+- Windows GUI 159 项测试通过；新增覆盖：2 个跨 Die 进程的去重与当前卡显存合计；空/未知/暂停状态与模态遮挡；底部翻转、小窗口边界及超量提示；两种宽度的列数及指标对齐。Python 采集器 14 项测试通过。
+- Windows Release 编译成功。原生布局坐标导出并使用 GDI 离线审查两列/四列布局、预览行间距与数值列；这不是原生运行截图，离线图使用矩形/图标名称占位，实际圆角、阴影、glyph 裁切及鼠标交互仍待试用验收。
+- 新试用包为 `TermViAI-monitor-preview-20261024-windows-x86_64.zip`，版本号仍为 beta.6；保留此前工作目录、SSH 采样和解析修复。未连接真实主机或执行进程终止。
+
+## 2026-10-24 文字与结束按钮悬浮优化
+
+- Windows GUI 161 项测试通过，Release 编译成功。新增 smoothstep 动画首尾缓入缓出/反向连续性和重复目标不重启动画验证；glyph 原点测试覆盖 100%/125%/150%/200% DPI 与奇偶窗口尺寸；详情布局测试确认正文 13 px、名称较重字重且长路径不与命令重叠。
+- 仅监控显式 UI 字体选择像素对齐入口，默认渲染入口保留原有浮点坐标。结束操作背景降低为淡红染色，文字/边框同步渐入，保持确认流程。
+- 试用包 `TermViAI-monitor-polish-20261024-windows-x86_64.zip`。真实鼠标动画和文字清晰度尚未进行原生屏幕验收；未执行任何远端进程结束操作。采集器未更改，沿用此前 14 项测试结果。
+
+## 2026-10-24 Monitor 进程抽屉滚动
+
+- Windows GUI 164 项测试通过。新增长命令/三进程抽屉用例覆盖 720×480 与 1417×872 窗口：连续重绘和样本变化保留位置，最末命令及说明均可到达，操作命中不会溢出可见内容区。
+- 背景 NPU 网格滚动与详情抽屉相互独立，关闭抽屉恢复原页位置；滚动条拖动到边界、松开、轨道点击、切换筛选清理拖动状态均通过回归。
+- 试用包 `TermViAI-monitor-scroll-20261024-windows-x86_64.zip`；未连接远程主机或终止进程。实际鼠标操作仍需试用验收。
+- Windows Release 编译通过，试用包压缩完整性及 19 个修改输入一致性检查通过；EXE 版本号维持 beta.6。
+
+## 2026-10-24 Monitor 连续像素滚动
+
+参考 Windows Scroll viewer 的鼠标/滑块交互以及可视区/内容比例模型，替换抽屉的整档滚动。实现连续像素位置、临界阻尼目标跟踪、直接拖动、比例滑块、悬浮加宽和固定标题/页脚遮罩。
+
+测试覆盖 30/60/144 fps 下无超调收敛与静止后停止额外动画，连续输入积累、反向输入、拖动中止动画、内容缩短钳制；比例滑块与小数位置跟手；边缘部分文字保留在裁切层下而非整行移除；沿用长命令、多进程、背景页位置和命中边界回归。渲染动画接入正常帧调度，采集数据刷新仍保持独立周期。
+
+试用包名 `TermViAI-monitor-smooth-20261024-windows-x86_64.zip`。本次测试不连接真实主机或结束进程；原生 GPU 裁切、实际鼠标/触控板手感仍需用户试用，不将时间模型测试当作实机流畅度测量。
+- 最终源码 Windows GUI 169 项测试通过，包括不足 1 px 溢出时滑块末端对齐。
+- Windows Release 编译、版本启动、压缩包完整性及 19 个修改输入一致性检查通过；版本号仍为 beta.6。
+
+## 2026-10-24 确认页层次与统一 UI 字体
+
+- Windows GUI 170 项测试通过。字体测试检查真实解析出的 Segoe UI 字体、400/600 字重及未使用模拟加粗，并沿用 DPI/缓存/终端缩放隔离验证。
+- 确认页测试覆盖 720×480 与 1417×872：名称与 PID/用户对齐且互不重叠，存在分隔线与范围摘要；单 PID 跨 3 个 Die 的影响被完整统计；刷新清空实时样本后，已捕获的确认摘要不变化。没有向真实主机发送操作。
+- 新试用包为 `TermViAI-monitor-typography-20261024-windows-x86_64.zip`，保留连续滚动与危险操作渐入。字体测试不等同于原生视觉验收；不同 DPI、三种主题、浏览器/原生渲染差异仍需用户屏幕确认。
+- Windows Release 编译、EXE `--version` 启动、ZIP CRC/逐文件校验与 19 个修改构建输入一致性检查通过。ZIP SHA-256：`58b01bd9561638d5c5d9662f74b04aeb8b2e76a5a364dd980ab4ab13e58e19f2`。版本字符串仍为 beta.6。
+
+## 2026-10-24 Monitor 滚动越界与窗口标题栏操作
+
+- Windows GUI 172 项测试通过。新增回归覆盖 1725×1091 → 1725×677 → 720×480 的窗口变化，以及 0 / 531.25 / 1200.5 px 滚动位置；长卡片背景必须始终位于 y≥52 的抽屉表面，连续位置不变，固定遮罩仍存在。
+- 对 Processes / Stop / Picker / Reason / Remove 五种抽屉检查拖动、最小化、最大化/还原、关闭命中均保留，遮罩点击不会触发下方主机连接。原有部分文本裁切与滚动连续性回归继续通过。
+- 自动测试验证布局/事件路由，不代替 Windows 原生鼠标与渲染验收；未连接 SSH 或执行进程终止。
+- Windows Release 编译、EXE 版本启动、ZIP CRC/逐文件哈希和 19 个修改构建输入一致性检查通过。试用包 `TermViAI-monitor-window-20261024-windows-x86_64.zip`，仍使用 beta.6 版本号。ZIP SHA-256：`5d0caf25a1b8879f355e06d06ebfae881460ff813ad2f9ddf415a774b66aa892`。
+
+## 2026-10-24 Windows UI 文字栅格化
+
+- 用户确认截图为 100% 缩放；因此高 DPI 默认禁用 hinting 不是本次的直接原因。截图边缘像素符合灰度混合，不能据此声称对照应用启用了 ClearType。发现默认字号 UI 没有进入既有物理像素对齐路径，现统一启用。
+- 默认 Windows UI 使用 DirectWrite 灰度分析/网格对齐，保留现有 shaping advance。172 项 GUI 回归通过；新增 2 项字体测试覆盖 96/120/144/192 DPI、400/600 字重的真实字形，确认抗锯齿灰阶、纹理尺寸、原生输出区别于回退输出，终端与普通标题字体不启用 UI 原生路径；强制无效 glyph 与显式 FreeType 标记均返回配置的回退。
+- 对照图 `ui-raster-comparison.png` 每两行为同字号/字重：上 FreeType，下 DirectWrite。它由真实 glyph mask 和离线合成生成，不是原生应用截图，没有替代整页 GPU/鼠标验收。
+- 应在三种主题实际检查 Hosts、Keychain、主机编号、输入框和监控小字。保留终端等宽字体/配置、显式 frame 字体覆盖、颜色/位图/变量实例和嵌入字体的原有回退；不对整体截图做锐化滤镜。
+- 最终字体回退测试与 Windows Release 重建通过，EXE `--version` 启动成功（仍为 beta.6）；ZIP CRC/逐文件哈希及 21 个修改构建输入一致性检查通过。试用包 `TermViAI-ui-text-20261024-windows-x86_64.zip`，SHA-256：`2fb2cb68b3fbf1c5102cc5851d5337ec1ea15b56d466c39cb1e83ae46629ac74`。
+
+## 2026-10-24 Monitor 单词断行
+
+- 原因是固定字符数分块（确认说明按 512 / 8 = 64 个字符），不是英文单词连字。所有监控抽屉的多行说明、命令、工作目录和错误文字改用实际渲染字体测宽；优先 Unicode 换行机会，超长 token 按 grapheme 断行，保留显式段落。
+- 新回归使用实际 UI 字体在 96/120/144 DPI 检查截图原句、普通单词完整性与行宽；对照 W / i 比例字宽，检查组合字符、超长路径、空段和极窄宽度。已有抽屉卡片、窗口缩小、连续滚动、标题栏命中等回归使用真实字体测量生成布局。
+- 字体/布局回归不是原生屏幕验收，未连接 SSH 或执行进程终止。
+- Windows GUI 173 项测试全部通过；Release 编译、EXE 版本启动、ZIP CRC/逐文件哈希及 21 个修改构建输入一致性检查通过。试用包 `TermViAI-ui-wrap-20261024-windows-x86_64.zip`（版本仍为 beta.6），SHA-256：`3616e5236e5c80a172177fc8ff542de21d9bfb44f08b2a339b7070aa26e9f46b`。
+
+## 2026-10-24 Windows 缩放调度与 UI 文字缓存
+
+- GUI 174 项回归通过，另有 1 项手动 CPU 基准通过；窗口 9 项测试通过，包含帧预算扣除工作耗时、合并待处理请求、最终摘要采样有界和真实 CSV 后台写出。
+- 最终基准（120 次采样，预热 20 次）：NPU 列表无缓存 P50/P95 0.257/0.470 ms，有缓存 0.024/0.025 ms；长命令抽屉无缓存 0.685/1.166 ms，有缓存 0.074/0.115 ms。两组 glyph 总数分别一致。这是 Monitor 布局和文字 shaping 的 CPU 测试，不包含完整 box model 或 GPU/呈现，不是应用 FPS。
+- Windows live resize 合并尺寸更新；更新区域在限帧时也完成验证；计时按帧起始时间，独立模态唤醒避免依赖新的鼠标消息。退出拖动补齐最终通知。现有最大化边界、负坐标屏幕工作区与普通窗口框架回归继续通过。
+- computer-use 技能禁止自动操作终端应用，所以没有自动拖动真实 TermViAI。试用包提供 Resize-Diagnostics.cmd，释放鼠标后将阶段统计追加至 resize-trace.csv；不采集终端/主机/认证内容。详见 [RESIZE_PERFORMANCE.md](RESIZE_PERFORMANCE.md)。
+- 最终 Windows Release 构建与打包 EXE 版本启动通过；ZIP CRC/逐文件哈希及 32 个修改输入与 Windows 构建副本一致。包名 `TermViAI-resize-20261024-windows-x86_64.zip`，版本仍为 beta.6；SHA-256：`5b008a500b86a4a8c6f362116d2f29e485c13872768c1fb8b13cfc007c142505`。
+
+## 2026-10-24 广播输入接收终端自动跟随
+
+- 复核截图为 4/4 广播：原来的键盘/粘贴调用者只重置源终端 viewport。统一发送入口现在只对非空输入的成功接收成员执行已有 scroll-on-input 逻辑，保留复制/搜索 overlay、用户关闭自动跟随的配置和源终端原处理。
+- 既有广播路由 11 项、Windows shell routing 1 项和 Windows GUI 174 项回归全部通过。路由回归涵盖失败隔离、离线跳过、成员选择、空输入等；这些不是新行为的真实 SSH 窗口验收。
+- 手工验收：开启组广播，将 216 滚动到历史输出，在 209 输入或粘贴，216 应立即回到底部并跟随输出；取消 216 的广播选择后重复，216 应保留历史位置。仅有远端后台输出时也应保持历史位置。
+- Windows Release 构建、33 个修改输入与构建副本一致性、ZIP CRC/逐文件 SHA-256 均通过。试用包 `TermViAI-broadcast-scroll-20261024-windows-x86_64.zip`，版本仍为 beta.6，SHA-256：`f8933b071cce39bbdea46628a8d7bec8e88b0d4ff7cf7201cde37be20bb72e6a`。
+
+## 2026-10-24 Monitor 进程按钮禁用状态
+
+- 详情的批量与单进程操作在禁用分支原来使用普通 text，导致边框消失、无点击区域却看不出原因。现在与主机级按钮共用完整的禁用外观，保持圆角、边框和内边距，不增加可执行命中区域。
+- 有进程但不可操作时在列表上方说明原因；空范围显示无可结束进程。保留 controls_enabled 现有条件，不因进程存在就放开结束操作。
+- Windows GUI 175 项测试通过；新增真实布局回归检查正常、空范围、暂停、过期、身份缺失、权限、平台限制、采集失败、操作进行中的外观、提示和点击区域，并验证混合权限时可操作的单 PID 仍可点击。未连接远端或结束真实进程。
+- Windows Release、打包 EXE 版本启动、33 个修改构建输入校验、ZIP CRC/逐文件哈希通过。试用包 `TermViAI-monitor-controls-20261024-windows-x86_64.zip`（beta.6），SHA-256：`42aebc803f9da7dedf7f0fedd734bcfb34169a8ac6a82824c904257ec6ca3a2d`。
+
+## 2026-10-26 缺失 Python pidfd 绑定的主机兼容
+
+- 根据 216 提供的 Python 3.13.12 输出（pidfd_open=False、pidfd_send_signal=True），将采集与终止的能力判断改为共享适配器；保留原生路径，缺失时使用 libc/已核对 ABI 的 syscall。
+- Linux Python 22 项测试通过：原生优先、缺少 open / 两个绑定、真实 libc 和 raw syscall 自身 pidfd/信号 0、模拟 x86_64/AArch64 调用参数、未知 ABI 拒绝、内核 ENOSYS/策略拒绝、关闭描述符，以及原有过期 PID/非 NPU 成员/权限/容器检查。真实探测只作用于测试程序自身，不发送终止信号。
+- Windows GUI 175 项测试通过。没有连接 216 或终止远程进程；216 实际内核能力和原生窗口效果留待试用验收。
+- Windows Release、EXE 版本启动、33 个修改构建输入一致性、ZIP CRC/逐文件哈希通过。试用包 `TermViAI-pidfd-compat-20261026-windows-x86_64.zip`（beta.6），SHA-256：`090b5bc91bc575b61008692109f1834888381b57ffb9f591308e5e5996d5cf7f`。
+
+## 2026-10-26 通用按钮左右留白
+
+- 根因：通用 button 使用固定宽度与左侧内边距，剩余宽度全部留在右侧。新增操作按钮整体内容居中，按照当前字体 shaping advance 计算图标+间距+标签总宽，复用已有 UI shaping 缓存，并保留独立的物理像素裁切余量。
+- 常规表单、添加、广播和 Monitor 操作按钮采用整体居中；禁用 Monitor 按钮保持同一布局。侧栏、Tab、输入框、卡片、认证选择列表及菜单行保留前缘对齐。Monitor 面包屑用真实字号测宽，保持文字原点，背景与 hit 一起收紧。
+- Windows GUI 178 项测试通过。新增 96/120/144 DPI 实际字体对照，检查中英文、图文组合、长标签的留白/裁切/点击区域；另验证导航排除规则及面包屑文字原点和命中尺寸。原生屏幕外观仍需试用验收。
+- Windows Release、EXE 版本启动、33 个修改构建输入一致性、ZIP CRC/逐文件哈希通过。试用包 `TermViAI-button-alignment-20261026-windows-x86_64.zip`（beta.6），SHA-256：`f2d19671782e7d08e5e2f323fd954b49b4adf2ff97582d17254bb55e84025e18`。
+
+## 2026-10-26 组内拖动的完整布局预览
+
+- 旧逻辑仅高亮目标原矩形的一半，忽略源叶移除后兄弟节点的扩展。新增 mux 克隆树预览，共用现有 remove/split 计算，抑制 PTY resize；不更改真实树、活动终端、recency 或广播成员。
+- 拖动超过阈值后以不透明布局示意（保留主机标题）覆盖旧终端画面；源位置不再保留，显示补位后的各终端边界及最终插入区域。命中测试基于移除源后的稳定几何；实际终端内容与尺寸直到释放才变化。取消或无有效落点时原布局保持不变。
+- Windows mux 46 项和 GUI 179 项测试通过。新增 96 组预览/实际提交对照（两种缩放布局模式 × 四个源 × 三个目标 × 四个方向），逐项核对坐标/尺寸，验证预览不增加 PTY resize、不改变活动 pane，并保留对象身份；另覆盖无效目标及 GUI 对旧位置的全覆盖。真实原生鼠标拖动仍待试用验收。
+- Windows Release、EXE 版本启动、34 个修改构建输入一致性、ZIP CRC/逐文件哈希通过。试用包 `TermViAI-dock-preview-20261026-windows-x86_64.zip`（beta.6），SHA-256：`2a421bbe5177e24f1160c9ecef5edc5375ceea066e684f876aa284a702496ba3`。
+
+## 2026-10-26 结束进程确认中的工作目录
+
+- 在既有名称/PID/用户/卡与 Die 信息下增加 Working directory，使用现有主题正文色与 13 px 字号，不增加额外 SSH 查询。目录随确认目标冻结；不改变结束进程条件和执行流程。
+- Windows GUI 180 项测试通过。确认摘要回归验证刷新后仍显示原目录；新增主机与卡范围的长中文路径换行、未获取目录、窄窗口滚动和确认按钮命中测试。未连接远端或结束真实进程，原生屏幕外观仍待试用验收。
+- Windows Release、EXE 版本启动、34 个修改构建输入一致性、ZIP CRC/逐文件哈希通过。试用包 `TermViAI-stop-cwd-20261026-windows-x86_64.zip`（beta.6），SHA-256：`b1b13ab68d51ff2d3ceff76e2bd213841d905a422af05ef3fd62743ebec21613`。
+
+## 2026-10-26 标签关闭确认设置与首页记录删除
+
+- Settings 新增 Confirm before closing tabs，默认开启；修改随 Save 持久化并同步同进程其他窗口，Cancel 不应用。兼容旧 settings.json；键盘 Tab 可访问开关，Space/Enter 切换，小窗口设置列表可滚动到达。
+- Saved workspaces 新增删除 ×，仅删除模板，保留活动终端和 Recent connections；移除活动标签的模板关联，防止后续重命名操作引用失效模板。Recent connections 与 Saved workspaces 仅悬浮行内显示 ×，保留稳定的尾部留白、红色悬浮及父行高亮，点击 × 不触发打开。
+- Windows GUI 182 项测试通过。覆盖设置默认值、开关持久化及旧配置兼容、窄窗口设置项可达、删除模板并发变更拒绝、旧缓存合并不复活删除项、其他记录保留，以及两类行在未悬浮/悬浮行/悬浮 ×/悬浮其他行时的图标可见性与点击区域。未操作真实连接；原生鼠标和屏幕外观留待试用验收。
+- Windows Release、EXE 版本启动、37 个修改构建输入一致性、ZIP CRC/逐文件哈希通过。试用包 `TermViAI-workspace-controls-20261026-windows-x86_64.zip`（beta.6），SHA-256：`60cb950c4b9a9a3643eb2be211445977cc2b69bc6d08c074bc5a570a7272b598`。
+
+## 2026-10-26 Recent connections 的 Identity 去重
+
+- 已只读核对用户本地记录：209 的一条历史直接保存 root，另一条选择 Identity、原始 username 为空，但该 Identity 的实际 username 为 root。旧 same_host 直接比较原始 username，因此出现相同地址的两行。
+- 最近连接去重改用规范化地址、端口、实际账号和密钥路径；读取 hosts.json 的元数据，不读取密码或私钥、不访问 SSH。保留最近一条的原始 Host/认证引用；加载和写入均先去重再截断。缺失引用与未知账号分开保留；不同账号/端口/密钥不合并，Saved workspaces 不变。
+- Windows GUI 185 项测试通过。新增旧重复记录加载迁移、手填/Identity 反复连接、旧缓存合并与删除防复活、Keychain 用户变更、不同账号端口密钥/地址、失效引用、密钥旧名称和离线密钥路径测试。未修改用户历史文件或连接实际主机；更新后加载时自动整理显示，下一次历史写入保存整理结果。
+- Windows Release、EXE 版本启动、37 个修改构建输入一致性、ZIP CRC/逐文件哈希通过。试用包 `TermViAI-recent-dedup-20261026-windows-x86_64.zip`（beta.6），SHA-256：`c8914635a7e4561508ca71ffeb21acb73ceb097419a9106d841c731144d91ba1`。

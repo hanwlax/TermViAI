@@ -27,6 +27,7 @@ impl super::TermWindow {
         window: &Window,
         live_resizing: bool,
     ) {
+        let _timing = ::window::resize_diagnostics::Span::new("resize_layout");
         log::trace!(
             "resize event, live={} current cells: {:?}, current dims: {:?}, new dims: {:?} window_state:{:?}",
             live_resizing,

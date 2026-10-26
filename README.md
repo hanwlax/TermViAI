@@ -4,19 +4,21 @@
 
 TermViAI combines WezTerm's terminal, SSH, PTY and GPU rendering foundations with a focused host library, multi-host tab groups and selective input broadcasting. Settings offers Ink, Navy and Light themes across the interface and terminal; the default font is JetBrainsMono Nerd Font Mono.
 
-> Current version: **v0.1.0-beta.6**. This beta targets Windows 10/11 x86_64.
+> Current version: **v0.1.0-beta.7**. This beta targets Windows 10/11 x86_64.
 
 ## Features
 
 - Nested Host groups with breadcrumbs, host moves and safe group deletion.
 - Exclusive Password / SSH Key / Identity authentication, with passwords saved in Windows Credential Manager.
 - Multiple SSH hosts in one tab with proportional split layouts.
-- Drag tabs along the tab bar, or drag pane headers to reorder terminals within a group.
+- Drag tabs along the tab bar, or move pane headers to create new splits with a full layout preview.
 - Whole-group and per-terminal broadcast controls, with a collapsed-by-default member panel in screen order.
 - Three switchable themes with instant preview and persistent Settings.
 - Tab menus for workspace actions; Ctrl + click to open terminal links.
 - Editable Keychain keys and identities, with consistent delete controls.
-- Saved SSH tab groups and recent connections.
+- Saved SSH tab groups and recent connections, with hover-only removal and Identity-aware deduplication.
+- NPU Monitor for existing Linux hosts: card/Die metrics, process details and guarded process termination.
+- Configurable tab-close confirmation, enabled by default.
 - In-place SSH reconnect with scrollback preserved, including whole-group reconnect.
 - Right-side add/edit drawers, animated sidebar and broadcast toolbar.
 - Per-session `Ctrl` + mouse-wheel font sizing and a persistent global font size.
@@ -25,7 +27,7 @@ TermViAI combines WezTerm's terminal, SSH, PTY and GPU rendering foundations wit
 
 ## Download
 
-Download **TermViAI-v0.1.0-beta.6-windows-x86_64.zip** from the [v0.1.0-beta.6 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.6), extract it, and run `TermViAI.exe`.
+Download **TermViAI-v0.1.0-beta.7-windows-x86_64.zip** from the [v0.1.0-beta.7 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.7), extract it, and run `TermViAI.exe`.
 
 This is a portable beta build. Keep `OpenConsole.exe`, `conpty.dll`, `libEGL.dll` and `libGLESv2.dll` beside the executable.
 
@@ -49,9 +51,9 @@ cargo build --locked --release -p wezterm-gui
 
 The Cargo output is still named `wezterm-gui.exe` internally; official TermViAI release packages publish it as `TermViAI.exe` with TermViAI Windows product metadata.
 
-CI builds the Windows x86_64 GUI and runs broadcast policy, SSH, terminal core, window, mux, and GUI tests on relevant pushes and pull requests to `main`. Rust formatting is checked separately. Windows CI can also be started manually; scheduled upstream builds and publishing workflows are archived under [`ci/upstream-workflows`](ci/upstream-workflows).
+CI builds the Windows x86_64 GUI and runs broadcast policy, SSH, terminal core, window, mux, and GUI tests on relevant pushes and pull requests to `main`. Rust formatting and the Linux remote collector tests are checked separately. Windows CI can also be started manually; scheduled upstream builds and publishing workflows are archived under [`ci/upstream-workflows`](ci/upstream-workflows).
 
-Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.6.md](docs/termviai/RELEASE_V0.1.0_BETA.6.md).
+Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.7.md](docs/termviai/RELEASE_V0.1.0_BETA.7.md).
 
 ## Project origin and license
 

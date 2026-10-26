@@ -49,7 +49,7 @@ fn domain_name(host: &Host, ssh_keepalive_interval: u64) -> String {
     )
 }
 
-fn ssh_domain(host: &Host, ssh_keepalive_interval: u64) -> SshDomain {
+pub(super) fn ssh_domain(host: &Host, ssh_keepalive_interval: u64) -> SshDomain {
     let mut domain = SshDomain {
         name: domain_name(host, ssh_keepalive_interval),
         remote_address: host.endpoint(),

@@ -23,7 +23,9 @@ impl crate::TermWindow {
         let webgpu = self.webgpu.as_mut().unwrap();
         let render_state = self.render_state.as_ref().unwrap();
 
+        let acquire = ::window::resize_diagnostics::Span::new("wgpu_acquire");
         let output = webgpu.surface.get_current_texture()?;
+        drop(acquire);
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -144,7 +146,11 @@ impl crate::TermWindow {
 
         // submit will accept anything that implements IntoIter
         webgpu.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        {
+            let _present = ::window::resize_diagnostics::Span::new("wgpu_present");
+            output.present();
+        }
+        ::window::resize_diagnostics::presented();
 
         Ok(())
     }

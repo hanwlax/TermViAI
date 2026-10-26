@@ -90,6 +90,7 @@ mod termviai_icons;
 mod termviai_layout;
 mod termviai_motion;
 mod termviai_tab_drag;
+mod termviai_text_cache;
 mod termviai_theme;
 mod termviai_ui;
 mod termviai_workspace;
@@ -443,6 +444,7 @@ pub struct TermWindow {
 
     quad_generation: usize,
     shape_generation: usize,
+    ui_text_cache: RefCell<termviai_text_cache::UiTextCache>,
     shape_cache: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<Vec<ShapedInfo>>>>>,
     line_to_ele_shape_cache: RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
 
@@ -799,6 +801,7 @@ impl TermWindow {
             current_highlight: None,
             quad_generation: 0,
             shape_generation: 0,
+            ui_text_cache: RefCell::new(termviai_text_cache::UiTextCache::new(&config)),
             shape_cache: RefCell::new(LfuCache::new(
                 "shape_cache.hit.rate",
                 "shape_cache.miss.rate",
@@ -1166,7 +1169,12 @@ impl TermWindow {
             ),
         );
         self.paint_impl(&mut RenderFrame::Glium(&mut frame));
-        window.finish_frame(frame).is_ok()
+        let _present = ::window::resize_diagnostics::Span::new("gl_present");
+        let ok = window.finish_frame(frame).is_ok();
+        if ok {
+            ::window::resize_diagnostics::presented();
+        }
+        ok
     }
 
     fn do_paint_webgpu(&mut self) -> anyhow::Result<bool> {
@@ -2125,6 +2133,7 @@ impl TermWindow {
                     window.set_title(match self.termviai_ui.page {
                         termviai_ui::Page::Hosts => "TermViAI — Hosts",
                         termviai_ui::Page::Keys => "TermViAI — Keychain",
+                        termviai_ui::Page::Monitor => "TermViAI — Monitor",
                         termviai_ui::Page::NewTab => "TermViAI — New Tab",
                         termviai_ui::Page::Terminal => "TermViAI",
                     });
@@ -2194,6 +2203,7 @@ impl TermWindow {
                 match self.termviai_ui.page {
                     termviai_ui::Page::Hosts => "TermViAI — Hosts".to_string(),
                     termviai_ui::Page::Keys => "TermViAI — Keychain".to_string(),
+                    termviai_ui::Page::Monitor => "TermViAI — Monitor".to_string(),
                     termviai_ui::Page::NewTab => "TermViAI — New Tab".to_string(),
                     termviai_ui::Page::Terminal => format!(
                         "TermViAI — {}",

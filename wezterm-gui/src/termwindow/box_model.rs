@@ -685,15 +685,24 @@ impl super::TermWindow {
             ElementContent::Text(s) => {
                 let window = self.window.as_ref().unwrap().clone();
                 let direction = wezterm_bidi::Direction::LeftToRight;
-                let infos = element.font.shape(
-                    &s,
-                    move || window.notify(TermWindowNotif::InvalidateShapeCache),
-                    BlockKey::filter_out_synthetic,
-                    element.presentation,
-                    direction,
-                    None,
-                    None,
-                )?;
+                let infos = if self.config.termviai_ui && element.presentation.is_none() {
+                    self.ui_text_cache.borrow_mut().shape(
+                        &element.font,
+                        s,
+                        self.shape_generation,
+                        move || window.notify(TermWindowNotif::InvalidateShapeCache),
+                    )?
+                } else {
+                    Rc::new(element.font.shape(
+                        s,
+                        move || window.notify(TermWindowNotif::InvalidateShapeCache),
+                        BlockKey::filter_out_synthetic,
+                        element.presentation,
+                        direction,
+                        None,
+                        None,
+                    )?)
+                };
                 let mut computed_cells = vec![];
                 let mut glyph_cache = context.gl_state.glyph_cache.borrow_mut();
                 let mut pixel_width = 0.0;
@@ -701,7 +710,7 @@ impl super::TermWindow {
                 let mut min_y = 0.0f32;
                 let max_x = context.bounds.min_x() + max_width;
 
-                for info in infos {
+                for info in infos.iter() {
                     let cell_start = &s[info.cluster as usize..];
                     let mut iter = Graphemes::new(cell_start).peekable();
                     let grapheme = iter
@@ -917,6 +926,18 @@ impl super::TermWindow {
         gl_state: &RenderState,
         inherited_colors: Option<&ElementColors>,
     ) -> anyhow::Result<()> {
+        self.render_element_with_pixel_snap(element, gl_state, inherited_colors, false)
+    }
+
+    /// Opt-in for small bitmap UI fonts. Keep shaping advances and scaled glyph
+    /// dimensions intact; only align the final texture origin to screen pixels.
+    pub(crate) fn render_element_with_pixel_snap(
+        &self,
+        element: &ComputedElement,
+        gl_state: &RenderState,
+        inherited_colors: Option<&ElementColors>,
+        snap_glyphs: bool,
+    ) -> anyhow::Result<()> {
         let layer = gl_state.layer_for_zindex(element.zindex)?;
         let mut layers = layer.quad_allocator();
 
@@ -990,12 +1011,15 @@ impl super::TermWindow {
                                 let width = texture.coords.size.width as f32 * glyph.scale as f32;
                                 let height = texture.coords.size.height as f32 * glyph.scale as f32;
 
+                                let (glyph_x, glyph_y) =
+                                    glyph_origin(pos_x, pos_y - top, left, top, snap_glyphs);
+
                                 let mut quad = layers.allocate(1)?;
                                 quad.set_position(
-                                    pos_x + left,
-                                    pos_y,
-                                    pos_x + left + width,
-                                    pos_y + height,
+                                    glyph_x,
+                                    glyph_y,
+                                    glyph_x + width,
+                                    glyph_y + height,
                                 );
                                 self.resolve_text(colors, inherited_colors).apply(&mut quad);
                                 quad.set_texture(texture.texture_coords());
@@ -1011,7 +1035,7 @@ impl super::TermWindow {
                 drop(layers);
 
                 for kid in kids {
-                    self.render_element(kid, gl_state, Some(colors))?;
+                    self.render_element_with_pixel_snap(kid, gl_state, Some(colors), snap_glyphs)?;
                 }
             }
             ComputedElementContent::Poly { poly, line_width } => {
@@ -1345,5 +1369,33 @@ impl super::TermWindow {
         }
 
         Ok(())
+    }
+}
+
+// Raster coordinates are in physical screen pixels; the viewport origin may be
+// a half pixel for odd window sizes and must be applied after rounding.
+fn glyph_origin(x: f32, y: f32, left: f32, top: f32, snap: bool) -> (f32, f32) {
+    if snap {
+        (x.round() + left, y.round() + top)
+    } else {
+        (x + left, y + top)
+    }
+}
+
+#[cfg(test)]
+mod pixel_snap_tests {
+    use super::glyph_origin;
+    #[test]
+    fn bitmap_origins_align_to_screen_pixels_at_fractional_dpi_and_odd_sizes() {
+        for scale in [1., 1.25, 1.5, 2.] {
+            for (left, top) in [(-743., -534.), (-743.5, -534.5)] {
+                let (x, y) = (950.25 * scale, 310.5 * scale);
+                let (a, b) = glyph_origin(x, y, left, top, true);
+                assert_eq!((a - left).fract(), 0.);
+                assert_eq!((b - top).fract(), 0.);
+                assert!((a - left - x).abs() <= 0.5 && (b - top - y).abs() <= 0.5);
+                assert_eq!(glyph_origin(x, y, left, top, false), (x + left, y + top));
+            }
+        }
     }
 }

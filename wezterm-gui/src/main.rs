@@ -42,6 +42,7 @@ mod frontend;
 mod glyphcache;
 mod hosts;
 mod inputmap;
+mod monitor;
 mod overlay;
 mod quad;
 mod renderstate;

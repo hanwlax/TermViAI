@@ -63,6 +63,6 @@ dhat-heap.json
 .idea/
 /winget-pkgs
 /assets/flatpak/generated-sources.json
-/__pycache__/
+__pycache__/
 /nix/result
 *.qcow2

@@ -163,7 +163,10 @@ impl SpawnQueue {
         self.event_handle.reset_event();
         let start = Instant::now();
         while let Some(func) = self.pop_func() {
-            func();
+            {
+                let _task = crate::resize_diagnostics::Span::new("modal_task");
+                func();
+            }
             if start.elapsed() >= Duration::from_millis(2) {
                 break;
             }

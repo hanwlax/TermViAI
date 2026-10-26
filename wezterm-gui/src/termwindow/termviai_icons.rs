@@ -9,6 +9,10 @@ use config::Dimension;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
+    Activity,
+    Pause,
+    Play,
+    Unplug,
     Menu,
     Hosts,
     Key,
@@ -70,6 +74,10 @@ impl Icon {
 
     pub fn poly(self) -> &'static [Poly] {
         match self {
+            Self::Activity => ACTIVITY,
+            Self::Pause => PAUSE,
+            Self::Play => PLAY,
+            Self::Unplug => UNPLUG,
             Self::Menu => MENU,
             Self::Hosts => HOSTS,
             Self::Key => KEY,
@@ -601,4 +609,32 @@ const LIST_PLUS: &[Poly] = &[outline(&[
     l(18, 20),
     m(14, 16),
     l(22, 16),
+])];
+
+const ACTIVITY: &[Poly] = &[outline(&[
+    m(2, 12),
+    l(6, 12),
+    l(9, 4),
+    l(14, 20),
+    l(17, 12),
+    l(22, 12),
+])];
+
+const PAUSE: &[Poly] = &[outline(&[m(8, 5), l(8, 19), m(16, 5), l(16, 19)])];
+const PLAY: &[Poly] = &[outline(&[m(7, 4), l(20, 12), l(7, 20), PolyCommand::Close])];
+const UNPLUG: &[Poly] = &[outline(&[
+    m(3, 21),
+    l(7, 17),
+    m(17, 7),
+    l(21, 3),
+    m(4, 10),
+    l(10, 16),
+    q(12, 18, 14, 16),
+    l(16, 14),
+    m(8, 8),
+    l(10, 6),
+    q(12, 4, 14, 6),
+    l(20, 12),
+    m(3, 3),
+    l(21, 21),
 ])];

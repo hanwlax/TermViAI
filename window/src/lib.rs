@@ -13,6 +13,7 @@ pub use wezterm_color_types as color;
 mod configuration;
 pub mod connection;
 pub mod os;
+pub mod resize_diagnostics;
 pub mod screen;
 mod spawn;
 

@@ -31,6 +31,8 @@ struct Preferences {
     ssh_keepalive_interval_seconds: Option<u64>,
     #[serde(default)]
     theme: Theme,
+    #[serde(default)]
+    confirm_close_tabs: Option<bool>,
     #[serde(flatten)]
     other: serde_json::Map<String, serde_json::Value>,
 }
@@ -80,6 +82,7 @@ pub(super) struct TermviaiFonts {
     pub(super) painted_theme: Option<Theme>,
     global_size: Option<f64>,
     ssh_keepalive_interval: u64,
+    confirm_close_tabs: bool,
     session_sizes: HashMap<PaneId, f64>,
     contexts: HashMap<PaneId, PaneFont>,
 }
@@ -91,6 +94,7 @@ impl Default for TermviaiFonts {
             painted_theme: None,
             global_size: None,
             ssh_keepalive_interval: DEFAULT_SSH_KEEPALIVE_INTERVAL,
+            confirm_close_tabs: true,
             session_sizes: HashMap::new(),
             contexts: HashMap::new(),
         }
@@ -100,26 +104,29 @@ impl Default for TermviaiFonts {
 impl TermviaiFonts {
     pub fn load() -> Self {
         let path = HostStore::path().with_file_name("settings.json");
-        let (global_size, ssh_keepalive_interval, theme) = match Preferences::load(&path) {
-            Ok(prefs) => (
-                prefs.terminal_font_size.filter(|size| valid_size(*size)),
-                prefs
-                    .ssh_keepalive_interval_seconds
-                    .filter(|interval| *interval <= MAX_SSH_KEEPALIVE_INTERVAL)
-                    .unwrap_or(DEFAULT_SSH_KEEPALIVE_INTERVAL),
-                prefs.theme,
-            ),
-            Err(err) => {
-                log::error!(
-                    "{:#}; preserving preferences and using the configured font",
-                    err
-                );
-                (None, DEFAULT_SSH_KEEPALIVE_INTERVAL, Theme::default())
-            }
-        };
+        let (global_size, ssh_keepalive_interval, theme, confirm_close_tabs) =
+            match Preferences::load(&path) {
+                Ok(prefs) => (
+                    prefs.terminal_font_size.filter(|size| valid_size(*size)),
+                    prefs
+                        .ssh_keepalive_interval_seconds
+                        .filter(|interval| *interval <= MAX_SSH_KEEPALIVE_INTERVAL)
+                        .unwrap_or(DEFAULT_SSH_KEEPALIVE_INTERVAL),
+                    prefs.theme,
+                    prefs.confirm_close_tabs.unwrap_or(true),
+                ),
+                Err(err) => {
+                    log::error!(
+                        "{:#}; preserving preferences and using the configured font",
+                        err
+                    );
+                    (None, DEFAULT_SSH_KEEPALIVE_INTERVAL, Theme::default(), true)
+                }
+            };
         Self {
             global_size,
             ssh_keepalive_interval,
+            confirm_close_tabs,
             theme,
             ..Self::default()
         }
@@ -131,6 +138,9 @@ impl TermviaiFonts {
 
     pub fn ssh_keepalive_interval(&self) -> u64 {
         self.ssh_keepalive_interval
+    }
+    pub fn confirm_close_tabs(&self) -> bool {
+        self.confirm_close_tabs
     }
     pub fn theme(&self) -> Theme {
         self.theme
@@ -192,6 +202,7 @@ impl TermWindow {
         size: f64,
         ssh_keepalive_interval: u64,
         theme: Theme,
+        confirm_close_tabs: bool,
     ) -> anyhow::Result<()> {
         ensure!(valid_size(size), "Font size must be between 6 and 48 pt.");
         ensure!(
@@ -205,22 +216,35 @@ impl TermWindow {
         prefs.terminal_font_size = Some(size);
         prefs.ssh_keepalive_interval_seconds = Some(ssh_keepalive_interval);
         prefs.theme = theme;
+        prefs.confirm_close_tabs = Some(confirm_close_tabs);
         prefs.save(&path)?;
-        self.termviai_apply_preferences(size, ssh_keepalive_interval, theme);
+        self.termviai_apply_preferences(size, ssh_keepalive_interval, theme, confirm_close_tabs);
         for other in crate::frontend::front_end().gui_windows() {
             let current_id = self.mux_window_id;
             other
                 .window
                 .notify(super::TermWindowNotif::Apply(Box::new(move |window| {
                     if window.config.termviai_ui && window.mux_window_id != current_id {
-                        window.termviai_apply_preferences(size, ssh_keepalive_interval, theme);
+                        window.termviai_apply_preferences(
+                            size,
+                            ssh_keepalive_interval,
+                            theme,
+                            confirm_close_tabs,
+                        );
                     }
                 })));
         }
         Ok(())
     }
 
-    fn termviai_apply_preferences(&mut self, size: f64, ssh_keepalive_interval: u64, theme: Theme) {
+    fn termviai_apply_preferences(
+        &mut self,
+        size: f64,
+        ssh_keepalive_interval: u64,
+        theme: Theme,
+        confirm_close_tabs: bool,
+    ) {
+        self.termviai_fonts.confirm_close_tabs = confirm_close_tabs;
         self.termviai_fonts.theme = theme;
         self.termviai_fonts.global_size = Some(size);
         self.termviai_fonts.ssh_keepalive_interval = ssh_keepalive_interval;
@@ -431,12 +455,22 @@ mod tests {
         let mut prefs = Preferences::load(&path).unwrap();
         assert_eq!(prefs.terminal_font_size, Some(14.5));
         assert_eq!(prefs.theme, Theme::Ink);
+        assert!(prefs.confirm_close_tabs.unwrap_or(true));
+        assert!(TermviaiFonts::default().confirm_close_tabs());
+        prefs.confirm_close_tabs = Some(false);
         prefs.theme = Theme::Light;
         prefs.terminal_font_size = Some(18.0);
         prefs.ssh_keepalive_interval_seconds = Some(45);
         prefs.save(&path).unwrap();
         let loaded = Preferences::load(&path).unwrap();
         assert_eq!(loaded.theme, Theme::Light);
+        assert_eq!(loaded.confirm_close_tabs, Some(false));
+        prefs.confirm_close_tabs = Some(true);
+        prefs.save(&path).unwrap();
+        assert_eq!(
+            Preferences::load(&path).unwrap().confirm_close_tabs,
+            Some(true)
+        );
         assert_eq!(loaded.terminal_font_size, Some(18.0));
         assert_eq!(loaded.ssh_keepalive_interval_seconds, Some(45));
         assert_eq!(loaded.other["appearance"], "mocha");

@@ -195,6 +195,15 @@ impl TermWindow {
             if !bytes.is_empty() {
                 for id in &report.delivered {
                     self.termviai_broadcast.pane_errors.remove(id);
+                    // The key/paste callers scroll only the source. Successful
+                    // broadcast recipients need the same live viewport, even
+                    // when they were previously reading scrollback. Preserve
+                    // copy/search overlays and the user's scroll-on-input setting.
+                    if *id != source && self.pane_state(*id).overlay.is_none() {
+                        if let Some(target) = mux.get_pane(*id) {
+                            self.maybe_scroll_to_bottom_for_input(&target);
+                        }
+                    }
                 }
                 for id in &report.disconnected {
                     self.termviai_broadcast.pane_errors.insert(*id,
