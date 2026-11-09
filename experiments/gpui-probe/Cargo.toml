@@ -1,0 +1,33 @@
+[package]
+name = "termviai-gpui-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Isolated evaluation: do not change the application's dependency graph.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+gpui = "=0.2.2"
+gpui-component = { version = "=0.5.1", default-features = false }
+gpui-component-assets = "=0.5.1"
+portable-pty = "=0.9.0"
+vt100 = "=0.16.2"
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+debug = 0
+strip = "debuginfo"
+
+[[bin]]
+name = "termviai-gpui-probe"
+path = "src/main.rs"
+
+[[bin]]
+name = "termviai-gpui-fixture"
+path = "src/fixture.rs"
+
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
