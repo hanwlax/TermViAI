@@ -52,6 +52,10 @@ impl wezterm_term::TerminalConfiguration for TermConfig {
         self.configuration().scrollback_lines
     }
 
+    fn reflow_cursor_line(&self) -> bool {
+        !self.configuration().termviai_ui
+    }
+
     fn enable_csi_u_key_encoding(&self) -> bool {
         self.configuration().enable_csi_u_key_encoding
     }

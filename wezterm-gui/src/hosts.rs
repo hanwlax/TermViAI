@@ -20,6 +20,8 @@ pub struct Host {
     pub address: String,
     pub port: u16,
     pub username: String,
+    // Key authentication can use another account without overwriting manual credentials.
+    pub key_username: String,
     pub group: String,
     pub group_id: String,
     pub identity_file: String,
@@ -128,6 +130,9 @@ impl Host {
                 self.key_label.clear();
             }
             Some(Authentication::Key) => {
+                if !self.key_username.is_empty() {
+                    self.username = self.key_username.clone();
+                }
                 self.identity_id.clear();
                 self.credential_id.clear();
                 self.session_credential.clear();
@@ -174,6 +179,67 @@ impl Host {
             );
         }
         Ok(())
+    }
+
+    /// Resolve each saved alternative independently, never mutating the Host.
+    /// An unavailable key or Identity must not prevent the remaining attempts.
+    pub fn terminal_authentication(
+        &self,
+        store: &HostStore,
+    ) -> Vec<(Authentication, anyhow::Result<Host>)> {
+        let mut modes = vec![];
+        if !self.key_label.is_empty() || !self.identity_file.is_empty() {
+            modes.push(Authentication::Key);
+        }
+        if !self.identity_id.is_empty() {
+            modes.push(Authentication::Identity);
+        }
+        if !self.own_credential_ref().is_empty() {
+            modes.push(Authentication::Password);
+        }
+        modes
+            .into_iter()
+            .map(|mode| {
+                let mut host = self.clone();
+                host.authentication = Some(mode);
+                let result = (|| {
+                    host.resolve_identity(store)?;
+                    host.validate()?;
+                    Ok(host)
+                })();
+                (mode, result)
+            })
+            .collect()
+    }
+
+    /// Update only the method that was successfully authenticated. The editor's
+    /// selected mode reflects the updated slot, without removing other slots.
+    pub fn apply_authentication(&mut self, successful: &Host, mode: Authentication) {
+        self.authentication = Some(mode);
+        match mode {
+            Authentication::Password => {
+                if self.key_username.is_empty()
+                    && (!self.key_label.is_empty() || !self.identity_file.is_empty())
+                {
+                    self.key_username = self.username.clone();
+                }
+                self.username = successful.username.clone();
+                self.credential_id = successful.credential_id.clone();
+                self.session_credential = successful.session_credential.clone();
+            }
+            Authentication::Key => {
+                self.key_username = if successful.key_username.is_empty() {
+                    successful.username.clone()
+                } else {
+                    successful.key_username.clone()
+                };
+                self.key_label = successful.key_label.clone();
+                self.identity_file = successful.identity_file.clone();
+            }
+            Authentication::Identity => {
+                self.identity_id = successful.identity_id.clone();
+            }
+        }
     }
 
     pub fn endpoint(&self) -> String {
@@ -1124,5 +1190,128 @@ mod tests {
         std::fs::write(&path, b"broken json").unwrap();
         assert!(HostStore::load_from(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"broken json");
+    }
+}
+
+#[cfg(test)]
+mod terminal_fallback_tests {
+    use super::*;
+    #[test]
+    fn saved_alternatives_resolve_in_order_with_independent_usernames() {
+        let key = tempfile::NamedTempFile::new().unwrap();
+        let store = HostStore {
+            keys: vec![KeyFile {
+                label: "ops-key".into(),
+                path: key.path().to_string_lossy().into(),
+                ..Default::default()
+            }],
+            identities: vec![Identity {
+                id: "ops-id".into(),
+                label: "Ops".into(),
+                username: "identity-user".into(),
+            }],
+            ..Default::default()
+        };
+        let host = Host {
+            label: "Test".into(),
+            address: "example.invalid".into(),
+            port: 22,
+            username: "manual-user".into(),
+            key_username: "key-user".into(),
+            key_label: "ops-key".into(),
+            identity_id: "ops-id".into(),
+            credential_id: "manual-secret-reference".into(),
+            authentication: Some(Authentication::Password),
+            ..Default::default()
+        };
+        let original = host.clone();
+        let attempts = host.terminal_authentication(&store);
+        assert_eq!(
+            attempts.iter().map(|(mode, _)| *mode).collect::<Vec<_>>(),
+            vec![
+                Authentication::Key,
+                Authentication::Identity,
+                Authentication::Password
+            ]
+        );
+        assert_eq!(attempts[0].1.as_ref().unwrap().username, "key-user");
+        assert_eq!(attempts[1].1.as_ref().unwrap().username, "identity-user");
+        assert_eq!(attempts[2].1.as_ref().unwrap().username, "manual-user");
+        assert!(attempts[0].1.as_ref().unwrap().credential_ref().is_empty());
+        assert_eq!(attempts[1].1.as_ref().unwrap().credential_ref(), "ops-id");
+        assert_eq!(
+            attempts[2].1.as_ref().unwrap().credential_ref(),
+            "manual-secret-reference"
+        );
+        assert_eq!(host, original);
+        let missing = host.terminal_authentication(&HostStore::default());
+        assert!(missing[0].1.is_err() && missing[1].1.is_err() && missing[2].1.is_ok());
+    }
+    #[test]
+    fn successful_method_only_replaces_its_own_fields() {
+        let base = Host {
+            label: "209".into(),
+            address: "example.invalid".into(),
+            port: 22,
+            username: "manual".into(),
+            key_username: "key-user".into(),
+            key_label: "old-key".into(),
+            identity_id: "old-identity".into(),
+            credential_id: "old-password".into(),
+            ..Default::default()
+        };
+        let replacement = Host {
+            username: "new-user".into(),
+            key_username: "new-key-user".into(),
+            identity_file: "new-path".into(),
+            identity_id: "new-identity".into(),
+            credential_id: "new-password".into(),
+            ..Default::default()
+        };
+        let mut host = base.clone();
+        host.apply_authentication(&replacement, Authentication::Key);
+        assert_eq!(
+            (&host.username, &host.credential_id, &host.identity_id),
+            (&base.username, &base.credential_id, &base.identity_id)
+        );
+        assert_eq!(host.identity_file, "new-path");
+        assert_eq!(host.key_username, "new-key-user");
+        assert!(host.key_label.is_empty());
+        let mut host = base.clone();
+        host.apply_authentication(&replacement, Authentication::Identity);
+        assert_eq!(
+            (
+                &host.username,
+                &host.credential_id,
+                &host.key_label,
+                &host.key_username
+            ),
+            (
+                &base.username,
+                &base.credential_id,
+                &base.key_label,
+                &base.key_username
+            )
+        );
+        assert_eq!(host.identity_id, "new-identity");
+        let mut host = base.clone();
+        host.apply_authentication(&replacement, Authentication::Password);
+        assert_eq!(
+            (&host.key_label, &host.key_username, &host.identity_id),
+            (&base.key_label, &base.key_username, &base.identity_id)
+        );
+        assert_eq!(host.username, "new-user");
+        assert_eq!(host.credential_id, "new-password");
+    }
+    #[test]
+    fn legacy_identity_reference_is_never_retried_as_manual_password() {
+        let host = Host {
+            identity_id: "shared-identity".into(),
+            credential_id: "shared-identity".into(),
+            ..Default::default()
+        };
+        let attempts = host.terminal_authentication(&HostStore::default());
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].0, Authentication::Identity);
     }
 }

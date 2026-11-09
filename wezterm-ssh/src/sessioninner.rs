@@ -141,7 +141,16 @@ impl SessionInner {
                 self.config.get("port").map(String::as_str).unwrap_or("22"),
             );
             self.tx_event
-                .try_send(SessionEvent::Error(format!("{:#}", err)))
+                .try_send(
+                    if err
+                        .downcast_ref::<crate::AuthenticationRejected>()
+                        .is_some()
+                    {
+                        SessionEvent::AuthenticationFailed(format!("{err:#}"))
+                    } else {
+                        SessionEvent::Error(format!("{err:#}"))
+                    },
+                )
                 .ok();
         }
     }
@@ -257,7 +266,26 @@ impl SessionInner {
         sess.set_option(libssh_rs::SshOption::Hostname(hostname.clone()))?;
         sess.set_option(libssh_rs::SshOption::User(Some(user)))?;
         sess.set_option(libssh_rs::SshOption::Port(port))?;
-        sess.options_parse_config(None)?; // FIXME: overridden config path?
+        if self
+            .config
+            .get("termviai_no_ssh_config")
+            .map(String::as_str)
+            == Some("yes")
+        {
+            // ssh_connect otherwise parses the default files itself even when
+            // options_parse_config was not explicitly called above.
+            sess.set_option(libssh_rs::SshOption::ProcessConfig(false))?;
+        } else {
+            sess.options_parse_config(None)?;
+        }
+        if let Some(seconds) = self
+            .config
+            .get("connecttimeout")
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+        {
+            sess.set_option(libssh_rs::SshOption::Timeout(Duration::from_secs(seconds)))?;
+        }
         if let Some(agent) = self.config.get("identityagent") {
             sess.set_option(libssh_rs::SshOption::IdentityAgent(Some(agent.clone())))?;
         }
@@ -373,6 +401,13 @@ impl SessionInner {
             sess.trace(ssh2::TraceFlags::all());
         }
         sess.set_blocking(true);
+        if let Some(seconds) = self
+            .config
+            .get("connecttimeout")
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            sess.set_timeout(seconds.saturating_mul(1000));
+        }
         sess.set_tcp_stream(sock);
         sess.handshake()
             .with_context(|| format!("ssh handshake with {}", remote_address))?;
@@ -475,8 +510,18 @@ impl SessionInner {
                 .with_context(|| format!("binding to {bind_addr:?}"))?;
         }
 
-        sock.connect(&addr.into())
-            .with_context(|| format!("Connecting to {hostname}:{port} ({addr:?})"))?;
+        let address = addr.into();
+        if let Some(seconds) = self
+            .config
+            .get("connecttimeout")
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+        {
+            sock.connect_timeout(&address, Duration::from_secs(seconds))
+        } else {
+            sock.connect(&address)
+        }
+        .with_context(|| format!("Connecting to {hostname}:{port} ({addr:?})"))?;
         Ok((sock, None))
     }
 
@@ -757,6 +802,34 @@ impl SessionInner {
             Ok(req) => {
                 sess.set_blocking(true);
                 let res = match req {
+                    SessionRequest::RemoteForward(request, reply) => {
+                        if !self.channels.is_empty()
+                            || !self.files.is_empty()
+                            || !self.dirs.is_empty()
+                        {
+                            reply
+                                .try_send(Err(anyhow!(
+                                    "Reverse forwarding requires a dedicated SSH session"
+                                )))
+                                .ok();
+                            sess.set_blocking(false);
+                            return Ok(true);
+                        }
+                        let result = crate::forward::run(sess, request);
+                        match sess {
+                            #[cfg(feature = "libssh-rs")]
+                            SessionWrap::LibSsh(s) => s.sess.disconnect(),
+                            #[cfg(feature = "ssh2")]
+                            SessionWrap::Ssh2(s) => {
+                                let _ = s.sess.disconnect(None, "Forwarding stopped", None);
+                            }
+                        }
+                        reply.try_send(result).ok();
+                        // Exit drops the dedicated transport, cancelling its remote listener
+                        // and all traffic before another attempt can start.
+                        self.session_was_dropped = true;
+                        return Ok(false);
+                    }
                     SessionRequest::SessionDropped => {
                         self.session_was_dropped = true;
                         Ok(true)

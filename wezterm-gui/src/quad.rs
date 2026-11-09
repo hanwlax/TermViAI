@@ -340,6 +340,43 @@ impl std::fmt::Debug for HeapQuadAllocator {
 }
 
 impl HeapQuadAllocator {
+    /// Translate cached terminal lines only when submitting them, then clip in
+    /// physical coordinates. Texture interpolation retains partial glyphs,
+    /// images, selection backgrounds and cursors at either viewport boundary.
+    pub fn apply_to_scrolled(
+        &self,
+        other: &mut TripleLayerQuadAllocator,
+        clip: Option<(f32, f32, f32)>,
+    ) -> anyhow::Result<()> {
+        let Some((dy, top, bottom)) = clip else {
+            return self.apply_to(other);
+        };
+        for (layer, quads) in [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)] {
+            for q in quads {
+                let (_, old_top, _, old_bottom) = q.position;
+                let y1 = old_top + dy;
+                let y2 = old_bottom + dy;
+                let a = y1.max(top);
+                let b = y2.min(bottom);
+                if b <= a || y2 <= y1 {
+                    continue;
+                }
+                let mut vertices = q.to_vertices();
+                let (_, _, t1, t2) = q.tex;
+                for i in [V_TOP_LEFT, V_TOP_RIGHT] {
+                    vertices[i].position[1] = a;
+                    vertices[i].tex[1] = t1 + (t2 - t1) * (a - y1) / (y2 - y1);
+                }
+                for i in [V_BOT_LEFT, V_BOT_RIGHT] {
+                    vertices[i].position[1] = b;
+                    vertices[i].tex[1] = t1 + (t2 - t1) * (b - y1) / (y2 - y1);
+                }
+                other.extend_with(layer, &vertices);
+            }
+        }
+        Ok(())
+    }
+
     pub fn apply_to(&self, other: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         for (layer_num, quads) in [(0, &self.layer0), (1, &self.layer1), (2, &self.layer2)] {
@@ -470,5 +507,43 @@ mod termviai_rounded_rectangle_tests {
         )
         .validate(&shader)
         .expect("WGSL must validate");
+    }
+}
+
+#[cfg(test)]
+mod terminal_scroll_clip_tests {
+    use super::*;
+    #[test]
+    fn clip_interpolates_texture_in_all_layers_without_mutating_cached_quads() {
+        let mut original = HeapQuadAllocator::default();
+        for layer in 0..3 {
+            let mut q = original.allocate(layer).unwrap();
+            q.set_position(10., 10., 30., 30.);
+            q.set_texture_discrete(0.2, 0.4, 0.3, 0.7);
+        }
+        let mut clipped = HeapQuadAllocator::default();
+        original
+            .apply_to_scrolled(
+                &mut TripleLayerQuadAllocator::Heap(&mut clipped),
+                Some((-5., 10., 20.)),
+            )
+            .unwrap();
+        for quads in [&clipped.layer0, &clipped.layer1, &clipped.layer2] {
+            assert_eq!(quads.len(), 1);
+            assert_eq!(quads[0].position, (10., 10., 30., 20.));
+            assert!((quads[0].tex.2 - 0.4).abs() < 0.00001);
+            assert!((quads[0].tex.3 - 0.6).abs() < 0.00001);
+        }
+        assert_eq!(original.layer0[0].position, (10., 10., 30., 30.));
+        let mut outside = HeapQuadAllocator::default();
+        original
+            .apply_to_scrolled(
+                &mut TripleLayerQuadAllocator::Heap(&mut outside),
+                Some((-40., 10., 20.)),
+            )
+            .unwrap();
+        assert!(
+            outside.layer0.is_empty() && outside.layer1.is_empty() && outside.layer2.is_empty()
+        );
     }
 }

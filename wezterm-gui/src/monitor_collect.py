@@ -101,7 +101,7 @@ def run_smi():
     if not binary:
         raise RuntimeError('npu-smi is not installed or not accessible to this SSH user.')
     result = subprocess.run([binary, 'info'], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            timeout=12, env=dict(os.environ, LC_ALL='C'), encoding='utf-8', errors='replace')
+                            timeout=30, env=dict(os.environ, LC_ALL='C'), encoding='utf-8', errors='replace')
     if result.returncode:
         raise RuntimeError('npu-smi failed: ' + (result.stderr or result.stdout)[-1000:])
     if len(result.stdout) > 2_000_000:

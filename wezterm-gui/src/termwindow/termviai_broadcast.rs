@@ -37,7 +37,15 @@ pub(super) fn toggle_participant(
 }
 
 fn pane_accepts_input(pane: &Arc<dyn Pane>) -> bool {
-    !pane.is_dead()
+    let authenticating = Mux::get()
+        .get_domain(pane.domain_id())
+        .and_then(|d| {
+            d.downcast_ref::<mux::ssh::RemoteSshDomain>()
+                .and_then(|d| d.authentication(pane.pane_id()))
+        })
+        .is_some_and(|c| c.view().phase != mux::ssh::authentication::Phase::Connected);
+    !authenticating
+        && !pane.is_dead()
         && !pane
             .downcast_ref::<LocalPane>()
             .is_some_and(LocalPane::is_reconnectable_ssh)

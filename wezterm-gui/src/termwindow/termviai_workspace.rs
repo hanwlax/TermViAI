@@ -45,7 +45,12 @@ fn domain_name(host: &Host, ssh_keepalive_interval: u64) -> String {
         host.label,
         ssh_keepalive_interval,
         host.credential_ref(),
-        host.authentication
+        (
+            host.authentication,
+            &host.identity_id,
+            &host.key_label,
+            &host.key_username
+        )
     )
 }
 
@@ -89,6 +94,54 @@ pub(super) fn ssh_domain(host: &Host, ssh_keepalive_interval: u64) -> SshDomain 
             .insert("termviai_credential".into(), host.credential_ref().into());
     }
     domain
+}
+
+pub(super) fn terminal_authentication_plan(
+    host: &Host,
+    store: &crate::hosts::HostStore,
+    keepalive: u64,
+) -> Vec<mux::ssh::authentication::Candidate> {
+    let attempts = host.terminal_authentication(store);
+    if attempts.is_empty() && host.authentication.is_none() {
+        // Quick connect retains agent/default-key discovery. If it needs input,
+        // the pane-local selector takes over instead of a raw password prompt.
+        return vec![authentication_candidate(
+            "Default SSH authentication".into(),
+            Ok(host.clone()),
+            keepalive,
+        )];
+    }
+    attempts
+        .into_iter()
+        .map(|(mode, host)| authentication_candidate(format!("{mode:?}"), host, keepalive))
+        .collect()
+}
+
+pub(super) fn authentication_candidate(
+    label: String,
+    host: anyhow::Result<Host>,
+    keepalive: u64,
+) -> mux::ssh::authentication::Candidate {
+    let result =
+        host.and_then(|host| mux::ssh::ssh_domain_to_ssh_config(&ssh_domain(&host, keepalive)));
+    match result {
+        Ok(mut config) => {
+            config.insert("termviai_auth_attempt".into(), "yes".into());
+            config
+                .entry("connecttimeout".into())
+                .or_insert_with(|| "15".into());
+            mux::ssh::authentication::Candidate {
+                label,
+                config,
+                error: None,
+            }
+        }
+        Err(error) => mux::ssh::authentication::Candidate {
+            label,
+            config: Default::default(),
+            error: Some(format!("{error:#}")),
+        },
+    }
 }
 
 fn snapshot(
@@ -372,33 +425,27 @@ impl TermWindow {
             !self.termviai_ui.connecting,
             "An SSH connection is still opening."
         );
-        fn resolve(
-            layout: &mut SavedLayout,
-            store: &crate::hosts::HostStore,
-        ) -> anyhow::Result<()> {
-            match layout {
-                SavedLayout::Pane { host } => host.resolve_identity(store),
-                SavedLayout::Split { first, second, .. } => {
-                    resolve(first, store)?;
-                    resolve(second, store)
-                }
-            }
-        }
         let raw_hosts: Vec<Host> = layout.hosts().into_iter().cloned().collect();
-        let mut layout = layout;
-        resolve(&mut layout, &crate::hosts::HostStore::load()?)?;
+        let store = crate::hosts::HostStore::load()?;
         let mux = Mux::get();
         let ssh_keepalive_interval = self.termviai_ssh_keepalive_interval();
         let mut original_hosts = HashMap::new();
         for (host, raw_host) in layout.hosts().into_iter().zip(raw_hosts) {
             let mut host = host.clone();
-            host.validate()?;
+            // Validate the endpoint; individual credential errors belong to the
+            // fallback sequence, not to the entire workspace creation.
+            let mut endpoint = host.clone();
+            endpoint.identity_file.clear();
+            endpoint.validate()?;
             let domain_name = domain_name(&host, ssh_keepalive_interval);
             original_hosts.insert(domain_name.clone(), raw_host.clone());
             if mux.get_domain_by_name(&domain_name).is_none() {
                 let dom = ssh_domain(&host, ssh_keepalive_interval);
-                let domain: Arc<dyn Domain> =
-                    Arc::new(mux::ssh::RemoteSshDomain::with_ssh_domain(&dom)?);
+                let domain: Arc<dyn Domain> = Arc::new(
+                    mux::ssh::RemoteSshDomain::with_ssh_domain(&dom)?.with_authentication_plan(
+                        terminal_authentication_plan(&raw_host, &store, ssh_keepalive_interval),
+                    ),
+                );
                 mux.add_domain(&domain);
             }
             let domain = mux

@@ -19,6 +19,7 @@ pub enum SessionEvent {
     Authenticate(AuthenticationEvent),
     HostVerificationFailed(HostVerificationFailed),
     Error(String),
+    AuthenticationFailed(String),
     Authenticated,
 }
 
@@ -59,6 +60,7 @@ pub(crate) enum SessionRequest {
     Sftp(SftpRequest),
     SignalChannel(SignalChannel),
     SessionDropped,
+    RemoteForward(crate::RemoteForward, Sender<anyhow::Result<()>>),
 }
 
 #[derive(Debug)]
@@ -188,6 +190,21 @@ impl Session {
         let mut exec = rx.recv().await??;
         exec.child.tx.replace(self.tx.clone());
         Ok(exec)
+    }
+
+    /// Runs one reverse listener on a dedicated session until cancelled.
+    /// This consumes the session: it must not be shared with terminal/SFTP users.
+    pub async fn run_remote_forward(self, request: crate::RemoteForward) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Arc::strong_count(&self._lifetime) == 1,
+            "Reverse forwarding cannot consume a shared SSH session"
+        );
+        let (tx, rx) = bounded(1);
+        self.tx
+            .send(SessionRequest::RemoteForward(request, tx))
+            .await
+            .map_err(|_| DeadSession)?;
+        rx.recv().await?
     }
 
     /// Creates a new reference to the sftp channel for filesystem operations

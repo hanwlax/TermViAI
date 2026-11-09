@@ -33,6 +33,8 @@ struct Preferences {
     theme: Theme,
     #[serde(default)]
     confirm_close_tabs: Option<bool>,
+    #[serde(default)]
+    audible_bell: Option<bool>,
     #[serde(flatten)]
     other: serde_json::Map<String, serde_json::Value>,
 }
@@ -83,6 +85,7 @@ pub(super) struct TermviaiFonts {
     global_size: Option<f64>,
     ssh_keepalive_interval: u64,
     confirm_close_tabs: bool,
+    audible_bell: Option<bool>,
     session_sizes: HashMap<PaneId, f64>,
     contexts: HashMap<PaneId, PaneFont>,
 }
@@ -95,6 +98,7 @@ impl Default for TermviaiFonts {
             global_size: None,
             ssh_keepalive_interval: DEFAULT_SSH_KEEPALIVE_INTERVAL,
             confirm_close_tabs: true,
+            audible_bell: None,
             session_sizes: HashMap::new(),
             contexts: HashMap::new(),
         }
@@ -104,7 +108,7 @@ impl Default for TermviaiFonts {
 impl TermviaiFonts {
     pub fn load() -> Self {
         let path = HostStore::path().with_file_name("settings.json");
-        let (global_size, ssh_keepalive_interval, theme, confirm_close_tabs) =
+        let (global_size, ssh_keepalive_interval, theme, confirm_close_tabs, audible_bell) =
             match Preferences::load(&path) {
                 Ok(prefs) => (
                     prefs.terminal_font_size.filter(|size| valid_size(*size)),
@@ -114,19 +118,27 @@ impl TermviaiFonts {
                         .unwrap_or(DEFAULT_SSH_KEEPALIVE_INTERVAL),
                     prefs.theme,
                     prefs.confirm_close_tabs.unwrap_or(true),
+                    prefs.audible_bell,
                 ),
                 Err(err) => {
                     log::error!(
                         "{:#}; preserving preferences and using the configured font",
                         err
                     );
-                    (None, DEFAULT_SSH_KEEPALIVE_INTERVAL, Theme::default(), true)
+                    (
+                        None,
+                        DEFAULT_SSH_KEEPALIVE_INTERVAL,
+                        Theme::default(),
+                        true,
+                        None,
+                    )
                 }
             };
         Self {
             global_size,
             ssh_keepalive_interval,
             confirm_close_tabs,
+            audible_bell,
             theme,
             ..Self::default()
         }
@@ -141,6 +153,14 @@ impl TermviaiFonts {
     }
     pub fn confirm_close_tabs(&self) -> bool {
         self.confirm_close_tabs
+    }
+    pub fn audible_bell(&self, termviai_ui: bool, configured: &config::AudibleBell) -> bool {
+        let configured = matches!(configured, config::AudibleBell::SystemBeep);
+        if termviai_ui {
+            self.audible_bell.unwrap_or(configured)
+        } else {
+            configured
+        }
     }
     pub fn theme(&self) -> Theme {
         self.theme
@@ -203,6 +223,7 @@ impl TermWindow {
         ssh_keepalive_interval: u64,
         theme: Theme,
         confirm_close_tabs: bool,
+        audible_bell: bool,
     ) -> anyhow::Result<()> {
         ensure!(valid_size(size), "Font size must be between 6 and 48 pt.");
         ensure!(
@@ -217,8 +238,15 @@ impl TermWindow {
         prefs.ssh_keepalive_interval_seconds = Some(ssh_keepalive_interval);
         prefs.theme = theme;
         prefs.confirm_close_tabs = Some(confirm_close_tabs);
+        prefs.audible_bell = Some(audible_bell);
         prefs.save(&path)?;
-        self.termviai_apply_preferences(size, ssh_keepalive_interval, theme, confirm_close_tabs);
+        self.termviai_apply_preferences(
+            size,
+            ssh_keepalive_interval,
+            theme,
+            confirm_close_tabs,
+            audible_bell,
+        );
         for other in crate::frontend::front_end().gui_windows() {
             let current_id = self.mux_window_id;
             other
@@ -230,6 +258,7 @@ impl TermWindow {
                             ssh_keepalive_interval,
                             theme,
                             confirm_close_tabs,
+                            audible_bell,
                         );
                     }
                 })));
@@ -243,8 +272,10 @@ impl TermWindow {
         ssh_keepalive_interval: u64,
         theme: Theme,
         confirm_close_tabs: bool,
+        audible_bell: bool,
     ) {
         self.termviai_fonts.confirm_close_tabs = confirm_close_tabs;
+        self.termviai_fonts.audible_bell = Some(audible_bell);
         self.termviai_fonts.theme = theme;
         self.termviai_fonts.global_size = Some(size);
         self.termviai_fonts.ssh_keepalive_interval = ssh_keepalive_interval;
@@ -448,6 +479,21 @@ mod tests {
     }
 
     #[test]
+    fn bell_sound_preference_overrides_only_termviai_and_inherits_old_configuration() {
+        use config::AudibleBell::{Disabled, SystemBeep};
+        let mut prefs = TermviaiFonts::default();
+        assert!(prefs.audible_bell(true, &SystemBeep));
+        assert!(!prefs.audible_bell(true, &Disabled));
+        for enabled in [false, true] {
+            prefs.audible_bell = Some(enabled);
+            assert_eq!(prefs.audible_bell(true, &SystemBeep), enabled);
+            assert_eq!(prefs.audible_bell(true, &Disabled), enabled);
+            assert!(prefs.audible_bell(false, &SystemBeep));
+            assert!(!prefs.audible_bell(false, &Disabled));
+        }
+    }
+
+    #[test]
     fn settings_round_trip_preserves_other_preferences_and_corruption() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -457,6 +503,8 @@ mod tests {
         assert_eq!(prefs.theme, Theme::Ink);
         assert!(prefs.confirm_close_tabs.unwrap_or(true));
         assert!(TermviaiFonts::default().confirm_close_tabs());
+        assert_eq!(prefs.audible_bell, None);
+        prefs.audible_bell = Some(false);
         prefs.confirm_close_tabs = Some(false);
         prefs.theme = Theme::Light;
         prefs.terminal_font_size = Some(18.0);
@@ -465,12 +513,15 @@ mod tests {
         let loaded = Preferences::load(&path).unwrap();
         assert_eq!(loaded.theme, Theme::Light);
         assert_eq!(loaded.confirm_close_tabs, Some(false));
+        assert_eq!(loaded.audible_bell, Some(false));
+        prefs.audible_bell = Some(true);
         prefs.confirm_close_tabs = Some(true);
         prefs.save(&path).unwrap();
         assert_eq!(
             Preferences::load(&path).unwrap().confirm_close_tabs,
             Some(true)
         );
+        assert_eq!(Preferences::load(&path).unwrap().audible_bell, Some(true));
         assert_eq!(loaded.terminal_font_size, Some(18.0));
         assert_eq!(loaded.ssh_keepalive_interval_seconds, Some(45));
         assert_eq!(loaded.other["appearance"], "mocha");

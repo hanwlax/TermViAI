@@ -8,6 +8,8 @@ pub mod credentials;
 mod dirwrap;
 mod filewrap;
 mod host;
+mod forward;
+pub use forward::{RemoteForward, RemoteForwardSetup, RemoteForwardSetupUnavailable};
 mod pty;
 mod session;
 mod sessioninner;

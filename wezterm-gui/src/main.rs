@@ -43,6 +43,7 @@ mod glyphcache;
 mod hosts;
 mod inputmap;
 mod monitor;
+mod forwarding;
 mod overlay;
 mod quad;
 mod renderstate;

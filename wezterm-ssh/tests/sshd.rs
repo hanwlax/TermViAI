@@ -524,7 +524,7 @@ pub async fn session(#[default(Config::new())] config: Config, sshd: Sshd) -> Se
             SessionEvent::HostVerificationFailed(failed) => {
                 panic!("{}", failed);
             }
-            SessionEvent::Error(err) => {
+            SessionEvent::Error(err) | SessionEvent::AuthenticationFailed(err) => {
                 panic!("{}", err);
             }
             SessionEvent::Authenticated => break,

@@ -169,6 +169,7 @@ impl crate::TermWindow {
     pub fn paint_pass(&mut self) -> anyhow::Result<()> {
         self.termviai_sync_theme();
         self.termviai_sync_terminal_layout();
+        self.termviai_scrollbar_frame();
         {
             let gl_state = self.render_state.as_ref().unwrap();
             for layer in gl_state.layers.borrow().iter() {

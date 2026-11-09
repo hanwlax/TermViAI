@@ -59,7 +59,11 @@ impl super::TermWindow {
     }
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
+        if self.termviai_scrollbar_dragging() && self.termviai_scrollbar_mouse(&event, context) {
+            return;
+        }
         if self.termviai_mouse(&event, context) {
+            self.termviai_scrollbar_unhover();
             return;
         }
         // The zoom target is the selected session, not whichever pane happens
@@ -80,6 +84,9 @@ impl super::TermWindow {
                 context.invalidate();
                 return;
             }
+        }
+        if self.termviai_scrollbar_mouse(&event, context) {
+            return;
         }
         log::trace!("{:?}", event);
         let pane = match self.get_active_pane_or_overlay() {
@@ -826,6 +833,9 @@ impl super::TermWindow {
                     - (padding_left + border.left.get() as f32 + dx).round() as isize
                     - pos.left as isize * self.render_metrics.cell_size.width;
                 let py = event.coords.y
+                    + (self.termviai_scroll_fraction(pane.pane_id())
+                        * metrics.cell_size.height as f32)
+                        .round() as isize
                     - (padding_top + border.top.get() as f32 + tab_height + dy).round() as isize
                     - pos.top as isize * self.render_metrics.cell_size.height;
                 let mapped = super::termviai_font::session_cell_position(

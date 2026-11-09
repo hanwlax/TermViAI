@@ -147,6 +147,14 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
         3500
     }
 
+    /// Reflow the logical line containing the cursor on resize. Embedders
+    /// whose interactive programs redraw that line may disable this to keep
+    /// the program's physical cursor row stable. That line is clipped on shrink
+    /// until the program redraws it; completed output still reflows.
+    fn reflow_cursor_line(&self) -> bool {
+        true
+    }
+
     /// Return true if the embedding application wants to use CSI-u encoding
     /// for keys that would otherwise be ambiguous.
     /// <http://www.leonerd.org.uk/hacks/fixterms/>

@@ -29,6 +29,13 @@ TABLE = '''
 '''
 
 class CollectorTests(unittest.TestCase):
+    def test_sampling_timeout_allows_slow_driver_response(self):
+        result = Mock(returncode=0, stdout=TABLE, stderr='')
+        with patch.object(collector.shutil, 'which', return_value='/usr/local/sbin/npu-smi'), \
+             patch.object(collector.subprocess, 'run', return_value=result) as run:
+            self.assertEqual(len(collector.run_smi()['dies']), 3)
+            self.assertEqual(run.call_args.kwargs['timeout'], 30)
+
     def test_non_contiguous_topology_and_processes(self):
         data = collector.parse_table(TABLE)
         self.assertEqual([(d['npu'],d['die']) for d in data['dies']],[(4,2),(4,3),(7,0)])

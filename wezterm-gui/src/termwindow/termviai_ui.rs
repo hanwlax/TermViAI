@@ -1,4 +1,8 @@
 //! Native TermViAI application chrome and local SSH library.
+#[path = "termviai_auth.rs"]
+mod auth_ui;
+#[path = "termviai_forwarding.rs"]
+mod forwarding_ui;
 #[path = "termviai_monitor.rs"]
 mod monitor_ui;
 use super::box_model::*;
@@ -58,6 +62,7 @@ pub fn sidebar_width(config: &config::ConfigHandle, dpi: f32) -> f32 {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Page {
+    Forwarding,
     Monitor,
     Hosts,
     Keys,
@@ -66,6 +71,8 @@ pub enum Page {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Action {
+    Authenticate(usize, auth_ui::Command),
+    Forward(forwarding_ui::Command),
     Monitor(monitor_ui::Command),
     ToggleSidebar,
     Hosts,
@@ -73,6 +80,7 @@ enum Action {
     Settings,
     Theme(Theme),
     ToggleCloseConfirmation,
+    ToggleBellSound,
     TabMenu(usize),
     NewTab,
     AddTab,
@@ -305,6 +313,7 @@ struct AuthForm {
     theme: Option<Theme>,
     theme_focus: bool,
     confirm_close_tabs: bool,
+    audible_bell: bool,
     original_key: Option<KeyFile>,
     editing_identity: bool,
     original_identity: Option<Identity>,
@@ -437,6 +446,7 @@ enum FormRow {
     SettingsSection(bool),
     ThemeHint,
     CloseConfirmation,
+    BellSound,
     Field(usize),
     Endpoint,
     AuthMode,
@@ -455,7 +465,7 @@ impl FormRow {
             Self::ThemeChoice(_) => 60.,
             Self::SettingsSection(_) => 32.,
             Self::ThemeHint => 38.,
-            Self::CloseConfirmation => 78.,
+            Self::CloseConfirmation | Self::BellSound => 78.,
             Self::Field(_) | Self::Endpoint | Self::Picker => 78.,
             Self::AuthMode => 100.,
             Self::KeySource => 62.,
@@ -471,6 +481,7 @@ impl FormRow {
             || (*self == Self::Endpoint && matches!(index, 1 | 2))
             || (*self == Self::KeyInput && index == 5)
             || (*self == Self::CloseConfirmation && index == 2)
+            || (*self == Self::BellSound && index == 3)
     }
 }
 impl Form {
@@ -522,6 +533,7 @@ impl Form {
                 FormRow::Field(0),
                 FormRow::Field(1),
                 FormRow::CloseConfirmation,
+                FormRow::BellSound,
             ]);
             return rows;
         }
@@ -2123,6 +2135,7 @@ fn hit_action(hits: &[Hit], x: f32, y: f32) -> Option<Action> {
         .find(|h| x >= h.x && x < h.x + h.w && y >= h.y && y < h.y + h.h)
         .map(|h| h.action.clone())
 }
+#[derive(Clone)]
 struct Hit {
     x: f32,
     y: f32,
@@ -2208,6 +2221,14 @@ impl Tile {
                     | monitor_ui::Command::Retry(b),
                 ),
             ) => a == b,
+            (
+                Some(Action::Forward(forwarding_ui::Command::Details(a))),
+                Action::Forward(
+                    forwarding_ui::Command::Menu(b)
+                    | forwarding_ui::Command::Start(b)
+                    | forwarding_ui::Command::Stop(b),
+                ),
+            ) => a == b,
             (Some(Action::OpenSaved(parent)), Action::RemoveSaved(child, _)) => parent == child,
             (Some(Action::ConnectRecent(parent)), Action::RemoveRecent(child, _)) => {
                 parent == child
@@ -2233,7 +2254,9 @@ struct HostPicker {
 }
 
 pub struct TermviaiUi {
+    auth: auth_ui::AuthUi,
     monitor: monitor_ui::MonitorUi,
+    forward: forwarding_ui::ForwardUi,
     pub page: Page,
     store: HostStore,
     query: Input,
@@ -2295,7 +2318,9 @@ impl TermviaiUi {
     }
     fn with_store(store: HostStore, error: String) -> Self {
         Self {
+            auth: auth_ui::AuthUi::default(),
             monitor: monitor_ui::MonitorUi::default(),
+            forward: forwarding_ui::ForwardUi::default(),
             page: Page::Hosts,
             store,
             query: Input::default(),
@@ -2412,6 +2437,7 @@ impl TermviaiUi {
                 theme: Some(Theme::default()),
                 theme_focus: true,
                 confirm_close_tabs: true,
+                audible_bell: true,
                 ..AuthForm::default()
             },
         });
@@ -2451,6 +2477,12 @@ impl TermviaiUi {
         self.error.clear();
     }
     fn input(&mut self) -> Option<&mut Input> {
+        if self.page == Page::Terminal && self.form.is_none() && self.auth.active() {
+            return self.auth.input();
+        }
+        if self.page == Page::Forwarding && self.form.is_none() {
+            return self.forward.input();
+        }
         if self.closing_form.is_some() {
             return None;
         }
@@ -2648,7 +2680,11 @@ impl TermviaiUi {
                 String::new(),
                 h.identity_file,
                 h.group,
-                h.username,
+                if h.key_username.is_empty() {
+                    h.username
+                } else {
+                    h.key_username
+                },
             ]
         };
         self.closing_form = None;
@@ -2854,54 +2890,88 @@ impl TermviaiUi {
                     .context("Port must be between 1 and 65535.")?,
 
                 authentication: Some(f.auth.mode),
-                ..Default::default()
+                ..f.original.clone().unwrap_or_default()
             };
-            match f.auth.mode {
-                Authentication::Password => {
-                    host.username = v[3].clone();
-                    if !v[4].is_empty() {
+            // The existing three-tab editor retains its drafts. Persist the
+            // configured slots independently; selecting another tab no longer
+            // discards the credentials needed by the terminal fallback chain.
+            if f.original
+                .as_ref()
+                .is_some_and(|h| h.own_credential_ref().is_empty())
+            {
+                host.credential_id.clear();
+                host.session_credential.clear();
+            }
+            if !v[3].trim().is_empty() || f.auth.mode == Authentication::Password {
+                if host.key_username.is_empty()
+                    && (!host.key_label.is_empty() || !host.identity_file.is_empty())
+                {
+                    host.key_username = host.username.clone();
+                }
+                host.username = v[3].trim().into();
+            }
+            if !v[7].trim().is_empty() {
+                host.key_username = v[7].trim().into();
+            }
+            if !f.auth.selected_identity.is_empty() {
+                host.identity_id = f.auth.selected_identity.clone();
+            }
+            if f.auth.keychain_key && !f.auth.selected_key.is_empty() {
+                host.key_label = f.auth.selected_key.clone();
+                host.identity_file.clear();
+            } else if !f.auth.keychain_key && !v[5].trim().is_empty() {
+                host.identity_file = v[5].trim().into();
+                host.key_label.clear();
+            }
+            if !v[4].is_empty() {
+                anyhow::ensure!(
+                    !host.username.is_empty(),
+                    "Enter a username for the manual password."
+                );
+                let id = new_credential_id();
+                host.credential_id = id.clone();
+                host.session_credential.clear();
+                pending_password = Some((id, v[4].clone(), true));
+            } else if f.auth.mode == Authentication::Password {
+                if let Some(original) = &f.original {
+                    let reference = original.own_credential_ref();
+                    if !reference.is_empty() && !original.session_credential.is_empty() {
+                        let password = wezterm_ssh::credentials::load(reference)?.context(
+                            "The temporary password has expired. Enter it again to save it.",
+                        )?;
                         let id = new_credential_id();
                         host.credential_id = id.clone();
-                        pending_password = Some((id, v[4].clone(), true));
-                    } else if let Some(original) = &f.original {
-                        let reference = original.own_credential_ref();
-                        if !reference.is_empty() {
-                            if original.session_credential.is_empty() {
-                                host.credential_id = reference.to_owned();
-                            } else {
-                                let password = wezterm_ssh::credentials::load(reference)?.context(
-                                    "The temporary password has expired. Enter it again to save it.")?;
-                                let id = new_credential_id();
-                                host.credential_id = id.clone();
-                                pending_password = Some((id, password, true));
-                            }
-                        }
+                        host.session_credential.clear();
+                        pending_password = Some((id, password, true));
                     }
-                    anyhow::ensure!(!host.credential_id.is_empty(), "Enter a password.");
+                }
+            }
+            match f.auth.mode {
+                Authentication::Password => {
+                    anyhow::ensure!(!host.own_credential_ref().is_empty(), "Enter a password.")
                 }
                 Authentication::Key => {
-                    host.username = v[7].clone();
                     if f.auth.keychain_key {
                         anyhow::ensure!(
                             !f.auth.selected_key.is_empty(),
                             "Select a key from Keychain."
                         );
-                        host.key_label = f.auth.selected_key.clone();
                     } else {
                         anyhow::ensure!(!v[5].trim().is_empty(), "Enter a private key file path.");
-                        host.identity_file = v[5].clone();
                     }
                 }
-                Authentication::Identity => {
-                    anyhow::ensure!(
-                        !f.auth.selected_identity.is_empty(),
-                        "Select an identity from Keychain."
-                    );
-                    host.identity_id = f.auth.selected_identity.clone();
-                }
+                Authentication::Identity => anyhow::ensure!(
+                    !f.auth.selected_identity.is_empty(),
+                    "Select an identity from Keychain."
+                ),
             }
             if f.auth.mode != Authentication::Identity {
-                anyhow::ensure!(!host.username.trim().is_empty(), "Enter a username.");
+                let username = if f.auth.mode == Authentication::Key {
+                    &host.key_username
+                } else {
+                    &host.username
+                };
+                anyhow::ensure!(!username.trim().is_empty(), "Enter a username.");
             }
             if let Some((id, initial_path)) = &f.host_group_target {
                 if v[6].trim() == initial_path {
@@ -2917,11 +2987,13 @@ impl TermviaiUi {
             } else {
                 store.assign_host_group(&mut host, &v[6], f.original.as_ref())?;
             }
-            // Persist references for the active mode, resolving a copy for validation.
+            // Validate the selected editor mode without mutating the saved fallback slots.
             let mut resolved = host.clone();
             resolved.resolve_identity(&store)?;
             resolved.validate()?;
-            host.validate()?;
+            let mut metadata = host.clone();
+            metadata.identity_file.clear();
+            metadata.validate()?;
             if let Some(original) = &f.original {
                 let idx = store
                     .hosts
@@ -2965,6 +3037,70 @@ impl TermviaiUi {
         self.error.clear();
         self.generation += 1;
         Ok(())
+    }
+}
+
+fn paint_terminal_scrollbars(
+    tiles: &mut Vec<Tile>,
+    bars: Vec<super::termviai_scrollbar::Visual>,
+    theme: Theme,
+) {
+    let (normal, strong) = match theme {
+        Theme::Ink => ("#636b7a", "#99a3b4"),
+        Theme::Navy => ("#60768e", "#9bb0c7"),
+        Theme::Light => ("#8e96a5", "#657083"),
+    };
+    for bar in bars {
+        if bar.opacity <= 0. {
+            continue;
+        }
+        let g = bar.geometry;
+        if bar.emphasis {
+            tile(tiles, g.x, g.y, 14., g.height, "", normal, INK, true);
+            let t = tiles.last_mut().unwrap();
+            t.opacity = bar.opacity * 0.09;
+            t.corner_radius = 8.;
+            t.zindex = 32;
+        }
+        tile(
+            tiles,
+            g.x + 14. - (4. - (bar.width - 4.) / 3.) - bar.width,
+            g.thumb_y,
+            bar.width,
+            g.thumb_height,
+            "",
+            if bar.emphasis { strong } else { normal },
+            INK,
+            true,
+        );
+        let t = tiles.last_mut().unwrap();
+        t.opacity = bar.opacity;
+        t.corner_radius = 8.;
+        t.zindex = 33;
+        if let Some(label) = bar.label {
+            // A small drag-only position cue, clamped within the pane track.
+            let width = 124_f32.min(g.x - g.left - 12.);
+            if width < 96. || g.height < 28. {
+                continue;
+            }
+            tile(
+                tiles,
+                (g.x - width - 8.).max(g.left + 4.),
+                g.thumb_y.min(g.y + g.height - 28.).max(g.y),
+                width,
+                26.,
+                label,
+                CARD,
+                MUTED,
+                true,
+            );
+            let t = tiles.last_mut().unwrap();
+            t.text_size = Some(11);
+            t.text_centered = true;
+            t.corner_radius = 5.;
+            t.border_color = Some("#353648");
+            t.zindex = 34;
+        }
     }
 }
 
@@ -3023,6 +3159,9 @@ fn button(
 ) {
     let text = text.into();
     let icon = match &action {
+        Action::Forward(forwarding_ui::Command::Open | forwarding_ui::Command::FromTab(_)) => {
+            Some(Icon::Link)
+        }
         Action::Monitor(monitor_ui::Command::Open) => Some(Icon::Activity),
         Action::Monitor(monitor_ui::Command::Add) => Some(Icon::Plus),
         Action::ToggleSidebar => Some(Icon::Menu),
@@ -3988,6 +4127,14 @@ impl TermWindow {
     pub(super) fn termviai_input_generation(&self) -> u64 {
         self.termviai_ui.generation
     }
+    pub(super) fn termviai_scrollbars_allowed(&self) -> bool {
+        self.config.termviai_ui
+            && !self.termviai_ui_input_active()
+            && self.get_modal().is_none()
+            && self.termviai_ui.tab_drag.is_none()
+            && !self.termviai_pane_geometry_in_motion()
+    }
+
     pub fn termviai_library_active(&self) -> bool {
         self.config.termviai_ui && self.termviai_ui.page != Page::Terminal
     }
@@ -4001,11 +4148,12 @@ impl TermWindow {
                 || self.termviai_ui.tab_menu.is_some()
                 || self.termviai_ui.host_menu.is_some()
                 || self.termviai_ui.group_menu.is_some()
-                || self.termviai_ui.host_picker.is_some())
+                || self.termviai_ui.host_picker.is_some()
+                || (self.termviai_ui.page == Page::Terminal && self.termviai_ui.auth.active()))
     }
 
     fn termviai_save_form(&mut self) -> anyhow::Result<()> {
-        if let Some((size_value, keepalive_value, confirm_close_tabs)) = self
+        if let Some((size_value, keepalive_value, confirm_close_tabs, audible_bell)) = self
             .termviai_ui
             .form
             .as_ref()
@@ -4015,6 +4163,7 @@ impl TermWindow {
                     form.fields[0].value.clone(),
                     form.fields[1].value.clone(),
                     form.auth.confirm_close_tabs,
+                    form.auth.audible_bell,
                 )
             })
         {
@@ -4031,6 +4180,7 @@ impl TermWindow {
                 keepalive,
                 self.termviai_theme(),
                 confirm_close_tabs,
+                audible_bell,
             )?;
             self.termviai_ui.close_form();
             return Ok(());
@@ -4058,6 +4208,7 @@ impl TermWindow {
     }
 
     pub(super) fn reset_termviai_interaction(&mut self) {
+        self.termviai_scrollbar_cancel();
         self.cancel_termviai_tab_drag();
         self.termviai_ui.input_drag = None;
         self.termviai_ui.host_menu = None;
@@ -4106,6 +4257,12 @@ impl TermWindow {
     fn termviai_action(&mut self, action: Action) -> anyhow::Result<()> {
         self.termviai_ui.generation += 1;
         match action {
+            Action::Authenticate(id, command) => self.termviai_auth_action(id, command)?,
+            Action::Forward(command) => {
+                if let Err(e) = self.forwarding_action(command) {
+                    self.termviai_ui.forward.error = format!("{e:#}");
+                }
+            }
             Action::Monitor(command) => {
                 if matches!(
                     command,
@@ -4315,6 +4472,17 @@ impl TermWindow {
                     .unwrap()
                     .auth
                     .confirm_close_tabs = self.termviai_fonts.confirm_close_tabs();
+                self.termviai_ui.form.as_mut().unwrap().auth.audible_bell = self
+                    .termviai_fonts
+                    .audible_bell(true, &self.config.audible_bell);
+            }
+            Action::ToggleBellSound => {
+                if let Some(form) = self.termviai_ui.form.as_mut().filter(|f| f.settings) {
+                    form.auth.audible_bell = !form.auth.audible_bell;
+                    form.auth.theme_focus = false;
+                    form.focus = 3;
+                    form.reveal_focus = true;
+                }
             }
             Action::ToggleCloseConfirmation => {
                 if let Some(form) = self.termviai_ui.form.as_mut().filter(|f| f.settings) {
@@ -4732,7 +4900,11 @@ impl TermWindow {
         let x = event.coords.x as f32 / scale;
         let y = (event.coords.y as f32 - self.get_os_border().top.get() as f32) / scale;
         let over = hit_action(&self.termviai_ui.hits, x, y);
-        let capture = self.termviai_ui_input_active()
+        let capture = (self.termviai_ui_input_active()
+            && !(self.termviai_ui.page == Page::Terminal
+                && self.termviai_ui.form.is_none()
+                && self.termviai_ui.auth.active()
+                && self.termviai_ui.tab_menu.is_none()))
             || over.is_some()
             || x < self.termviai_ui.sidebar_width(Instant::now())
             || y < 52.
@@ -4747,6 +4919,18 @@ impl TermWindow {
             return false;
         }
         self.current_mouse_event = Some(event.clone());
+        if self.termviai_ui.page == Page::Forwarding
+            && self.termviai_ui.form.is_none()
+            && self.termviai_ui.forward.scrollbar_mouse(
+                &event.kind,
+                x,
+                y,
+                event.mouse_buttons.contains(window::MouseButtons::LEFT),
+            )
+        {
+            context.invalidate();
+            return true;
+        }
         if self.termviai_ui.page == Page::Monitor
             && self.termviai_ui.form.is_none()
             && self.termviai_ui.monitor.scrollbar_mouse(
@@ -4801,7 +4985,15 @@ impl TermWindow {
             }
         }
         if matches!(event.kind, MouseEventKind::Press(MousePress::Left))
-            && matches!(over, Some(Action::Field(_) | Action::Search))
+            && matches!(
+                over,
+                Some(
+                    Action::Field(_)
+                        | Action::Search
+                        | Action::Forward(forwarding_ui::Command::Field(_))
+                        | Action::Authenticate(_, auth_ui::Command::Field(_))
+                )
+            )
         {
             let action = over.clone().unwrap();
             let position = self
@@ -4844,7 +5036,15 @@ impl TermWindow {
                     context.invalidate();
                 }
                 context.set_cursor(Some(
-                    if matches!(over, Some(Action::Field(_) | Action::Search)) {
+                    if matches!(
+                        over,
+                        Some(
+                            Action::Field(_)
+                                | Action::Search
+                                | Action::Forward(forwarding_ui::Command::Field(_))
+                                | Action::Authenticate(_, auth_ui::Command::Field(_))
+                        )
+                    ) {
                         CursorIcon::Text
                     } else if over.is_some()
                         && !matches!(over, Some(Action::Drag | Action::Drawer | Action::Cancel))
@@ -4920,6 +5120,21 @@ impl TermWindow {
                 context.invalidate();
             }
             MouseEventKind::VertWheel(amount) => {
+                if self.termviai_ui.page == Page::Terminal
+                    && self.termviai_ui.form.is_none()
+                    && self
+                        .termviai_ui
+                        .auth
+                        .scroll_at(x, y, -(amount as f32) * 28.)
+                {
+                    context.invalidate();
+                    return true;
+                }
+                if self.termviai_ui.page == Page::Forwarding && self.termviai_ui.form.is_none() {
+                    self.termviai_ui.forward.scroll_by(-(amount as f32) * 24.);
+                    context.invalidate();
+                    return true;
+                }
                 if self.termviai_ui.page == Page::Monitor && self.termviai_ui.form.is_none() {
                     let m = &mut self.termviai_ui.monitor;
                     let step = amount.unsigned_abs().max(1) as usize;
@@ -5067,6 +5282,12 @@ impl TermWindow {
             context.invalidate();
             return true;
         }
+        if self.termviai_ui.page == Page::Forwarding
+            && self.termviai_ui.form.is_none()
+            && self.forwarding_key(event, context)
+        {
+            return true;
+        }
         if self.termviai_ui.page == Page::Monitor
             && self.termviai_ui.form.is_none()
             && self.termviai_monitor_key(event, context)
@@ -5147,6 +5368,9 @@ impl TermWindow {
             }
             return true;
         }
+        if self.termviai_auth_key(event, context) {
+            return true;
+        }
         if !self.termviai_ui_input_active() {
             return false;
         }
@@ -5155,10 +5379,14 @@ impl TermWindow {
         }
         if let Some(form) = self.termviai_ui.form.as_mut().filter(|f| f.settings) {
             if !form.auth.theme_focus
-                && form.focus == 2
+                && matches!(form.focus, 2 | 3)
                 && matches!(event.key, KeyCode::Char(' ' | '\r'))
             {
-                form.auth.confirm_close_tabs = !form.auth.confirm_close_tabs;
+                if form.focus == 2 {
+                    form.auth.confirm_close_tabs = !form.auth.confirm_close_tabs;
+                } else {
+                    form.auth.audible_bell = !form.auth.audible_bell;
+                }
                 context.invalidate();
                 return true;
             }
@@ -5183,9 +5411,9 @@ impl TermWindow {
                 let backwards = event.modifiers.contains(Modifiers::SHIFT);
                 if form.auth.theme_focus {
                     form.auth.theme_focus = false;
-                    form.focus = if backwards { 2 } else { 0 };
+                    form.focus = if backwards { 3 } else { 0 };
                     form.reveal_focus = true;
-                } else if (backwards && form.focus == 0) || (!backwards && form.focus == 2) {
+                } else if (backwards && form.focus == 0) || (!backwards && form.focus == 3) {
                     form.auth.theme_focus = true;
                     form.first_row = 0;
                     form.reveal_focus = false;
@@ -5248,6 +5476,9 @@ impl TermWindow {
                 .form
                 .as_ref()
                 .is_some_and(Form::masked_password)
+                || (self.termviai_ui.page == Page::Terminal
+                    && self.termviai_ui.auth.active()
+                    && self.termviai_ui.auth.masked())
             {
                 return true;
             }
@@ -5426,6 +5657,7 @@ impl TermWindow {
         if !self.config.termviai_ui {
             return Ok(());
         }
+        self.termviai_auth_tick();
         let ui_layout = ::window::resize_diagnostics::Span::new("ui_layout");
         let now = Instant::now();
         let keepalive = self.termviai_ssh_keepalive_interval();
@@ -5434,6 +5666,22 @@ impl TermWindow {
             .tick(&self.termviai_ui.store, keepalive);
         if self.termviai_ui.monitor.active() {
             self.update_next_frame_time(Some(now + Duration::from_millis(200)));
+        }
+        self.termviai_ui.forward.refresh();
+        if self
+            .termviai_ui
+            .forward
+            .views
+            .iter()
+            .any(|v| v.state.active() || v.busy)
+        {
+            self.update_next_frame_time(Some(now + Duration::from_millis(200)));
+        }
+        if self.termviai_ui.page == Page::Forwarding
+            && (self.termviai_ui.forward.scroll.active()
+                || self.termviai_ui.forward.drawer_scroll.active())
+        {
+            self.update_next_frame_time(Some(now + frame_interval(self.config.max_fps as u64)));
         }
         let theme = self.termviai_theme();
         self.termviai_sync_sidebar_layout(now);
@@ -5484,6 +5732,47 @@ impl TermWindow {
             self.termviai_ui.page = Page::Hosts;
         }
         let headers = self.termviai_pane_headers();
+        let auth_areas: Vec<_> = if headers.is_empty() {
+            active_tab
+                .as_ref()
+                .and_then(|t| t.get_active_pane())
+                .map(|p| {
+                    (
+                        p.pane_id(),
+                        true,
+                        super::termviai_dock::Rect {
+                            x: self.termviai_ui.sidebar_width(now),
+                            y: 52.,
+                            w: (self.dimensions.pixel_width as f32 / scale
+                                - self.termviai_ui.sidebar_width(now))
+                            .max(1.),
+                            h: ((self.dimensions.pixel_height as f32 - top) / scale
+                                - 52.
+                                - self.termviai_ui.broadcast_tray_height())
+                            .max(1.),
+                        },
+                    )
+                })
+                .into_iter()
+                .collect()
+        } else {
+            headers
+                .iter()
+                .map(|h| {
+                    let top = (h.rect.y + h.rect.h).max(h.frame.y);
+                    (
+                        h.pane_id,
+                        h.is_active,
+                        super::termviai_dock::Rect {
+                            x: h.frame.x + 1.,
+                            y: top,
+                            w: (h.frame.w - 2.).max(1.),
+                            h: (h.frame.y + h.frame.h - top).max(1.),
+                        },
+                    )
+                })
+                .collect()
+        };
         let labels: HashMap<usize, String> = pane_list
             .iter()
             .map(|p| (p.pane.pane_id(), self.termviai_pane_label(p.pane.pane_id())))
@@ -5577,6 +5866,7 @@ impl TermWindow {
                     .or_insert_with(|| error.clone());
             }
         }
+        let scrollbars = self.termviai_scrollbar_visuals();
         let drag_visuals = self.termviai_tab_drag_visuals();
         let mut tiles = vec![];
         let mut hits = vec![];
@@ -5878,12 +6168,24 @@ impl TermWindow {
             &mut tiles,
             &mut hits,
             12.,
-            210.,
+            258.,
             SIDEBAR_WIDTH - 24.,
             40.,
             "Settings",
             SIDE,
             Action::Settings,
+            &hover,
+        );
+        button(
+            &mut tiles,
+            &mut hits,
+            12.,
+            210.,
+            SIDEBAR_WIDTH - 24.,
+            40.,
+            "Port Forwarding",
+            SIDE,
+            Action::Forward(forwarding_ui::Command::Open),
             &hover,
         );
         if ui.page != Page::Terminal {
@@ -5917,6 +6219,10 @@ impl TermWindow {
                     tile.action,
                     Some(Action::Monitor(monitor_ui::Command::Open))
                 ) && ui.page == Page::Monitor
+                || matches!(
+                    tile.action,
+                    Some(Action::Forward(forwarding_ui::Command::Open))
+                ) && ui.page == Page::Forwarding
                 || matches!(tile.action, Some(Action::Settings))
                     && ui.form.as_ref().is_some_and(|f| f.settings)
             {
@@ -5929,6 +6235,7 @@ impl TermWindow {
             hit.x += sidebar_shift;
         }
         if ui.page == Page::Terminal {
+            auth_ui::draw(ui, &mut tiles, &mut hits, &auth_areas, &hover);
             if ui.connecting {
                 tile(
                     &mut tiles,
@@ -6867,6 +7174,19 @@ impl TermWindow {
                 tile(&mut tiles, w - 7., sy, 4., 60., "", MUTED, MUTED, true);
             }
         }
+        if ui.page == Page::Forwarding {
+            forwarding_ui::draw(
+                ui,
+                &mut tiles,
+                &mut hits,
+                content_left,
+                w,
+                h,
+                &hover,
+                &self.fonts,
+                scale,
+            )?;
+        }
         if ui.page == Page::Monitor {
             monitor_ui::draw(
                 ui,
@@ -7084,7 +7404,13 @@ impl TermWindow {
                                 false,
                             );
                         }
-                        FormRow::CloseConfirmation => {
+                        FormRow::CloseConfirmation | FormRow::BellSound => {
+                            let bell = *row == FormRow::BellSound;
+                            let selected = if bell {
+                                form.auth.audible_bell
+                            } else {
+                                form.auth.confirm_close_tabs
+                            };
                             button(
                                 &mut tiles,
                                 &mut hits,
@@ -7092,19 +7418,27 @@ impl TermWindow {
                                 y,
                                 fw,
                                 40.,
-                                "Confirm before closing tabs",
+                                if bell {
+                                    "Terminal bell sound"
+                                } else {
+                                    "Confirm before closing tabs"
+                                },
                                 FIELD,
-                                Action::ToggleCloseConfirmation,
+                                if bell {
+                                    Action::ToggleBellSound
+                                } else {
+                                    Action::ToggleCloseConfirmation
+                                },
                                 &hover,
                             );
                             let control = tiles.last_mut().unwrap();
-                            control.icon = Some(if form.auth.confirm_close_tabs {
+                            control.icon = Some(if selected {
                                 Icon::CheckboxChecked
                             } else {
                                 Icon::Checkbox
                             });
                             control.content_centered = false;
-                            if !form.auth.theme_focus && form.focus == 2 {
+                            if !form.auth.theme_focus && form.focus == if bell { 3 } else { 2 } {
                                 control.border_color = Some(ACCENT);
                             }
                             tile(
@@ -7113,7 +7447,11 @@ impl TermWindow {
                                 y + 44.,
                                 fw,
                                 26.,
-                                "Ask before disconnecting a tab or tab group.",
+                                if bell {
+                                    "Sound on invalid input or failed completion."
+                                } else {
+                                    "Ask before disconnecting a tab or tab group."
+                                },
                                 SIDE,
                                 MUTED,
                                 false,
@@ -7469,6 +7807,16 @@ impl TermWindow {
                 ("Rename tab", Action::RenameTab(id)),
                 ("Save workspace", Action::SaveWorkspace(id)),
             ];
+            if Mux::get()
+                .get_tab(id)
+                .and_then(|t| t.get_active_pane())
+                .is_some_and(|p| !p.is_dead() && ui.workspace.hosts.contains_key(&p.domain_id()))
+            {
+                actions.push((
+                    "Add port forwarding",
+                    Action::Forward(forwarding_ui::Command::FromTab(id)),
+                ));
+            }
             if disconnected_groups.contains(&id) {
                 actions.push(("Reconnect offline", Action::ReconnectGroup(id)));
             }
@@ -7619,6 +7967,27 @@ impl TermWindow {
                 }
             } else if let Some((action, hint)) = hover.as_ref().and_then(|action| {
                 let hint = match action {
+                    Action::Forward(forwarding_ui::Command::Details(id))
+                        if ui.forward.panel.is_none() && ui.forward.menu.is_none() =>
+                    {
+                        ui.forward
+                            .views
+                            .iter()
+                            .find(|v| &v.rule.id == id)
+                            .and_then(|v| {
+                                let available = tiles
+                                    .iter()
+                                    .find(|t| t.text == v.rule.name)
+                                    .map(|t| t.w)
+                                    .unwrap_or(f32::MAX);
+                                let measured = text_positions(&ui_font, &v.rule.name, scale)
+                                    .ok()?
+                                    .last()
+                                    .copied()
+                                    .unwrap_or(0.);
+                                (measured > available).then(|| v.rule.name.clone())
+                            })
+                    }
                     Action::PaneError(id) => pane_errors
                         .get(id)
                         .map(|error| format!("{error}\nClick to dismiss")),
@@ -7685,6 +8054,7 @@ impl TermWindow {
                 &hover,
             );
         }
+        paint_terminal_scrollbars(&mut tiles, scrollbars, theme);
         ui.hits = hits;
         let hover_hits = &ui.hits;
         let hovered_hit = pointer
@@ -7789,9 +8159,15 @@ impl TermWindow {
             if matches!(
                 t.action,
                 Some(
-                    Action::Save
+                    Action::Authenticate(
+                        _,
+                        auth_ui::Command::Continue
+                            | auth_ui::Command::Trust
+                            | auth_ui::Command::SaveAgain
+                    ) | Action::Save
                         | Action::AcceptHostPicker
                         | Action::Monitor(monitor_ui::Command::AcceptAdd)
+                        | Action::Forward(forwarding_ui::Command::Save)
                 )
             ) {
                 bg = mix_color(color(t.bg), color("#474159"), hover);
@@ -7817,7 +8193,15 @@ impl TermWindow {
                 bg = if matches!(
                     t.action,
                     Some(
-                        Action::GroupMenu(_)
+                        Action::Forward(
+                            forwarding_ui::Command::Menu(_)
+                                | forwarding_ui::Command::Start(_)
+                                | forwarding_ui::Command::Stop(_)
+                                | forwarding_ui::Command::Details(_)
+                                | forwarding_ui::Command::StartAll
+                                | forwarding_ui::Command::StopAll
+                                | forwarding_ui::Command::ChangeSource
+                        ) | Action::GroupMenu(_)
                             | Action::HostMenu(_)
                             | Action::TabBroadcast(_)
                             | Action::TabMenu(_)
@@ -7851,6 +8235,7 @@ impl TermWindow {
                             | Action::Cancel
                             | Action::ConfirmCancel
                             | Action::Monitor(monitor_ui::Command::Close)
+                            | Action::Forward(forwarding_ui::Command::Close)
                     )
                 );
             let fg = if close_icon {
@@ -9129,7 +9514,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn saving_uses_only_active_authentication_and_key_source() {
+    fn saving_keeps_all_authentication_drafts_and_selected_key_source() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hosts.json");
         let key = tempfile::NamedTempFile::new().unwrap();
@@ -9162,11 +9547,15 @@ mod tests {
         ui.save_form_at(&path).unwrap();
         let host = ui.store.hosts[0].clone();
         assert_eq!(host.authentication, Some(Authentication::Key));
-        assert_eq!(host.username, "key-user");
-        assert!(
-            host.identity_id.is_empty()
-                && host.credential_ref().is_empty()
-                && host.identity_file.is_empty()
+        assert_eq!(host.username, "manual");
+        assert_eq!(host.key_username, "key-user");
+        assert_eq!(host.identity_id, "test-identity-ref");
+        assert!(!host.credential_ref().is_empty() && host.identity_file.is_empty());
+        assert_eq!(
+            wezterm_ssh::credentials::load(host.credential_ref())
+                .unwrap()
+                .as_deref(),
+            Some("inactive-secret")
         );
         assert_eq!(host.key_label, "Selected key");
         ui.open_form(false, Some(host));
@@ -9178,12 +9567,19 @@ mod tests {
         let host = &ui.store.hosts[0];
         assert_eq!(host.authentication, Some(Authentication::Identity));
         assert!(
-            host.username.is_empty()
-                && host.key_label.is_empty()
+            host.username == "manual"
+                && host.key_label == "Selected key"
                 && host.identity_file.is_empty()
-                && host.credential_ref().is_empty()
+                && !host.credential_ref().is_empty()
         );
         assert_eq!(host.identity_id, "test-identity-ref");
+        assert_eq!(
+            wezterm_ssh::credentials::load(host.credential_ref())
+                .unwrap()
+                .as_deref(),
+            Some("another-inactive-secret")
+        );
+        wezterm_ssh::credentials::delete(host.credential_ref()).unwrap();
         let json = std::fs::read_to_string(&path).unwrap();
         assert!(!json.contains("inactive-secret") && !json.contains("invalid-unused-path"));
     }
@@ -9243,7 +9639,8 @@ mod tests {
         ui.save_form_at(&path).unwrap();
         let host = &ui.store.hosts[0];
         let _manual_cleanup = Cleanup(host.credential_id.clone());
-        assert!(host.identity_id.is_empty() && host.key_label.is_empty());
+        assert_eq!(host.identity_id, original.id);
+        assert!(host.key_label.is_empty());
         assert_eq!(host.username, "manual-user");
         assert_eq!(
             wezterm_ssh::credentials::load(host.credential_ref())
@@ -9762,6 +10159,11 @@ mod tests {
         let rows = form.drawer_rows(&ui.store);
         let visible = form.visible_drawer_rows(&rows, 200.);
         assert!(rows[visible].contains(&FormRow::CloseConfirmation));
+        form.focus = 3;
+        form.reveal_focus = true;
+        let visible = form.visible_drawer_rows(&rows, 200.);
+        assert!(rows[visible].contains(&FormRow::BellSound));
+        assert!(ui.input().is_none());
         ui.close_form();
         assert!(ui.input().is_none());
         assert!(ui.page == Page::Terminal);
@@ -9933,5 +10335,74 @@ mod tests {
         input.cursor = 0;
         input.delete(false);
         assert_eq!(input.value, "ewname");
+    }
+}
+
+#[cfg(test)]
+mod terminal_scrollbar_visual_tests {
+    use super::*;
+    use crate::termwindow::termviai_scrollbar::{Geometry, Visual};
+    #[test]
+    fn scrollbar_states_match_design_in_all_themes_and_stay_inside_each_pane() {
+        for theme in Theme::ALL {
+            for left in [0., 400.] {
+                let g = Geometry::new(left, left + 300., 60., 240., 30, 100, 1000, 500.);
+                let mut tiles = vec![];
+                paint_terminal_scrollbars(
+                    &mut tiles,
+                    vec![Visual {
+                        geometry: g,
+                        opacity: 0.,
+                        width: 4.,
+                        emphasis: false,
+                        label: None,
+                    }],
+                    theme,
+                );
+                assert!(tiles.is_empty());
+                paint_terminal_scrollbars(
+                    &mut tiles,
+                    vec![Visual {
+                        geometry: g,
+                        opacity: 1.,
+                        width: 4.,
+                        emphasis: false,
+                        label: None,
+                    }],
+                    theme,
+                );
+                assert_eq!(tiles.len(), 1);
+                assert_eq!(tiles[0].w, 4.);
+                assert_eq!(tiles[0].x, g.x + 6.);
+                tiles.clear();
+                paint_terminal_scrollbars(
+                    &mut tiles,
+                    vec![Visual {
+                        geometry: g,
+                        opacity: 1.,
+                        width: 7.,
+                        emphasis: true,
+                        label: Some("History · 44%".into()),
+                    }],
+                    theme,
+                );
+                assert_eq!(tiles.len(), 3);
+                assert_eq!(tiles[1].w, 7.);
+                assert_eq!(tiles[1].x, g.x + 4.);
+                assert!(tiles[0].opacity < 0.1);
+                for t in &tiles {
+                    assert!(t.action.is_none());
+                    assert!(t.x >= left);
+                    assert!(t.y >= g.y && t.y + t.h <= g.y + g.height);
+                }
+                let expected = match theme {
+                    Theme::Ink => "#99a3b4",
+                    Theme::Navy => "#9bb0c7",
+                    Theme::Light => "#657083",
+                };
+                assert_eq!(tiles[1].bg, expected);
+                assert_eq!(tiles[2].text_size, Some(11));
+            }
+        }
     }
 }

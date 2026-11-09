@@ -111,8 +111,42 @@ impl Screen {
         let mut logical_cursor_x: Option<usize> = None;
         let mut adjusted_cursor = (cursor_x, cursor_y);
 
+        // Shells redraw their current input after SIGWINCH using the old
+        // physical row count. Reflowing that same logical line first leaves
+        // prompt fragments behind on shrink and can erase history on grow.
+        // Keep the entire wrapped cursor line in place, including when the
+        // cursor is in its middle. Other logical lines retain normal reflow.
+        let cursor_line = if !self.config.reflow_cursor_line() {
+            let mut start = cursor_y;
+            while start > 0 && self.lines[start - 1].last_cell_was_wrapped() {
+                start -= 1;
+            }
+            let mut end = cursor_y;
+            while end + 1 < self.lines.len() && self.lines[end].last_cell_was_wrapped() {
+                end += 1;
+            }
+            Some(start..=end)
+        } else {
+            None
+        };
+
         for (phys_idx, mut line) in self.lines.drain(..).enumerate() {
             line.update_last_change_seqno(seqno);
+            if cursor_line
+                .as_ref()
+                .map_or(false, |range| range.contains(&phys_idx))
+            {
+                if phys_idx == cursor_y {
+                    adjusted_cursor = (cursor_x.min(physical_cols - 1), rewrapped.len());
+                }
+                if line.len() > physical_cols {
+                    let wrapped = line.last_cell_was_wrapped();
+                    line.resize(physical_cols, seqno);
+                    line.set_last_cell_was_wrapped(wrapped, seqno);
+                }
+                rewrapped.push_back(line);
+                continue;
+            }
             let was_wrapped = line.last_cell_was_wrapped();
 
             if was_wrapped {

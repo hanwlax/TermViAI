@@ -53,7 +53,7 @@ beta.6 主题与工作区：Settings → Appearance 提供墨黑·鸢尾紫、�
 - Windows 原生最小客户区为 720×480 逻辑像素；缩放时仅在终端网格变化后重排 Mux/PTY。
 - 关闭窗口、Tab、pane 和退出应用使用统一的现代确认卡片。
 
-用户已明确暂不实现顶栏 SFTP、Vaults，以及侧栏 Port Forwarding、Snippets、Known Hosts、Logs。这些功能不是当前 Beta 的缺陷。
+用户已明确暂不实现顶栏 SFTP、Vaults，以及侧栏 Snippets、Known Hosts、Logs。这些功能不是当前 Beta 的缺陷。
 
 ## 代码结构与关键入口
 
@@ -181,3 +181,31 @@ beta.6 主题与工作区：Settings → Appearance 提供墨黑·鸢尾紫、�
 - 2026-10-26：Settings 增加 Confirm before closing tabs（默认开启），保存后适用于标签和终端组关闭；与窗口退出、单终端断开、删除 Host/Group 的确认策略分开。New Tab 的 Saved workspaces 支持 × 删除模板，Recent connections 与 Saved workspaces 的 × 仅悬浮行内显示、悬浮变红无底色；子按钮保持父行高亮。删除模板保留活动会话，清除活动标签模板关联并同步其他窗口；旧缓存 save 不可复活已删除模板，并拒绝误删并发更新。
 
 - 2026-10-26：Recent connections 的连接身份按 Keychain 解析后的用户名/密钥路径与规范化地址、端口判断；不能直接比较 Identity 表单里为空的 username。保留最新原始 Host/认证引用，加载和写入均先去重再限制条数；失效 Identity/Key 使用独立引用标识，不猜测账号，不读取私钥。Saved workspaces 不随最近连接去重。
+
+- 2026-10-27：Settings → Terminal & SSH 新增 Terminal bell sound。Save 后立即同步同进程其他窗口并持久化；未保存过此选项时继承既有 audible_bell 配置，非 TermViAI UI 保留原配置行为。仅控制终端 Bell 的系统提示音，保留视觉响铃、bell 事件和窗口归属检查。
+
+- 2026-10-27：按已审核滚动条 UX 增加每终端独立浮动滑块，默认隐藏；右侧 14 px 热区或滚动唤出，细条 4 px / 悬浮 7 px，停止 1.2 秒后 180 ms 淡出，拖动时展示历史位置。轨道翻页，拖动直接定位，滚轮采用设计稿 45 ms 指数响应；像素平移在已缓存文字 quad 提交时执行并裁切到终端正文，停止后回到整行。保持输入回到底部、广播跟随、Ctrl+滚轮字号和 TUI 鼠标上报；无历史和备用屏幕不显示。未自动操作原生终端窗口，实际手感待试用验收。
+
+- 2026-10-27：缩窄窗口时提示符重复的确定性复现是当前光标行先 reflow、Shell 再按旧物理行数重绘，导致残留或向上清除历史。TermViAI 使用与 xterm.js 默认策略一致的当前逻辑行不 reflow：保留整段软折行的物理行数，缩窄时裁切到列宽、钳制光标，等待应用重绘；其他历史逻辑行正常折行。非 TermViAI 默认仍 reflow；备用屏幕路径保留。无重绘的当前行会被裁切，这是此策略的明确取舍，不做提示符字符串识别或自动清屏。
+
+- 2026-10-28：Monitor 每主机独立复用 SSH 会话，与终端连接独立。故障不再永久停止采样：连接/未知无 stderr 退出丢弃旧会话，远端采集错误保留会话，按 2/5/10/30 秒退避只重试采样；认证交互、主机指纹与配置错误需人工处理。npu-smi 超时 30 秒，外层收集 45 秒。结束进程完成或结果不确定时立即查询，不自动重发结束请求，结果不确定提示独立保留；等待退出时追加最多 5 次 1 秒间隔查询，再恢复原间隔。切回 Monitor 保留选中主机、NPU/Die、详情与滚动位置，Home 才返回首页。
+
+## 2026-10-29 Port Forwarding 本地试用
+
+按审核的多列紧凑卡片 UX 新增原生反向 TCP 转发，从已打开的 TermViAI SSH 终端添加，侧栏和独立页签管理；不含 REST、不读取 `.ssh/config`。每条规则独立长连接，支持启停、编辑删除、有限重试、本机探测、远端冲突检查与显式确认结束合格 SSH 会话。规则持久化但启动应用后默认停止；关闭终端/页面不停止转发。详见 [PORT_FORWARDING.md](PORT_FORWARDING.md)。未提交、未推送、未发布正式 beta；试用版沿用 beta.7 版本字符串。
+
+### 2026-10-29 转发自动恢复更新
+
+Port Forwarding 现已保存运行意图：重新打开应用恢复应运行规则，手动停止规则保持停止，无需先打开来源 SSH 终端。监听之前在同一专用连接取得 sshd PID/boot ID/starttime 并落盘；旧监听唯一归属匹配才用 pidfd 自动释放并重建，同一数据目录使用 OS 文件锁防止双实例接管。旧版本缺少归属记录和运行意图，不能追认其遗留占用；首次启动后启用新记录。普通转发保留无 Python/禁止 exec 主机的降级路径，自动清理需要 Linux/Python/ss/pidfd。详见 PORT_FORWARDING.md。
+
+## 2026-10-29 Port Forwarding 导航与主机选择
+
+- Port Forwarding 改为与 Hosts / Keychain 一致的侧栏页面，移除额外顶栏标签及其关闭/激活状态。
+- Add forwarding 列表包括所有已保存 SSH 主机，无需先打开终端；补充当前窗口未保存的活动 SSH 主机。已保存元数据优先，合并相同来源的临时会话密码引用，保留不同账户/认证配置。
+- 主机选择沿用 Monitor 的 560 px 响应式抽屉、分组标题、两行主机信息与固定搜索框；按名称/地址/用户名/完整分组路径过滤，单击或搜索后 Enter 选择。保留终端菜单直接创建快捷入口。
+- 继续复用已保存 Host / Keychain 认证及既有自动恢复逻辑，不读取 .ssh/config。首次未知主机指纹仍需在终端验证，不静默信任。
+
+## 2026-10-29 Bash 5.1.8 长提示符缩放兼容
+
+- 216 录屏残行在隔离 Bash 5.1.8 + 当前终端模型中复现，远端 Readline 重绘遗漏向上清行。相同缩放下原配置累积 42 条残行；开启 `bind 'set horizontal-scroll-mode on'` 或 Bash 5.2.21 均不累积。
+- 之前 `reflow_cursor_line=false` 修复仍有效，不能因此撤回；本次没有给终端添加基于提示符文本的去重或猜测性清屏。详情见 UI_VALIDATION.md；建议当前会话水平滚动或使用含 Readline 修复的 Shell。

@@ -1,6 +1,14 @@
 # TermViAI UI 验证
 
 
+## 2026-11-09 终端内认证恢复
+
+Edit Host 布局不变，独立保留 Key、Identity 与手动密码字段；交互终端按 Key → Identity → 手动密码尝试，全部未成功时在所属终端分屏内显示认证选择页。认证成功只回写对应 Host 项，不改共享 Keychain；保存冲突不会覆盖其他窗口的修改。新增分屏范围内滚动、固定操作区、口令/MFA 输入和显式主机指纹确认，广播跳过未认证终端。
+
+Windows release 回归：mux SSH 11 项、SSH 库 21 项、GUI 222 项通过（GUI 另有 2 项原有 ignored 测试）。独立 loopback 集成测试通过，分别以 libssh 与 libssh2 验证 Key 成功即停止、Identity 回退、手动密码回退、全部失败后加密私钥重试及远端命令执行；只使用合成账号和密钥。布局测试覆盖 960×700、430×650、272×197、340×340 分屏，检查正文、命中区域和页脚边界。rustfmt 与 git diff --check 通过。
+
+试用包：`TermViAI-auth-recovery-20261109-windows-x86_64.zip`，内部版本沿用 beta.7。真实主机/MFA、多 DPI 和 Windows 原生像素级视觉对照尚待人工试用；几何布局测试不等价于视觉验收。复现命令与交互说明见 [AUTHENTICATION.md](AUTHENTICATION.md)。
+
 ## 2026-10-23 Ctrl + 单击打开终端链接
 
 TermViAI 默认鼠标绑定中，普通左键、Shift 左键和 Alt+Shift 左键释放只完成文本选择，不再在空选区时打开链接；Ctrl 左键按下建立新选区，拖动扩展选区，释放后有选区则复制、无选区才打开链接。覆盖自动识别 URL 和 OSC 超链接。手形链接光标要求 Ctrl；原有显式自定义绑定、禁用默认绑定、非 TermViAI UI 及鼠标报告模式保留原语义。
@@ -438,3 +446,76 @@ Windows 完整 GUI 154 项通过，Release 编译成功。新增对照回归覆�
 - 最近连接去重改用规范化地址、端口、实际账号和密钥路径；读取 hosts.json 的元数据，不读取密码或私钥、不访问 SSH。保留最近一条的原始 Host/认证引用；加载和写入均先去重再截断。缺失引用与未知账号分开保留；不同账号/端口/密钥不合并，Saved workspaces 不变。
 - Windows GUI 185 项测试通过。新增旧重复记录加载迁移、手填/Identity 反复连接、旧缓存合并与删除防复活、Keychain 用户变更、不同账号端口密钥/地址、失效引用、密钥旧名称和离线密钥路径测试。未修改用户历史文件或连接实际主机；更新后加载时自动整理显示，下一次历史写入保存整理结果。
 - Windows Release、EXE 版本启动、37 个修改构建输入一致性、ZIP CRC/逐文件哈希通过。试用包 `TermViAI-recent-dedup-20261026-windows-x86_64.zip`（beta.6），SHA-256：`c8914635a7e4561508ca71ffeb21acb73ceb097419a9106d841c731144d91ba1`。
+
+## 2026-10-27 终端响铃声音设置
+
+- Settings → Terminal & SSH 增加 Terminal bell sound，沿用关闭确认开关的布局和三套主题样式；Save 保存并同步当前进程窗口，Cancel 放弃草稿。Tab 可访问、Space/Enter 切换，小窗口自动滚动到聚焦项。
+- Windows GUI 186 项测试通过（1 项性能基准忽略）。验证旧配置回退、开关覆盖与非 TermViAI 路径、关闭和重新启用的持久化、其他设置保留及滚动可达。保留视觉响铃和 bell 事件；未进行原生声音/窗口手动验收。
+- Windows Release、3 个修改源码输入一致性、EXE 版本启动及 ZIP CRC/逐文件哈希通过。试用包 `TermViAI-bell-toggle-20261027-windows-x86_64.zip`（beta.7 本地试用），SHA-256：`6094cee0936eef1219e2dfb32df77a4576b21e1f076183d54a8637ba5c820334`。
+
+## 2026-10-27 每终端浮动滚动条与平滑滚动
+
+- 每个可见终端独立维护稳定行位置、动画目标、悬浮和淡出时间；拖动在鼠标释放/失焦/布局变化时结束，轨道点击保持释放事件所有权。文本选择按下前停止惯性，默认隐藏的滚动条不会因已在底部的普通输入而唤出。
+- 复用原滚轮绑定，保留备用屏幕/鼠标上报、Copy/Search overlay、Ctrl+滚轮及其他非 TermViAI 路径。浮动条不增加 PTY 列宽预留，不改变终端组合树。仅可见动画请求帧，静止时不持续重绘。
+- 文字保留原 shape/quad 缓存，提交时按物理像素平移和插值裁切纹理；背景、文字、光标、选区三层同步裁切，底部多取一行填充平滑滚动露出的区域。
+- Windows GUI 193 项回归测试通过（1 项性能基准忽略）：增加三帧率运动收敛/反向、四终端独立位置与缩放保持、历史淘汰/实时输出跟随/外部跳转、隐藏/淡出/拖动保持、短轨道端点映射、三主题滑块与提示布局、三层纹理裁切与原缓存不变测试。原生 Windows 鼠标手感和画面未人工验收。
+- Windows Release、9 个修改源码输入一致性、EXE 版本启动及 ZIP CRC/逐文件哈希通过。试用包 `TermViAI-terminal-scrollbar-20261027-windows-x86_64.zip`（beta.7 本地试用），SHA-256：`f48d1fcbe868cf336b0a677ba464a48852294aa2bbf8cf4b3e4b5af7a9fcc64c`。包含上次终端响铃开关修改，未提交或发布正式 beta。
+
+## 2026-10-27 缩窄窗口的提示符重复
+
+- 用户确认触发方式是拖动右边缘向左缩窄。使用本地 Bash/readline PTY 捕获跨提示符宽度的缩窄/拉宽输出，离线回放；另以确定性清行序列连续循环 20 次。旧模型确实多留一段 `root@localhost:/home`，新策略不再重复，也不清除上方既有输出。
+- TermViAI 禁止当前光标所在的整个软折行逻辑段参与 reflow，保留 Shell 认为的物理行数；缩窄时裁切该段并将光标限制在可见列，其他输出仍按新列宽重排。参考 [xterm.js reflowCursorLine 默认策略](https://xtermjs.org/docs/api/terminal/interfaces/iterminaloptions/#reflowcursorline)。公共终端配置新增默认 true 的兼容钩子，仅 TermViAI 配置返回 false；备用屏幕、原先 CR/LF 分包修复保留。当前行若所属程序不响应 resize 重绘，会被裁切，不假定所有输出都是 Shell 提示符。
+- Windows 终端 58 项测试通过：新增 Bash 捕获记录整块/逐字节回放、20 次双向 resize 的历史和提示符数量检查、多行编辑中间光标、备用屏幕裁切；原 CR/LF 回归覆盖两种 reflow 策略。旧模型的新增提示符用例失败已确认。没有连接或修改真实 SSH 主机。
+- Windows GUI 193 项测试通过（1 项性能基准忽略），包含浮动滚动条和响铃设置回归。原生窗口拖动及远端各版本 Shell 的视觉效果未人工验收。
+- Windows Release、14 个修改源码输入哈希一致性、EXE 版本启动、ZIP CRC/逐文件哈希通过。试用包 `TermViAI-resize-redraw-20261027-windows-x86_64.zip`（beta.7 本地试用），SHA-256：`6dc8198a800da426439ef608892fc739b7cdf0a8421919bac18e6abada3bde01`。包含前两次响铃开关与浮动滚动条修改，未提交或发布正式 beta。
+
+## 2026-10-28 Monitor 故障恢复、结束进程刷新与页面保持
+
+- 用户报告 `fatal socket error`、`npu-smi info timeout after 12 seconds` 及无 stderr 的 collector exit 1。代码确认原调度被非空 error 永久阻止；独立 Monitor 会话失败不等于终端会话断开。未将无 stderr 的非零退出断言为 Python 安装错误，也未连接真实主机诊断网络根因。
+- 增加故障阶段标记与 2/5/10/30 秒封顶退避；采集失败复用已有连接，传输或未知退出重建连接。认证/指纹/本地配置错误停下等待人工处理。手动 Retry 立即调度，暂停和在途任务阻止重叠采样，移除取消工作保持不变。卡片和错误详情展示自动恢复状态；远端采集超时 30 秒，外层收集 45 秒。
+- 原实现已有结束成功后零延迟采样；补充明确的 Refreshing 状态并在新样本前禁用进程控制，等待退出时最多 5 次 1 秒间隔追踪。结束请求失败或确认丢失时仅查询状态、不自动重发信号，独立保留请求错误供进程详情查看。仍依赖实际驱动返回的数据，不提前将占用伪造为 0。
+- Monitor Open 仅加载一次并恢复已有 selected/dialog/NPU/Die/scroll/drawer_scroll，显式 Home 清除导航；进入其他主机、筛选以及关闭详情保留各自既有逻辑。
+- 199 项 Windows GUI 测试通过（1 项性能基准忽略），新增退避/恢复/暂停/在途任务、需人工处理错误、连接复用策略、结束后立即刷新与有限追踪、失败操作不重发、Monitor 导航保持回归。23 项 Python 采集器测试通过，包括超时参数与已有进程身份/pidfd 安全检查。未执行真实进程结束操作；实际主机的恢复效果仍需试用验收。
+- Windows Release、18 个修改源码输入哈希一致性、EXE 版本启动、ZIP CRC/逐文件哈希通过。试用包 `TermViAI-monitor-recovery-20261028-windows-x86_64.zip`（beta.7 本地试用），SHA-256：`581a3b228040742f3c2f8543572e1a1d2fda22aaf4028a4009ecc1eedba49a7e`。包含之前的终端缩放、滚动条和响铃设置修改，未提交或发布正式 beta。
+
+
+## 2026-10-29 Port Forwarding 试用
+
+- 按审核的紧凑多列 UX 接入原生页签/侧栏入口、已打开 SSH 终端选择、创建/编辑/详情/删除/停止全部抽屉，继承三主题、字号与悬浮反馈。438 px 抽屉、固定操作区、正文平滑滚动、键盘焦点自动滚动。
+- 原生几何回归覆盖 720×480、1024×640、1417×872：按钮不越界/重叠、背景不穿透、窗口标题栏保留、部分可见卡片绘制和点击区域裁切。
+- Windows GUI 208 项、SSH 21 项通过；GUI 另 1 项人工性能基准忽略。GUI 并行运行曾触发原生 HarfBuzz 对象断言，串行完整重跑通过；不把串行测试通过解释为原生屏幕验收。
+- Python 监听/进程控制 7 项测试，覆盖普通 sshd/sshd-session 纯转发、非交互 exec、拒绝 PTY/守护进程/业务进程/未知所有者、pidfd 缺失、身份/端口归属变化、一次 SIGTERM 和端口释放、ss 退出码为 0 但 stderr 报 netlink 错误等。既有 Monitor 23 项 Python 测试通过。
+- Windows libssh → 一次性 WSL OpenSSH 实测通过：3 路并发分别传送 180000 字节请求和 210000 字节响应；EOF 半关闭不丢响应；重复监听拒绝；停止后远端端口不可连接；独立终端连接继续执行命令。发现并修正 libssh 非阻塞 stdout 把 EOF 转为 WouldBlock 的兼容问题。
+- 一次性本地 ssh -N 监听实测确认其进程标题是 `sshd: user`（不一定有 `@notty`），识别规则兼容两种非交互标题。通过临时服务祖先进程校验后，使用真实 pidfd 结束仅该测试会话并验证释放端口。未连接用户保存的主机。
+- 源码确认 libssh 在 ssh_connect 内会自动读取配置，因此转发连接显式设置 ProcessConfig(false)，不仅跳过 options_parse_config；终端原有行为不变。
+- computer-use 技能禁止自动操作终端应用，所以未执行原生窗口鼠标自动验收。三主题/DPI/GPU 实际显示、真实 SSH/MFA/代理策略、网络黑洞与长期性能仍需试用反馈。
+- 本次仅编译本地试用版，沿用 beta.7 版本字符串；未 commit/push 或创建正式 Release。试用包与 SHA-256 记录在 Windows releases 的 `port-forwarding-20261029-validation.json`。
+
+
+## 2026-10-29 Port Forwarding 意外中断恢复
+
+- 原子保存 desired 运行意图，应用启动时由后台管理器恢复，无需先创建来源终端；手动停止持久化 false。旧无字段规则默认不自动启动，防止恢复原本已停止的旧规则。
+- 同一专用 SSH 连接先登记远端 sshd 会话 PID/boot ID/starttime，记录落盘后才请求监听。自动检查严格匹配本地归属记录、当前进程身份与唯一监听归属；PID 复用、重启后新进程、其他会话均不自动清理。
+- 新增 Windows 文件锁互斥、运行意图跨重启/手动停止、无终端启动且只尝试一次、归属记录作用域/损坏、登记写入失败阻断监听、远端父进程登记和命名空间拒绝等回归。
+- Windows GUI 213 项、SSH 21 项通过；GUI 人工性能基准和临时 SSH 实测默认忽略。Python 转发 11 项及既有 Monitor 23 项通过。
+- 显式执行临时 SSH 实测：保留旧转发监听；从落盘记录启动新恢复任务；错误 boot/starttime 不结束旧会话；正确归属自动清理、建立新监听并更新身份记录；停止新监听释放端口。仅测试一次性本机 sshd，未连接用户主机。
+- 继续验证 3 路并发、大请求/响应、半关闭、重复端口拒绝和独立终端保持。登记不可用时先关闭登记传输，再用全新 SSH 传输降级普通转发，防止 exec 拒绝留下 libssh 错误状态；不会在归属落盘失败后继续开监听。
+- 不能把旧试用版无归属的存量监听追认为 TermViAI 创建；需要一次人工确认，之后启动的新连接才有完整恢复记录。自动恢复还受已保存认证、远端 Python/ss/pidfd/权限与既有重试上限约束。
+- 本地试用包 `TermViAI-port-forwarding-recovery-20261029-windows-x86_64.zip`，沿用 beta.7 字符串；SHA-256 和输入一致性记录位于 `port-forwarding-recovery-20261029-validation.json`。未提交或发布正式 Release。
+
+## 2026-10-29 Port Forwarding 侧栏页面与所有主机选择
+
+- 移除 Port Forwarding 人工顶栏标签，仅保留侧栏页面；仍可从 SSH Tab 菜单直接创建规则。
+- 所有已保存主机可直接选择，按分组展示并支持搜索；未保存的活动 SSH 主机补充到列表。搜索使用稳定来源索引，过滤不会选错主机；切换查询后重置列表滚动，搜索区/页脚保持固定。
+- Windows Release GUI 215 项测试通过，0 失败，2 项需人工/临时 SSH 环境的测试保持默认忽略。新增保存主机的嵌套分组过滤与点击索引、保存来源和活动来源去重/临时凭据保留测试；既有 720×480、1024×640、1417×872 抽屉边界与点击裁切测试通过。
+- 本次未修改转发传输层，未连接用户 SSH 主机；真实 Windows 屏幕、各 DPI 和鼠标手感未人工验收。
+- 本地试用包命名 `TermViAI-port-forwarding-hosts-20261029-windows-x86_64.zip`，沿用 beta.7 字符串；打包哈希与输入一致性记录在 `port-forwarding-hosts-20261029-validation.json`。未提交/推送或创建正式 Release。
+
+## 2026-10-29 缩放重复提示符：Bash 5.1.8 隔离复现
+
+- 用户录屏：四分屏中 216 的 `(base) [root@localhost quantization-refactor]# `（含末尾空格 47 字符）在反复缩窄/拉宽后累积残行，短提示符没有同样累积。用户确认 Bash 5.1.8(1)-release。
+- 临时目录从 GNU 官方 Bash 5.1 源码与 001–008 补丁构建 5.1.8，链接系统 libtinfo；不安装、不改系统或远端 Shell。通过本机 PTY 采集 80→60→50→46→…→36→…→60 的三轮缩放真实字节流。
+- 同一当前 Windows 终端模型回放：Bash 5.1.8 原配置最终 44 个非空行（历史、当前提示符及 42 条残留）；Bash 5.1.8 `horizontal-scroll-mode on` 和本机 Bash 5.2.21 各仅 2 行，历史与提示符完整。3 项临时诊断断言通过。
+- 5.1.8 在长提示符已换行后仍只发送 CR + EL + 提示符，没有上移清除前一行；5.2 的重绘会返回上一行。GNU Readline 8.2 更新记录条目 j 对应屏宽变化后长提示符错误换行：https://lists.gnu.org/archive/html/info-gnu/2022-09/msg00013.html 。Bash 版本可能包含发行版回补，不能把该现象推广到所有同版本构建。
+- 当前会话临时兼容方式：`bind 'set horizontal-scroll-mode on'`；长输入改为水平滚动。长期方案为使用含相关 Readline 修复的 Bash（本次验证 5.2.21），而不是让终端猜测删除重复文字。
+- 本次未改应用运行逻辑、未连接用户主机；诊断测试仅在构建副本运行，结束后还原测试源码。未重打相同运行代码的试用包。

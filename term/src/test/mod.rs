@@ -46,8 +46,13 @@ struct TestTerm {
 #[derive(Debug)]
 struct TestTermConfig {
     scrollback: usize,
+    reflow_cursor_line: bool,
 }
 impl TerminalConfiguration for TestTermConfig {
+    fn reflow_cursor_line(&self) -> bool {
+        self.reflow_cursor_line
+    }
+
     fn scrollback_size(&self) -> usize {
         self.scrollback
     }
@@ -63,6 +68,15 @@ impl TerminalConfiguration for TestTermConfig {
 
 impl TestTerm {
     fn new(height: usize, width: usize, scrollback: usize) -> Self {
+        Self::with_reflow(height, width, scrollback, true)
+    }
+
+    fn with_reflow(
+        height: usize,
+        width: usize,
+        scrollback: usize,
+        reflow_cursor_line: bool,
+    ) -> Self {
         let _ = env_logger::Builder::new()
             .is_test(true)
             .filter_level(log::LevelFilter::Trace)
@@ -76,7 +90,10 @@ impl TestTerm {
                 pixel_height: height * 16,
                 dpi: 0,
             },
-            Arc::new(TestTermConfig { scrollback }),
+            Arc::new(TestTermConfig {
+                scrollback,
+                reflow_cursor_line,
+            }),
             "WezTerm",
             "O_o",
             Box::new(Vec::new()),
@@ -1381,35 +1398,173 @@ fn test_hyperlinks() {
 
 #[test]
 fn resize_preserves_line_start_between_carriage_return_and_line_feed() {
-    for cols in [60, 100] {
-        for split in ["\r", "\r\n"] {
-            let mut term = TestTerm::new(8, 80, 16);
-            term.print("banner\r\nUsing SSH to connect");
-            term.print(split);
+    for reflow in [true, false] {
+        for cols in [60, 100] {
+            for split in ["\r", "\r\n"] {
+                let mut term = TestTerm::with_reflow(8, 80, 16, reflow);
+                term.print("banner\r\nUsing SSH to connect");
+                term.print(split);
+                term.resize(TerminalSize {
+                    rows: 8,
+                    cols,
+                    ..Default::default()
+                });
+                if split == "\r" {
+                    term.print("\n");
+                }
+                term.print("SSH-2.0\r\nLast login\r\n[root@host ~]# ");
+                assert_visible_contents(
+                    &term,
+                    file!(),
+                    line!(),
+                    &[
+                        "banner",
+                        "Using SSH to connect",
+                        "SSH-2.0",
+                        "Last login",
+                        "[root@host ~]# ",
+                        "",
+                        "",
+                        "",
+                    ],
+                );
+            }
+        }
+    }
+}
+
+// Captured from Bash/readline on a local PTY while resizing across the prompt
+// width. No shell, timing, network or user configuration is needed to replay it.
+#[test]
+fn resize_readline_prompt_does_not_accumulate_fragments() {
+    let events = [
+        (80, "\x1b[?2004hroot@localhost:/home/weights# "),
+        (60, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (40, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (30, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (20, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (40, "\r\x1b[K\r\x1b[A\x1b[K\rroot@localhost:/home/weights# "),
+        (60, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (80, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (60, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (40, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (30, "\r\x1b[K\rroot@localhost:/home\r\n\r/weights# "),
+        (20, "\r\x1b[K\r\x1b[A\x1b[K\rroot@localhost:/home/weights# "),
+        (40, "\r\x1b[K\r\x1b[A\x1b[K\rroot@localhost:/home/weights# "),
+        (60, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (80, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (60, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (40, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (30, "\r\x1b[K\rroot@localhost:/home\r\n\r/weights# "),
+        (20, "\r\x1b[K\r\x1b[A\x1b[K\rroot@localhost:/home/weights# "),
+        (40, "\r\x1b[K\r\x1b[A\x1b[K\rroot@localhost:/home/weights# "),
+        (60, "\r\x1b[K\rroot@localhost:/home/weights# "),
+        (80, "\r\x1b[K\rroot@localhost:/home/weights# "),
+    ];
+    // Replay whole reads and byte-sized reads: escape sequences may be split
+    // across SSH packets. Keep an earlier line to catch accidental cursor-up
+    // erasure that a prompt at the top of the screen would conceal.
+    for chunk_size in [1, usize::MAX] {
+        let mut term = TestTerm::with_reflow(24, 80, 100, false);
+        term.print("previous command\r\n");
+        for (cols, output) in events {
             term.resize(TerminalSize {
-                rows: 8,
+                rows: 24,
                 cols,
                 ..Default::default()
             });
-            if split == "\r" {
-                term.print("\n");
+            for chunk in output.as_bytes().chunks(chunk_size) {
+                term.print(chunk);
             }
-            term.print("SSH-2.0\r\nLast login\r\n[root@host ~]# ");
-            assert_visible_contents(
-                &term,
-                file!(),
-                line!(),
-                &[
-                    "banner",
-                    "Using SSH to connect",
-                    "SSH-2.0",
-                    "Last login",
-                    "[root@host ~]# ",
-                    "",
-                    "",
-                    "",
-                ],
-            );
         }
+        let text = term
+            .screen()
+            .visible_lines()
+            .iter()
+            .map(|line| line.as_str().trim_end().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text, "previous command\nroot@localhost:/home/weights#");
     }
+}
+
+#[test]
+fn resize_shell_redraw_preserves_history_and_prompt_count() {
+    let mut term = TestTerm::with_reflow(12, 40, 100, false);
+    let history = "012345678901234567890123456789";
+    let prompt = "root@localhost:/home/weights# ";
+    term.print(format!("{history}\r\n{prompt}"));
+    for _ in 0..20 {
+        term.resize(TerminalSize {
+            rows: 12,
+            cols: 20,
+            ..Default::default()
+        });
+        // Readline had one physical prompt row before this shrink.
+        term.print(format!("\r\x1b[K\r{prompt}"));
+        let lines: Vec<String> = term
+            .screen()
+            .visible_lines()
+            .iter()
+            .map(|line| line.as_str().trim_end().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "01234567890123456789",
+                "0123456789",
+                "root@localhost:/home",
+                "/weights#"
+            ]
+        );
+        term.resize(TerminalSize {
+            rows: 12,
+            cols: 40,
+            ..Default::default()
+        });
+        // It now knows the prompt occupied two rows; both must still exist
+        // until the shell clears them, even though the window is wider.
+        term.print(format!("\r\x1b[K\r\x1b[A\x1b[K\r{prompt}"));
+        let lines: Vec<String> = term
+            .screen()
+            .visible_lines()
+            .iter()
+            .map(|line| line.as_str().trim_end().to_owned())
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(lines, vec![history, prompt.trim_end()]);
+    }
+}
+
+#[test]
+fn resize_preserves_wrapped_edit_line_with_cursor_in_middle() {
+    let mut term = TestTerm::with_reflow(6, 10, 100, false);
+    term.print("history\r\n1234567890abcdefghijKLMNO");
+    term.cup(3, 2);
+    term.resize(TerminalSize {
+        rows: 6,
+        cols: 16,
+        ..Default::default()
+    });
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["history", "1234567890", "abcdefghij", "KLMNO", "", ""],
+    );
+    term.assert_cursor_pos(3, 2, None, None);
+}
+
+#[test]
+fn resize_shell_policy_keeps_alternate_screen_clipping() {
+    let mut term = TestTerm::with_reflow(4, 10, 100, false);
+    term.print("\x1b[?1049hABCDEFGHIJ\r\nsecond");
+    term.resize(TerminalSize {
+        rows: 4,
+        cols: 6,
+        ..Default::default()
+    });
+    assert_visible_contents(&term, file!(), line!(), &["ABCDEF", "second", "", ""]);
 }

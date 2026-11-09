@@ -144,6 +144,34 @@ fn command(targets: Option<&[Target]>) -> anyhow::Result<String> {
         b64.encode(serde_json::to_vec(&request)?)
     ))
 }
+// Transport failure needs a fresh session; a remote collector failure does
+// not. Authentication/host-key prompts require user action rather than a loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+enum FailureKind {
+    #[error("Monitor SSH connection failed")]
+    Connection,
+    #[error("Monitor sampling failed")]
+    Collector,
+    #[error("Monitor configuration requires attention")]
+    Attention,
+}
+const COLLECT_TIMEOUT: Duration = Duration::from_secs(45);
+
+fn failure_kind(error: &anyhow::Error) -> FailureKind {
+    error
+        .downcast_ref::<FailureKind>()
+        .copied()
+        .unwrap_or(FailureKind::Connection)
+}
+
+fn session_reusable(result: &anyhow::Result<Response>) -> bool {
+    result.is_ok()
+        || result
+            .as_ref()
+            .err()
+            .is_some_and(|e| failure_kind(e) == FailureKind::Collector)
+}
+
 fn connect(config: ConfigMap, cancel: &AtomicBool) -> anyhow::Result<Session> {
     let (session, events) = Session::connect(config)?;
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -156,11 +184,11 @@ fn connect(config: ConfigMap, cancel: &AtomicBool) -> anyhow::Result<Session> {
             Ok(SessionEvent::HostVerify(event)) => {
                 let message = event.message.clone();
                 event.try_answer(false).ok();
-                bail!("{} Open this Host once from Hosts to verify its fingerprint, then retry monitoring.", message);
+                return Err(anyhow::anyhow!("{} Open this Host once from Hosts to verify its fingerprint, then retry monitoring.", message).context(FailureKind::Attention));
             }
-            Ok(SessionEvent::Authenticate(_)) => bail!("Interactive authentication is required. Save a password / Identity or unlock the key in your SSH agent, then retry."),
-            Ok(SessionEvent::HostVerificationFailed(e)) => bail!("{}", e),
-            Ok(SessionEvent::Error(e)) => bail!("{}", e),
+            Ok(SessionEvent::Authenticate(_)) => return Err(anyhow::anyhow!("Interactive authentication is required. Save a password / Identity or unlock the key in your SSH agent, then retry.").context(FailureKind::Attention)),
+            Ok(SessionEvent::HostVerificationFailed(e)) => return Err(anyhow::anyhow!("{}", e).context(FailureKind::Attention)),
+            Ok(SessionEvent::Error(e) | SessionEvent::AuthenticationFailed(e)) => bail!("{}", e),
             Err(smol::channel::TryRecvError::Closed) => bail!("SSH authentication ended"),
             Err(smol::channel::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(40)),
         }
@@ -170,7 +198,8 @@ fn execute(session: &Session, command: &str, cancel: &AtomicBool) -> anyhow::Res
     let exec = smol::block_on(smol::future::or(session.exec(command, None), async {
         smol::Timer::after(Duration::from_secs(15)).await;
         bail!("SSH exec timed out")
-    }))?;
+    }))
+    .context(FailureKind::Connection)?;
     collect_output(exec.stdin, exec.stdout, exec.stderr, exec.child, cancel)
 }
 
@@ -186,7 +215,7 @@ fn collect_output(
     // The python -c collector never reads stdin, so no half-close is needed here.
     stdout.set_non_blocking(true)?;
     stderr.set_non_blocking(true)?;
-    let deadline = Instant::now() + Duration::from_secs(25);
+    let deadline = Instant::now() + COLLECT_TIMEOUT;
     let mut out = Vec::new();
     let mut err = Vec::new();
     let mut eof = [false; 2];
@@ -211,17 +240,25 @@ fn collect_output(
         }
         if eof.iter().all(|v| *v) {
             if let Some(status) = child.try_wait()? {
-                ensure!(
-                    status.success(),
-                    "Remote collector failed (exit {}): {}",
-                    status.exit_code(),
-                    if err.is_empty() {
-                        "SSH command ended without an error message; retry and check the remote Python environment.".into()
+                if !status.success() {
+                    let kind = if err.is_empty() {
+                        FailureKind::Connection
+                    } else {
+                        FailureKind::Collector
+                    };
+                    let detail = if err.is_empty() {
+                        "SSH command ended without stderr; the connection or remote command may have been interrupted.".into()
                     } else {
                         String::from_utf8_lossy(&err)
-                    }
-                );
-                return response(&String::from_utf8_lossy(&out));
+                    };
+                    return Err(anyhow::anyhow!(
+                        "Remote collector failed (exit {}): {}",
+                        status.exit_code(),
+                        detail
+                    )
+                    .context(kind));
+                }
+                return response(&String::from_utf8_lossy(&out)).context(FailureKind::Collector);
             }
         }
         std::thread::sleep(Duration::from_millis(15));
@@ -239,6 +276,12 @@ pub struct Entry {
     pub updated: Option<Instant>,
     pub results: Vec<StopResult>,
     pub stopping: bool,
+    pub refresh_pending: bool,
+    pub action_error: String,
+    failure: Option<FailureKind>,
+    failures: u32,
+    retryable: bool,
+    settle_samples: u8,
     pending_stop: Option<Vec<Target>>,
     job_stop: bool,
     session: Option<Session>,
@@ -262,6 +305,7 @@ impl Entry {
                 .updated
                 .is_some_and(|t| t.elapsed() < Duration::from_secs(30))
             && !self.stopping
+            && !self.refresh_pending
     }
     pub fn status(&self) -> &str {
         if self.stopping {
@@ -270,10 +314,113 @@ impl Entry {
             "Paused"
         } else if !self.error.is_empty() {
             "Unavailable"
+        } else if self.refresh_pending {
+            "Refreshing"
         } else if self.snapshot.is_some() {
             "Collecting"
         } else {
             "Connecting"
+        }
+    }
+    pub fn sampling_failed(&self) -> bool {
+        self.failure == Some(FailureKind::Collector)
+    }
+    pub fn recovery_hint(&self) -> String {
+        if self.paused {
+            "Sampling is paused.".into()
+        } else if self.busy() && !self.error.is_empty() {
+            if self.session.is_some() || self.sampling_failed() {
+                "Retrying sample…"
+            } else {
+                "Reconnecting…"
+            }
+            .into()
+        } else if self.retryable && !self.error.is_empty() {
+            let remaining = self
+                .next
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64()
+                .ceil() as u64;
+            format!("Retrying automatically in {remaining}s.")
+        } else {
+            "Review details, then retry.".into()
+        }
+    }
+    fn failed(&mut self, error: anyhow::Error, now: Instant) {
+        self.failure = Some(failure_kind(&error));
+        self.retryable = self.failure != Some(FailureKind::Attention);
+        self.failures = self.failures.saturating_add(1);
+        let seconds = [2, 5, 10, 30][self.failures.saturating_sub(1).min(3) as usize];
+        self.next = now + Duration::from_secs(seconds);
+        self.error = format!("{error:#}");
+        self.pending_stop = None;
+        self.stopping = false;
+    }
+    fn sampling_due(&self, now: Instant) -> bool {
+        !self.paused
+            && !self.busy()
+            && (self.error.is_empty() || self.retryable)
+            && now >= self.next
+    }
+    fn completed(&mut self, done: Completed, interval: u64, now: Instant) {
+        self.rx = None;
+        self.session = done.session;
+        let stopping = self.job_stop;
+        self.job_stop = false;
+        self.stopping = self.pending_stop.is_some();
+        if stopping {
+            // Never replay a control request. Even if its acknowledgement was
+            // lost, query what actually happened before enabling controls again.
+            self.refresh_pending = true;
+            self.settle_samples = 5;
+        }
+        match done.response {
+            Ok(r) => {
+                if let Some(s) = r.snapshot {
+                    if s.processes_available {
+                        for result in &mut self.results {
+                            if result.status == "Exit requested; waiting for process"
+                                && !s.processes.iter().any(|p| p.pid == result.pid)
+                            {
+                                result.status = "No longer reported by NPU".into();
+                            }
+                        }
+                    }
+                    self.snapshot = Some(s);
+                    self.updated = Some(now);
+                    self.refresh_pending = false;
+                }
+                if let Some(r) = r.results {
+                    self.results = r;
+                }
+                self.error.clear();
+                self.failure = None;
+                self.failures = 0;
+                self.retryable = false;
+                let waiting = self
+                    .results
+                    .iter()
+                    .any(|r| r.status == "Exit requested; waiting for process");
+                let delay = if stopping {
+                    0
+                } else if self.settle_samples > 0 && waiting {
+                    self.settle_samples -= 1;
+                    1
+                } else {
+                    self.settle_samples = 0;
+                    interval
+                };
+                self.next = now + Duration::from_secs(delay);
+            }
+            Err(err) => {
+                if stopping {
+                    self.action_error = format!("Process request was not confirmed: {err:#}. Only sampling will retry; the process request will not be sent again.");
+                }
+                self.failed(err, now);
+                if stopping && self.retryable {
+                    self.next = now;
+                }
+            }
         }
     }
     fn spawn(&mut self, config: ConfigMap, targets: Option<Vec<Target>>) {
@@ -291,9 +438,11 @@ impl Entry {
                 } else {
                     connect(config, &cancel)?
                 };
-                let r = execute(&s, &command(targets.as_deref())?, &cancel)?;
-                session = Some(s);
-                Ok(r)
+                let r = execute(&s, &command(targets.as_deref())?, &cancel);
+                if session_reusable(&r) {
+                    session = Some(s);
+                }
+                r
             })();
             tx.send(Completed { response, session }).ok();
         });
@@ -374,6 +523,12 @@ impl Monitor {
                 updated: None,
                 results: vec![],
                 stopping: false,
+                refresh_pending: false,
+                action_error: String::new(),
+                failure: None,
+                failures: 0,
+                retryable: false,
+                settle_samples: 0,
                 pending_stop: None,
                 job_stop: false,
                 session: None,
@@ -386,6 +541,9 @@ impl Monitor {
     pub fn retry(&mut self, id: usize) {
         if let Some(e) = self.entries.get_mut(id) {
             e.error.clear();
+            e.failure = None;
+            e.failures = 0;
+            e.retryable = false;
             e.paused = false;
             e.next = Instant::now();
         }
@@ -402,43 +560,7 @@ impl Monitor {
                     Err(mpsc::TryRecvError::Empty) => None,
                 };
                 if let Some(done) = done {
-                    e.rx = None;
-                    e.session = done.session;
-                    let stopping = e.job_stop;
-                    e.job_stop = false;
-                    e.stopping = e.pending_stop.is_some();
-                    match done.response {
-                        Ok(r) => {
-                            if let Some(s) = r.snapshot {
-                                if s.processes_available {
-                                    for result in &mut e.results {
-                                        if result.status == "Exit requested; waiting for process"
-                                            && !s.processes.iter().any(|p| p.pid == result.pid)
-                                        {
-                                            result.status = "No longer reported by NPU".into();
-                                        }
-                                    }
-                                }
-                                e.snapshot = Some(s);
-                                e.updated = Some(Instant::now());
-                            }
-                            if let Some(r) = r.results {
-                                e.results = r;
-                            }
-                            e.error.clear();
-                        }
-                        Err(err) => {
-                            e.error = format!("{err:#}");
-                            e.pending_stop = None;
-                            e.stopping = false;
-                        }
-                    }
-                    e.next = Instant::now()
-                        + if stopping {
-                            Duration::ZERO
-                        } else {
-                            Duration::from_secs(self.interval)
-                        };
+                    e.completed(done, self.interval, Instant::now());
                 }
             }
             if !e.busy() {
@@ -460,7 +582,7 @@ impl Monitor {
                     }
                 }
             }
-            if !e.paused && !e.busy() && e.error.is_empty() && Instant::now() >= e.next {
+            if e.sampling_due(Instant::now()) {
                 let cfg = (|| {
                     let mut h=store.hosts.iter().find(|h|same_host(h,&e.host)).context("Host changed or was removed. Remove this monitor and add the current Host.")?.clone();
                     h.resolve_identity(store)?;
@@ -468,7 +590,7 @@ impl Monitor {
                 })();
                 match cfg {
                     Ok(cfg) => e.spawn(cfg, None),
-                    Err(err) => e.error = format!("{err:#}"),
+                    Err(err) => e.failed(err.context(FailureKind::Attention), Instant::now()),
                 }
             }
         }
@@ -493,6 +615,7 @@ impl Monitor {
             "SSH connection is unavailable"
         );
         e.results.clear();
+        e.action_error.clear();
         if e.busy() {
             e.pending_stop = Some(targets);
             e.stopping = true;
@@ -572,15 +695,17 @@ mod tests {
     }
     #[test]
     fn collector_failure_retains_remote_stderr_and_exit_code() {
-        let e = collector_output(b"", b"python3: not found", 127)
-            .err()
-            .unwrap()
-            .to_string();
+        let e = format!(
+            "{:#}",
+            collector_output(b"", b"python3: not found", 127)
+                .err()
+                .unwrap()
+        );
         assert!(e.contains("exit 127"));
         assert!(e.contains("python3: not found"));
-        let e = collector_output(b"", b"", 1).err().unwrap().to_string();
+        let e = format!("{:#}", collector_output(b"", b"", 1).err().unwrap());
         assert!(e.contains("exit 1"));
-        assert!(e.contains("without an error message"));
+        assert!(e.contains("without stderr"));
     }
     #[test]
     fn deduplicates_processes_by_pid_across_dies() {
@@ -676,5 +801,152 @@ mod tests {
         let flag = m.entries[0].cancel.clone();
         m.entries.clear();
         assert!(flag.load(Ordering::Relaxed));
+    }
+    fn sample_done(snapshot: Snapshot) -> Completed {
+        Completed {
+            response: Ok(Response {
+                snapshot: Some(snapshot),
+                results: None,
+                error: None,
+            }),
+            session: None,
+        }
+    }
+    #[test]
+    fn sampling_failures_retry_with_backoff_and_recover() {
+        let mut m = Monitor::default();
+        m.add(Host::default());
+        let now = Instant::now();
+        let e = &mut m.entries[0];
+        e.snapshot = Some(fixture());
+        for seconds in [2, 5, 10, 30, 30] {
+            e.completed(
+                Completed {
+                    response: Err(anyhow::anyhow!("fatal socket error")),
+                    session: None,
+                },
+                2,
+                now,
+            );
+            assert!(!e.sampling_due(now));
+            assert_eq!(e.next, now + Duration::from_secs(seconds));
+            assert!(e.sampling_due(e.next));
+            assert!(e.snapshot.is_some());
+            assert!(!e.live());
+            e.paused = true;
+            assert!(!e.sampling_due(e.next));
+            e.paused = false;
+            let (_tx, rx) = mpsc::channel();
+            e.rx = Some(rx);
+            assert!(!e.sampling_due(e.next));
+            e.rx = None;
+        }
+        e.completed(sample_done(fixture()), 2, now);
+        assert!(e.error.is_empty());
+        assert_eq!(e.failures, 0);
+        assert!(e.live());
+    }
+    #[test]
+    fn credential_failures_wait_for_manual_retry() {
+        let mut m = Monitor::default();
+        m.add(Host::default());
+        let now = Instant::now();
+        let e = &mut m.entries[0];
+        e.failed(
+            anyhow::anyhow!("Verify host fingerprint").context(FailureKind::Attention),
+            now,
+        );
+        assert!(!e.sampling_due(now + Duration::from_secs(3600)));
+        m.retry(0);
+        assert!(m.entries[0].sampling_due(Instant::now()));
+    }
+    #[test]
+    fn collector_failure_reuses_connection_but_transport_failure_reconnects() {
+        let timeout = collector_output(
+            b"TERMVIAI_MONITOR_V1={\"error\":\"npu-smi timed out\"}\n",
+            b"",
+            0,
+        );
+        assert_eq!(
+            failure_kind(timeout.as_ref().err().unwrap()),
+            FailureKind::Collector
+        );
+        assert!(session_reusable(&timeout));
+        let lost = collector_output(b"", b"", 1);
+        assert_eq!(
+            failure_kind(lost.as_ref().err().unwrap()),
+            FailureKind::Connection
+        );
+        assert!(!session_reusable(&lost));
+        assert!(!session_reusable(&Err(anyhow::anyhow!(
+            "fatal socket error"
+        ))));
+    }
+    #[test]
+    fn stop_completion_refreshes_immediately_then_tracks_release() {
+        let mut m = Monitor::default();
+        m.add(Host::default());
+        let e = &mut m.entries[0];
+        let now = Instant::now();
+        e.snapshot = Some(fixture());
+        e.updated = Some(now);
+        e.job_stop = true;
+        e.stopping = true;
+        e.completed(
+            Completed {
+                response: Ok(Response {
+                    snapshot: None,
+                    results: Some(vec![StopResult {
+                        pid: 21,
+                        status: "Exit requested; waiting for process".into(),
+                    }]),
+                    error: None,
+                }),
+                session: None,
+            },
+            10,
+            now,
+        );
+        assert!(e.sampling_due(now));
+        assert!(e.refresh_pending);
+        assert!(!e.live());
+        assert!(!e.job_stop && e.pending_stop.is_none());
+        for _ in 0..5 {
+            e.completed(sample_done(fixture()), 10, now);
+            assert_eq!(e.next, now + Duration::from_secs(1));
+        }
+        e.completed(sample_done(fixture()), 10, now);
+        assert_eq!(e.next, now + Duration::from_secs(10));
+        let mut released = fixture();
+        released.processes.clear();
+        released.dies.iter_mut().for_each(|d| d.used_mb = Some(0.));
+        e.completed(sample_done(released), 10, now);
+        assert_eq!(e.snapshot.as_ref().unwrap().dies[0].used_mb, Some(0.));
+        assert_eq!(e.results[0].status, "No longer reported by NPU");
+        assert!(!e.refresh_pending);
+    }
+    #[test]
+    fn unacknowledged_stop_only_retries_sampling_and_retains_action_error() {
+        let mut m = Monitor::default();
+        m.add(Host::default());
+        let e = &mut m.entries[0];
+        let now = Instant::now();
+        e.job_stop = true;
+        e.stopping = true;
+        e.completed(
+            Completed {
+                response: Err(anyhow::anyhow!("connection lost")),
+                session: None,
+            },
+            10,
+            now,
+        );
+        assert!(e.sampling_due(now));
+        assert!(e.refresh_pending);
+        assert!(!e.job_stop && e.pending_stop.is_none());
+        assert!(e.action_error.contains("will not be sent again"));
+        e.completed(sample_done(fixture()), 10, now);
+        assert!(e.error.is_empty());
+        assert!(!e.action_error.is_empty());
     }
 }

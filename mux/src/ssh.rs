@@ -1,3 +1,4 @@
+pub mod authentication;
 use crate::connui::ConnectionUI;
 use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, WriterWrapper};
 use crate::localpane::LocalPane;
@@ -144,7 +145,7 @@ pub fn ssh_connect_with_ui(
                     ui.output(message);
                     anyhow::bail!("Host key verification failed");
                 }
-                SessionEvent::Error(err) => {
+                SessionEvent::Error(err) | SessionEvent::AuthenticationFailed(err) => {
                     anyhow::bail!("Error: {}", err);
                 }
                 SessionEvent::Authenticated => return Ok(session),
@@ -202,7 +203,9 @@ fn format_host_verification_for_terminal(failed: HostVerificationFailed) -> Vec<
 /// and the reader and writer instances so that we can inject the
 /// interactive setup.  The bulk of that is driven by `connect_ssh_session`.
 pub struct RemoteSshDomain {
-    session: Mutex<Option<Session>>,
+    session: Arc<Mutex<Option<Session>>>,
+    authentication_plan: Mutex<Option<Vec<authentication::Candidate>>>,
+    authentication: Mutex<HashMap<PaneId, std::sync::Weak<authentication::Control>>>,
     dom: SshDomain,
     id: DomainId,
     name: String,
@@ -275,9 +278,26 @@ impl RemoteSshDomain {
         Ok(Self {
             id,
             name: dom.name.clone(),
-            session: Mutex::new(None),
+            session: Arc::new(Mutex::new(None)),
+            authentication_plan: Mutex::new(None),
+            authentication: Mutex::new(HashMap::new()),
             dom: dom.clone(),
         })
+    }
+
+    pub fn with_authentication_plan(self, plan: Vec<authentication::Candidate>) -> Self {
+        *self.authentication_plan.lock().unwrap() = Some(plan);
+        self
+    }
+    pub fn set_authentication_plan(&self, plan: Vec<authentication::Candidate>) {
+        *self.authentication_plan.lock().unwrap() = Some(plan);
+    }
+    pub fn authentication(&self, pane: PaneId) -> Option<Arc<authentication::Control>> {
+        self.authentication
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .and_then(std::sync::Weak::upgrade)
     }
 
     pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
@@ -366,13 +386,25 @@ impl RemoteSshDomain {
 
     async fn start_new_session(
         &self,
+        pane_id: PaneId,
         command_line: Option<String>,
         env: HashMap<String, String>,
         size: TerminalSize,
     ) -> anyhow::Result<StartNewSessionResult> {
-        let (session, events) = Session::connect(self.ssh_config().context("obtain ssh config")?)
-            .context("connect to ssh server")?;
-        self.session.lock().unwrap().replace(session.clone());
+        let ssh_config = self.ssh_config().context("obtain ssh config")?;
+        let plan = self.authentication_plan.lock().unwrap().clone();
+        let control = plan.as_ref().map(|_| authentication::Control::new());
+        if let Some(control) = &control {
+            let mut states = self.authentication.lock().unwrap();
+            states.retain(|_, c| c.strong_count() > 0);
+            if let Some(old) = states
+                .insert(pane_id, Arc::downgrade(control))
+                .and_then(|c| c.upgrade())
+            {
+                old.cancel();
+            }
+        }
+        let cache = Arc::clone(&self.session);
 
         // We get to establish the session!
         //
@@ -407,6 +439,7 @@ impl RemoteSshDomain {
                 inner: Arc::new(Mutex::new(KillerInner {
                     killer: None,
                     pending_kill: false,
+                    authentication: control.clone(),
                 })),
             },
         });
@@ -428,19 +461,45 @@ impl RemoteSshDomain {
         // UI to carry out any authentication.
         let mut stdout_write = BufWriter::new(stdout_write);
         std::thread::spawn(move || {
-            if let Err(err) = connect_ssh_session(
-                session,
-                events,
-                stdin_read,
-                writer_tx,
-                &mut stdout_write,
-                reader_tx,
-                child_tx,
-                pty_tx,
-                size,
-                command_line,
-                env,
-            ) {
+            let result = (|| -> anyhow::Result<()> {
+                let (session, events) = if let (Some(control), Some(plan)) = (&control, plan) {
+                    let session = authentication::connect(control, plan)?;
+                    let (tx, rx) = bounded(1);
+                    tx.try_send(SessionEvent::Authenticated)?;
+                    (session, rx)
+                } else {
+                    Session::connect(ssh_config)?
+                };
+                cache.lock().unwrap().replace(session.clone());
+                connect_ssh_session(
+                    session,
+                    events,
+                    stdin_read,
+                    writer_tx,
+                    &mut stdout_write,
+                    reader_tx,
+                    child_tx,
+                    pty_tx,
+                    size,
+                    command_line,
+                    env,
+                )
+            })();
+            if let Some(control) = &control {
+                control.update(
+                    if result.is_ok() {
+                        authentication::Phase::Connected
+                    } else {
+                        authentication::Phase::Failed
+                    },
+                    result
+                        .as_ref()
+                        .err()
+                        .map(|e| format!("{e:#}"))
+                        .unwrap_or_default(),
+                );
+            }
+            if let Err(err) = result {
                 let _ = write!(stdout_write, "\r\n{:#}\r\n", err);
                 log::error!("Failed to connect ssh: {:#}", err);
             }
@@ -462,7 +521,11 @@ impl RemoteSshDomain {
             .context("build_command")?;
 
         // Release the session lock before awaiting a PTY request.
-        let mut session: Option<Session> = self.session.lock().unwrap().as_ref().cloned();
+        let mut session: Option<Session> = if self.authentication_plan.lock().unwrap().is_some() {
+            None
+        } else {
+            self.session.lock().unwrap().as_ref().cloned()
+        };
         if let Some(session) = session.take() {
             let cached = with_ssh_pty_timeout(
                 session.request_pty(
@@ -482,9 +545,13 @@ impl RemoteSshDomain {
                 let writer = Box::new(pty.take_writer().context("take writer from pty")?);
                 Ok(StartNewSessionResult { pty, child, writer })
             });
-            cached_pty_or_fresh(cached, || self.start_new_session(command_line, env, size)).await
+            cached_pty_or_fresh(cached, || {
+                self.start_new_session(pane_id, command_line, env, size)
+            })
+            .await
         } else {
-            self.start_new_session(command_line, env, size).await
+            self.start_new_session(pane_id, command_line, env, size)
+                .await
         }
     }
 
@@ -500,7 +567,9 @@ impl RemoteSshDomain {
         // DeadSession. Explicit reconnect must never request a PTY from that
         // cached transport; open a fresh connection and authenticate inline.
         let (command_line, env) = self.build_command(pane.pane_id(), None, None)?;
-        let backend = self.start_new_session(command_line, env, size).await?;
+        let backend = self
+            .start_new_session(pane.pane_id(), command_line, env, size)
+            .await?;
         pane.reconnect(backend.child, backend.pty, backend.writer)?;
 
         let mux = Mux::get();
@@ -740,7 +809,7 @@ fn connect_ssh_session(
                 }
                 smol::block_on(auth.answer(answers))?;
             }
-            SessionEvent::Error(err) => {
+            SessionEvent::Error(err) | SessionEvent::AuthenticationFailed(err) => {
                 shim.output_line(&format!("Error: {}", err))?;
             }
             SessionEvent::HostVerificationFailed(failed) => {
@@ -763,7 +832,7 @@ fn connect_ssh_session(
                 )) {
                     Err(err) => {
                         shim.output_line(&format!("Failed to spawn command: {:#}", err))?;
-                        break;
+                        return Err(err);
                     }
                     Ok((pty, child)) => {
                         drop(shim);
@@ -882,6 +951,7 @@ struct KillerInner {
     /// `kill`, then we use this to remember to kill as soon as we recv
     /// the child process.
     pending_kill: bool,
+    authentication: Option<Arc<authentication::Control>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1013,6 +1083,9 @@ impl ChildKiller for WrappedSshChild {
             killer.kill()
         } else {
             killer.pending_kill = true;
+            if let Some(control) = &killer.authentication {
+                control.cancel();
+            }
             Ok(())
         }
     }
@@ -1029,6 +1102,9 @@ impl ChildKiller for WrappedSshChildKiller {
             killer.kill()
         } else {
             killer.pending_kill = true;
+            if let Some(control) = &killer.authentication {
+                control.cancel();
+            }
             Ok(())
         }
     }

@@ -2,6 +2,10 @@ use crate::session::SessionEvent;
 use anyhow::Context;
 use smol::channel::{bounded, Sender};
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct AuthenticationRejected(pub String);
+
 #[derive(Debug)]
 pub struct AuthenticationPrompt {
     pub prompt: String,
@@ -115,6 +119,26 @@ impl crate::sessioninner::SessionInner {
                         log::info!("pubkey_file immediately ok for {}", file.display());
                         return Ok(true);
                     }
+                    Err(error)
+                        if error.code() == ssh2::ErrorCode::Session(-18)
+                            && self.config.get("termviai_auth_attempt").map(String::as_str)
+                                == Some("yes") =>
+                    {
+                        let next = sess.auth_methods(user)?;
+                        if !next.split(',').any(|method| method == "publickey")
+                            && next
+                                .split(',')
+                                .any(|method| matches!(method, "password" | "keyboard-interactive"))
+                        {
+                            // A valid first factor can still report auth failure
+                            // while the server requests an additional factor.
+                            return Ok(false);
+                        }
+                        return Err(AuthenticationRejected(
+                            "The selected SSH key was not accepted".into(),
+                        )
+                        .into());
+                    }
                     Err(_) => {
                         // Most likely cause of error is that we need a passphrase
                         // to decrypt the key, so let's prompt the user for one.
@@ -169,7 +193,10 @@ impl crate::sessioninner::SessionInner {
             .config
             .get("termviai_identity_file")
             .context("No SSH key selected")?;
-        let key = match libssh_rs::SshKey::from_privkey_file(file, None) {
+        // A null passphrase permits libssh/OpenSSL to read from the process
+        // console. An explicit empty passphrase fails promptly, allowing the
+        // pane-local UI to request it without blocking a background thread.
+        let key = match libssh_rs::SshKey::from_privkey_file(file, Some("")) {
             Ok(key) => key,
             Err(_) => {
                 let (reply, answers) = bounded(1);
@@ -187,7 +214,9 @@ impl crate::sessioninner::SessionInner {
                 let passphrase = answers
                     .first()
                     .context("User cancelled key authentication")?;
-                libssh_rs::SshKey::from_privkey_file(file, Some(passphrase))?
+                libssh_rs::SshKey::from_privkey_file(file, Some(passphrase)).map_err(|e| {
+                    AuthenticationRejected(format!("Could not unlock the selected key: {e}"))
+                })?
             }
         };
         Ok(sess.userauth_publickey(None, &key)?)
@@ -223,12 +252,14 @@ impl crate::sessioninner::SessionInner {
                 }],
                 reply,
             }))
-            .unwrap();
+            .map_err(|e| libssh_rs::Error::fatal(e.to_string()))?;
 
-            let mut answers = smol::block_on(answers.recv())
-                .context("waiting for authentication answers from user")
-                .unwrap();
-            Ok(answers.remove(0))
+            let answers = smol::block_on(answers.recv())
+                .map_err(|e| libssh_rs::Error::fatal(e.to_string()))?;
+            answers
+                .into_iter()
+                .next()
+                .ok_or_else(|| libssh_rs::Error::fatal("Authentication cancelled"))
         });
 
         use libssh_rs::{AuthMethods, AuthStatus};
@@ -247,6 +278,15 @@ impl crate::sessioninner::SessionInner {
                     match sess.userauth_password(None, Some(&password))? {
                         AuthStatus::Success => return Ok(()),
                         AuthStatus::Partial => continue,
+                        AuthStatus::Denied
+                            if self.config.get("termviai_auth_attempt").map(String::as_str)
+                                == Some("yes") =>
+                        {
+                            return Err(AuthenticationRejected(
+                                "The saved password was not accepted".into(),
+                            )
+                            .into());
+                        }
                         _ => {}
                     }
                 }
@@ -270,11 +310,12 @@ impl crate::sessioninner::SessionInner {
                         continue;
                     }
                     status => {
-                        anyhow::ensure!(
-                            policy != AuthPolicy::Key,
-                            "The selected SSH key was not accepted: {:?}",
-                            status
-                        );
+                        if policy == AuthPolicy::Key {
+                            return Err(AuthenticationRejected(format!(
+                                "The selected SSH key was not accepted: {status:?}"
+                            ))
+                            .into());
+                        }
                         status_by_method.insert(AuthMethods::PUBLIC_KEY, status);
                     }
                 }
@@ -322,6 +363,12 @@ impl crate::sessioninner::SessionInner {
                             continue;
                         }
                         AuthStatus::Denied => {
+                            if policy != AuthPolicy::Legacy {
+                                return Err(AuthenticationRejected(
+                                    "Keyboard-interactive authentication was rejected".into(),
+                                )
+                                .into());
+                            }
                             break;
                         }
                         AuthStatus::Partial => continue,
@@ -345,25 +392,28 @@ impl crate::sessioninner::SessionInner {
                         }],
                         reply,
                     }))
-                    .unwrap();
+                    .context("requesting password")?;
 
-                let mut answers = smol::block_on(answers.recv())
-                    .context("waiting for authentication answers from user")
-                    .unwrap();
-                let pw = answers.remove(0);
+                let answers = smol::block_on(answers.recv())
+                    .context("waiting for authentication answers from user")?;
+                let pw = answers
+                    .into_iter()
+                    .next()
+                    .context("Authentication cancelled")?;
 
                 match sess.userauth_password(None, Some(&pw))? {
                     AuthStatus::Success => return Ok(()),
                     AuthStatus::Partial => continue,
-                    status => anyhow::bail!("password auth status: {:?}", status),
+                    status => {
+                        return Err(AuthenticationRejected(format!(
+                            "Password was not accepted: {status:?}"
+                        ))
+                        .into())
+                    }
                 }
             }
 
-            anyhow::bail!(
-                "unhandled auth case; methods={:?}, status={:?}",
-                auth_methods,
-                status_by_method
-            );
+            return Err(AuthenticationRejected(format!("No accepted authentication method; methods={auth_methods:?}, status={status_by_method:?}")).into());
         }
     }
 
@@ -397,13 +447,16 @@ impl crate::sessioninner::SessionInner {
             let methods: HashSet<&str> = sess.auth_methods(&user)?.split(',').collect();
             log::trace!("ssh auth methods: {:?}", methods);
             if policy != AuthPolicy::Legacy {
-                anyhow::ensure!(
-                    (policy.public_key() && !key_factor_complete && methods.contains("publickey"))
-                        || (policy.password(key_factor_complete)
-                            && (methods.contains("password")
-                                || methods.contains("keyboard-interactive"))),
-                    "The server does not offer the selected authentication method."
-                );
+                if !((policy.public_key() && !key_factor_complete && methods.contains("publickey"))
+                    || (policy.password(key_factor_complete)
+                        && (methods.contains("password")
+                            || methods.contains("keyboard-interactive"))))
+                {
+                    return Err(AuthenticationRejected(
+                        "The server does not offer the selected authentication method.".into(),
+                    )
+                    .into());
+                }
             }
 
             if policy.password(key_factor_complete)
@@ -411,8 +464,21 @@ impl crate::sessioninner::SessionInner {
                 && methods.contains("password")
             {
                 if let Some(password) = saved_password.take() {
-                    if sess.userauth_password(user, &password).is_ok() {
-                        continue;
+                    match sess.userauth_password(user, &password) {
+                        Ok(()) => continue,
+                        Err(error)
+                            if self.config.get("termviai_auth_attempt").map(String::as_str)
+                                == Some("yes") =>
+                        {
+                            if error.code() == ssh2::ErrorCode::Session(-18) {
+                                return Err(AuthenticationRejected(
+                                    "The saved password was not accepted".into(),
+                                )
+                                .into());
+                            }
+                            return Err(error.into());
+                        }
+                        Err(_) => {}
                     }
                 }
             }
@@ -436,10 +502,12 @@ impl crate::sessioninner::SessionInner {
                         && next
                             .split(',')
                             .any(|m| matches!(m, "password" | "keyboard-interactive"));
-                    anyhow::ensure!(
-                        key_factor_complete,
-                        "The selected SSH key was not accepted."
-                    );
+                    if !key_factor_complete {
+                        return Err(AuthenticationRejected(
+                            "The selected SSH key was not accepted.".into(),
+                        )
+                        .into());
+                    }
                     continue;
                 }
             }
@@ -469,6 +537,14 @@ impl crate::sessioninner::SessionInner {
                 }
 
                 if let Err(err) = sess.userauth_password(user, &answers[0]) {
+                    if policy != AuthPolicy::Legacy {
+                        if err.code() == ssh2::ErrorCode::Session(-18) {
+                            return Err(
+                                AuthenticationRejected("Password was not accepted".into()).into()
+                            );
+                        }
+                        return Err(err.into());
+                    }
                     log::error!("while attempting password auth: {}", err);
                 }
             }
@@ -534,6 +610,20 @@ impl crate::sessioninner::SessionInner {
                 };
 
                 if let Err(err) = sess.userauth_keyboard_interactive(user, &mut helper) {
+                    if self.config.get("termviai_auth_attempt").map(String::as_str) == Some("yes") {
+                        if err.code() != ssh2::ErrorCode::Session(-18) {
+                            return Err(err.into());
+                        }
+                        // A completed factor can expose a different method (MFA).
+                        // Otherwise return to the pane instead of prompting forever.
+                        let next: HashSet<&str> = sess.auth_methods(user)?.split(',').collect();
+                        if next == methods {
+                            return Err(AuthenticationRejected(
+                                "Keyboard-interactive authentication was not accepted".into(),
+                            )
+                            .into());
+                        }
+                    }
                     log::error!("while attempting keyboard-interactive auth: {}", err);
                 }
             }

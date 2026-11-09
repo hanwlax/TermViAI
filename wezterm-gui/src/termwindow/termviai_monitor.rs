@@ -239,10 +239,9 @@ impl MonitorUi {
                     self.data = Monitor::load();
                     self.loaded = true;
                 }
-                self.selected = None;
-                self.dialog = None;
+                // Activating the Monitor tab resumes its previous location.
+                // Only the breadcrumb Home action resets navigation.
                 self.menu = None;
-                self.reset_scroll();
             }
             Command::Add => {
                 self.dialog = Some(Dialog::Picker);
@@ -268,6 +267,7 @@ impl MonitorUi {
             }
             Command::Home => {
                 self.selected = None;
+                self.dialog = None;
                 self.menu = None;
                 self.reset_scroll();
             }
@@ -543,6 +543,8 @@ fn status(e: &crate::monitor::Entry) -> (&'static str, &'static str) {
         ("Paused", MUTED)
     } else if e.stopping {
         ("Ending processes", MUTED)
+    } else if e.refresh_pending {
+        ("Refreshing", MUTED)
     } else if e.snapshot.is_some() {
         ("● Collecting", "#59b79e")
     } else {
@@ -551,7 +553,9 @@ fn status(e: &crate::monitor::Entry) -> (&'static str, &'static str) {
 }
 fn reason(e: &crate::monitor::Entry) -> &'static str {
     let error = e.error.to_lowercase();
-    if error.contains("timed out") || error.contains("timeout") {
+    if e.sampling_failed() {
+        "Sampling failed"
+    } else if error.contains("timed out") || error.contains("timeout") {
         "Connection timed out"
     } else if error.contains("auth") || error.contains("password") {
         "Authentication required"
@@ -892,7 +896,7 @@ pub(super) fn draw(
                     x + (width - 150.) / 2.,
                     cy + 164.,
                     150.,
-                    "Retry connection",
+                    "Retry monitoring",
                     Command::Retry(index),
                     Icon::Refresh,
                     hover,
@@ -1216,9 +1220,9 @@ pub(super) fn draw(
                         cw - 58.,
                         22.,
                         if e.error.is_empty() {
-                            "Sampling starts once connected."
+                            "Sampling starts once connected.".into()
                         } else {
-                            "Host is retained. Retry to reconnect."
+                            e.recovery_hint()
                         },
                         MUTED,
                     );
@@ -1234,7 +1238,7 @@ pub(super) fn draw(
             t.last_mut().unwrap().border_color = Some("#353648");
             let e = &m.data.entries[index];
             let action = if !e.error.is_empty() {
-                ("Retry connection", Command::Retry(index), Icon::Refresh)
+                ("Retry monitoring", Command::Retry(index), Icon::Refresh)
             } else if e.paused {
                 ("Resume sampling", Command::Pause(index), Icon::Play)
             } else {
@@ -1414,7 +1418,7 @@ fn draw_dialog(
         Dialog::Processes => format!("NPU {}", m.npu),
         Dialog::Stop => "End processes".into(),
         Dialog::Remove => "Remove monitor".into(),
-        Dialog::Reason => "Connection details".into(),
+        Dialog::Reason => "Monitoring details".into(),
     };
     label(t, cx, 76., cw - 42., 30., title, INK, 17, true, false);
     ctl(t, hits, w - 54., 75., 30., 30., "", Command::Close, hover);
@@ -1829,6 +1833,12 @@ fn draw_dialog(
                         );
                         y += 40.;
                     }
+                    if !e.action_error.is_empty() {
+                        for line in wrap(&e.action_error, cw - 8., 12, false)? {
+                            text(&mut body, cx, y, cw, 24., line, "#ed8193");
+                            y += 26.;
+                        }
+                    }
                     for result in &e.results {
                         text(
                             &mut body,
@@ -1988,16 +1998,16 @@ fn draw_dialog(
                     format!("{} · {}", e.host.label, e.host.endpoint()),
                     MUTED,
                 );
-                for line in wrap(
-                    if e.error.is_empty() {
-                        "No connection error was reported."
+                let details = if e.error.is_empty() {
+                    if e.action_error.is_empty() {
+                        "No monitoring error was reported.".to_owned()
                     } else {
-                        &e.error
-                    },
-                    cw - 8.,
-                    12,
-                    false,
-                )? {
+                        e.action_error.clone()
+                    }
+                } else {
+                    format!("{}\n{}", e.error, e.recovery_hint())
+                };
+                for line in wrap(&details, cw - 8., 12, false)? {
                     text(&mut body, cx, y, cw, 24., line, INK);
                     y += 26.;
                 }
@@ -2007,7 +2017,7 @@ fn draw_dialog(
                     w - 174.,
                     footer + 12.,
                     150.,
-                    "Retry connection",
+                    "Retry monitoring",
                     Command::Retry(m.selected.unwrap()),
                     Icon::Refresh,
                     hover,
@@ -3583,5 +3593,29 @@ mod tests {
         let large = fonts.ui_font(24, true).unwrap();
         assert!(height(&large) > height(&heading));
         assert!(!std::rc::Rc::ptr_eq(&heading, &large));
+    }
+    #[test]
+    fn reopening_monitor_preserves_host_device_filter_and_scroll() {
+        let mut ui = preview_ui();
+        let m = &mut ui.monitor;
+        m.loaded = true;
+        m.selected = Some(0);
+        m.npu = 4;
+        m.die = Some(2);
+        m.scroll = 3;
+        m.dialog = Some(Dialog::Processes);
+        m.drawer_scroll.position = 137.;
+        m.drawer_scroll.target = 137.;
+        m.handle(Command::Open, &ui.store).unwrap();
+        assert_eq!(m.selected, Some(0));
+        assert!(m.dialog == Some(Dialog::Processes));
+        assert_eq!((m.npu, m.die), (4, Some(2)));
+        assert_eq!(
+            (m.scroll, m.drawer_scroll.position, m.drawer_scroll.target),
+            (3, 137., 137.)
+        );
+        m.handle(Command::Home, &ui.store).unwrap();
+        assert!(m.selected.is_none() && m.dialog.is_none());
+        assert_eq!(m.scroll, 0);
     }
 }

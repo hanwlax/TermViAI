@@ -126,6 +126,9 @@ impl crate::TermWindow {
 
         let pane_id = pos.pane.pane_id();
         let current_viewport = self.get_viewport(pane_id);
+        let scroll_pixels = (self.termviai_scroll_fraction(pane_id)
+            * self.render_metrics.cell_size.height as f32)
+            .round();
         let dims = pos.pane.get_dimensions();
 
         let gl_state = self.render_state.as_ref().unwrap();
@@ -366,6 +369,12 @@ impl crate::TermWindow {
                 self.render_metrics.cell_size.height,
                 visible_content_height,
             );
+            let visible_rows = visible_rows + usize::from(scroll_pixels > 0.);
+            let scroll_clip = visible_content_height.map(|height| {
+                let top = top_pixel_y + pos.top as f32 * cell_height
+                    - self.dimensions.pixel_height as f32 / 2.;
+                (-scroll_pixels, top, top + height)
+            });
             let stable_range = match current_viewport {
                 Some(top) => top..top + visible_rows as StableRowIndex,
                 None => dims.physical_top..dims.physical_top + visible_rows as StableRowIndex,
@@ -399,6 +408,7 @@ impl crate::TermWindow {
                 window_is_transparent: bool,
                 layers: &'a mut TripleLayerQuadAllocator<'b>,
                 error: Option<anyhow::Error>,
+                scroll_clip: Option<(f32, f32, f32)>,
             }
 
             let left_pixel_x =
@@ -429,6 +439,7 @@ impl crate::TermWindow {
                 window_is_transparent,
                 layers,
                 error: None,
+                scroll_clip,
             };
 
             impl<'a, 'b> LineRender<'a, 'b> {
@@ -528,7 +539,7 @@ impl crate::TermWindow {
                         if !expired && !hover_changed {
                             cached_quad
                                 .layers
-                                .apply_to(self.layers)
+                                .apply_to_scrolled(self.layers, self.scroll_clip)
                                 .context("cached_quad.layers.apply_to")?;
                             self.term_window.update_next_frame_time(cached_quad.expires);
                             return Ok(());
@@ -600,7 +611,7 @@ impl crate::TermWindow {
                     let expires = self.term_window.has_animation.borrow().as_ref().cloned();
                     self.term_window.update_next_frame_time(next_due);
 
-                    buf.apply_to(self.layers)
+                    buf.apply_to_scrolled(self.layers, self.scroll_clip)
                         .context("HeapQuadAllocator::apply_to")?;
 
                     let quad_value = LineQuadCacheValue {

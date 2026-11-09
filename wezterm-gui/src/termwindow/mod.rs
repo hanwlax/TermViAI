@@ -36,8 +36,8 @@ use config::keyassignment::{
 };
 use config::window::WindowLevel;
 use config::{
-    configuration, AudibleBell, ConfigHandle, Dimension, DimensionContext, FrontEndSelection,
-    GeometryOrigin, GuiPosition, TermConfig, WindowCloseConfirmation,
+    configuration, ConfigHandle, Dimension, DimensionContext, FrontEndSelection, GeometryOrigin,
+    GuiPosition, TermConfig, WindowCloseConfirmation,
 };
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
@@ -89,6 +89,7 @@ mod termviai_font;
 mod termviai_icons;
 mod termviai_layout;
 mod termviai_motion;
+mod termviai_scrollbar;
 mod termviai_tab_drag;
 mod termviai_text_cache;
 mod termviai_theme;
@@ -380,6 +381,7 @@ pub struct TermWindow {
     termviai_confirm: termviai_confirm::ConfirmState,
     termviai_layout: termviai_layout::TermviaiLayout,
     termviai_fonts: termviai_font::TermviaiFonts,
+    termviai_scrollbars: termviai_scrollbar::Scrollbars,
     pub window: Option<Window>,
     pub config: ConfigHandle,
     pub config_overrides: wezterm_dynamic::Value,
@@ -749,6 +751,7 @@ impl TermWindow {
             termviai_confirm: Default::default(),
             termviai_layout: Default::default(),
             termviai_fonts,
+            termviai_scrollbars: Default::default(),
             created: Instant::now(),
             connection_name,
             last_fps_check_time: Instant::now(),
@@ -782,7 +785,7 @@ impl TermWindow {
             leader_is_down: None,
             dead_key_status: DeadKeyStatus::None,
             show_tab_bar,
-            show_scroll_bar: config.enable_scroll_bar,
+            show_scroll_bar: config.enable_scroll_bar && !config.termviai_ui,
             tab_bar: TabBarState::default(),
             fancy_tab_bar: None,
             right_status: String::new(),
@@ -1023,6 +1026,9 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::FocusChanged(focused) => {
+                if !focused {
+                    self.termviai_scrollbar_cancel();
+                }
                 self.focus_changed(focused, window);
                 Ok(true)
             }
@@ -1031,6 +1037,7 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::MouseLeave => {
+                self.termviai_scrollbar_unhover();
                 self.mouse_leave_impl(window);
                 Ok(true)
             }
@@ -1326,11 +1333,11 @@ impl TermWindow {
                         return Ok(());
                     }
 
-                    match self.config.audible_bell {
-                        AudibleBell::SystemBeep => {
-                            Connection::get().expect("on main thread").beep();
-                        }
-                        AudibleBell::Disabled => {}
+                    if self
+                        .termviai_fonts
+                        .audible_bell(self.config.termviai_ui, &self.config.audible_bell)
+                    {
+                        Connection::get().expect("on main thread").beep();
                     }
 
                     log::trace!("Ding! (this is the bell) in pane {}", pane_id);
@@ -1880,7 +1887,7 @@ impl TermWindow {
             None,
         );
 
-        self.show_scroll_bar = config.enable_scroll_bar;
+        self.show_scroll_bar = config.enable_scroll_bar && !config.termviai_ui;
         self.shape_generation += 1;
         {
             let mut shape_cache = self.shape_cache.borrow_mut();
@@ -2134,6 +2141,7 @@ impl TermWindow {
                         termviai_ui::Page::Hosts => "TermViAI — Hosts",
                         termviai_ui::Page::Keys => "TermViAI — Keychain",
                         termviai_ui::Page::Monitor => "TermViAI — Monitor",
+                        termviai_ui::Page::Forwarding => "TermViAI — Port Forwarding",
                         termviai_ui::Page::NewTab => "TermViAI — New Tab",
                         termviai_ui::Page::Terminal => "TermViAI",
                     });
@@ -2204,6 +2212,7 @@ impl TermWindow {
                     termviai_ui::Page::Hosts => "TermViAI — Hosts".to_string(),
                     termviai_ui::Page::Keys => "TermViAI — Keychain".to_string(),
                     termviai_ui::Page::Monitor => "TermViAI — Monitor".to_string(),
+                    termviai_ui::Page::Forwarding => "TermViAI — Port Forwarding".to_string(),
                     termviai_ui::Page::NewTab => "TermViAI — New Tab".to_string(),
                     termviai_ui::Page::Terminal => format!(
                         "TermViAI — {}",
@@ -2690,7 +2699,9 @@ impl TermWindow {
                 MouseEventKind::VertWheel(amount) => -amount,
                 _ => return Ok(()),
             };
-            self.scroll_by_line(amount.into(), pane)?;
+            if !self.termviai_smooth_wheel(pane, amount.into()) {
+                self.scroll_by_line(amount.into(), pane)?;
+            }
         }
         Ok(())
     }
@@ -3558,6 +3569,7 @@ impl TermWindow {
             None => None,
         };
 
+        self.termviai_scrollbar_external(pane_id, pos, dims);
         let mut state = self.pane_state(pane_id);
         if pos != state.viewport {
             state.viewport = pos;
@@ -3587,6 +3599,7 @@ impl TermWindow {
     }
 
     fn scroll_to_bottom(&mut self, pane: &Arc<dyn Pane>) {
+        self.termviai_scrollbar_external(pane.pane_id(), None, pane.get_dimensions());
         self.pane_state(pane.pane_id()).viewport = None;
     }
 
