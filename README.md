@@ -2,12 +2,15 @@
 
 **Terminal Via AI** — a modern Windows SSH terminal application created through human and AI collaboration.
 
-TermViAI combines WezTerm's terminal, SSH, PTY and GPU rendering foundations with a focused host library, multi-host tab groups and selective input broadcasting. Settings offers Ink, Navy and Light themes across the interface and terminal; the default font is JetBrainsMono Nerd Font Mono.
+TermViAI combines WezTerm's terminal, SSH and PTY foundations with a native Rust GPUI interface, a focused host library, multi-host tab groups and selective input broadcasting. Settings offers Ink, Navy and Light themes across the interface and terminal; the default font is JetBrainsMono Nerd Font Mono.
 
-> Current version: **v0.1.0-beta.7**. This beta targets Windows 10/11 x86_64.
+> Current version: **v0.1.0-beta.8**. This beta targets Windows 10/11 x86_64.
 
 ## Features
 
+- Native GPUI interface with shared terminal/SSH engines, without WebView or Electron.
+- Ctrl+click Host multi-selection and Enter to open separate terminal tabs.
+- Overflow tab navigation with scrolling, searchable All tabs, automatic active-tab reveal and Ctrl+Tab cycling.
 - Nested Host groups with breadcrumbs, host moves and safe group deletion.
 - Exclusive Password / SSH Key / Identity authentication, with passwords saved in Windows Credential Manager.
 - Multiple SSH hosts in one tab with proportional split layouts.
@@ -18,6 +21,8 @@ TermViAI combines WezTerm's terminal, SSH, PTY and GPU rendering foundations wit
 - Editable Keychain keys and identities, with consistent delete controls.
 - Saved SSH tab groups and recent connections, with hover-only removal and Identity-aware deduplication.
 - NPU Monitor for existing Linux hosts: card/Die metrics, process details and guarded process termination.
+- Port Forwarding from saved Hosts, with owned-tunnel recovery.
+- Inline SSH authentication recovery with Keychain → Identity → manual fallback.
 - Configurable tab-close confirmation, enabled by default.
 - In-place SSH reconnect with scrollback preserved, including whole-group reconnect.
 - Right-side add/edit drawers, animated sidebar and broadcast toolbar.
@@ -27,9 +32,9 @@ TermViAI combines WezTerm's terminal, SSH, PTY and GPU rendering foundations wit
 
 ## Download
 
-Download **TermViAI-v0.1.0-beta.7-windows-x86_64.zip** from the [v0.1.0-beta.7 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.7), extract it, and run `TermViAI.exe`.
+Download **TermViAI-v0.1.0-beta.8-windows-x86_64.zip** from the [v0.1.0-beta.8 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.8), extract it, and run `TermViAI.exe`.
 
-This is a portable beta build. Keep `OpenConsole.exe`, `conpty.dll`, `libEGL.dll` and `libGLESv2.dll` beside the executable.
+This portable package contains `TermViAI.exe`, `README.txt` and `LICENSES.txt`. Extract into a new folder; no WebView or separate Chromium runtime is required. Existing Hosts, Keychain references and workspaces are reused.
 
 ## Basic use
 
@@ -46,14 +51,14 @@ Settings and local host data stay on this device. On Windows the application dat
 The repository is based on WezTerm and uses its Rust workspace. A Windows x64 release build can be produced with:
 
 ```powershell
-cargo build --locked --release -p wezterm-gui
+cargo build --locked --release --manifest-path termviai-gpui/Cargo.toml
 ```
 
-The Cargo output is still named `wezterm-gui.exe` internally; official TermViAI release packages publish it as `TermViAI.exe` with TermViAI Windows product metadata.
+The Cargo output is `termviai-gpui/target/release/TermViAI.exe`, with TermViAI Windows product metadata. The internal crate/directory name remains `termviai-gpui`; the older frontend remains in the repository for reference.
 
 CI builds the Windows x86_64 GUI and runs broadcast policy, SSH, terminal core, window, mux, and GUI tests on relevant pushes and pull requests to `main`. Rust formatting and the Linux remote collector tests are checked separately. Windows CI can also be started manually; scheduled upstream builds and publishing workflows are archived under [`ci/upstream-workflows`](ci/upstream-workflows).
 
-Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.7.md](docs/termviai/RELEASE_V0.1.0_BETA.7.md).
+Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.8.md](docs/termviai/RELEASE_V0.1.0_BETA.8.md).
 
 ## Project origin and license
 

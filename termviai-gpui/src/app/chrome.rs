@@ -113,14 +113,42 @@ enum MenuAction {
 }
 impl AppView {
     fn top_bar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let metrics = self.tab_rail.metrics;
+        let offset = self.tab_rail.offset();
         let mut tabs = div()
             .id("tab-strip")
+            .w(px(metrics.viewport))
+            .flex_shrink_0()
             .min_w_0()
             .h_full()
             .flex()
             .items_center()
-            .gap_2()
-            .overflow_x_scroll();
+            .gap(px(tab_strip::GAP))
+            // Keep programmatic scroll offsets, but let our wheel handler own easing.
+            // Overflow::Scroll also installs GPUI's immediate wheel handler.
+            .overflow_hidden()
+            .track_scroll(&self.tab_rail.scroll)
+            .on_scroll_wheel(cx.listener(|s, e: &ScrollWheelEvent, _, cx| {
+                if !s.tab_rail.metrics.overflow || e.modifiers.control {
+                    return;
+                }
+                let delta = e.delta.pixel_delta(px(28.));
+                let x = if delta.x.abs() > delta.y.abs() {
+                    delta.x
+                } else {
+                    delta.y
+                };
+                s.scroll_tabs(-x / px(1.), matches!(e.delta, ScrollDelta::Lines(_)), cx);
+                cx.stop_propagation();
+            }))
+            .on_drag_move::<Drag>(cx.listener(|s, e: &DragMoveEvent<Drag>, _, cx| {
+                let drag = e.drag(cx).clone();
+                s.track_tab_drag(&drag, e.event.position, cx);
+            }))
+            .on_drop(cx.listener(|s, d: &Drag, w, cx| {
+                cx.stop_propagation();
+                s.finish_tab_drop(d, w, cx);
+            }));
         for t in &self.tabs {
             let id = t.id;
             let active = self.page == Page::Terminal(id);
@@ -228,16 +256,7 @@ impl AppView {
                         )
                     })
                     .on_click(cx.listener(move |s, _, w, cx| {
-                        s.page = Page::Terminal(id);
-                        if let Some(p) = s
-                            .tabs
-                            .iter()
-                            .find(|t| t.id == id)
-                            .and_then(|t| t.layout.panes().first().copied())
-                        {
-                            s.panes[&p].view.focus_handle(cx).focus(w);
-                        }
-                        cx.notify();
+                        s.activate_tab(Page::Terminal(id), w, cx);
                     }))
                     .on_mouse_down(
                         MouseButton::Right,
@@ -248,39 +267,35 @@ impl AppView {
                     )
                     .on_drag(drag, move |d: &Drag, _, _, cx| {
                         owner.update(cx, |s, cx| {
+                            s.clear_drag();
                             s.drag_source = Some(d.clone());
                             cx.notify();
                         });
                         cx.new(|_| d.clone())
                     })
-                    .on_drag_move::<Drag>(cx.listener(move |s, e: &DragMoveEvent<Drag>, _, cx| {
-                        if e.drag(cx).tab != id
-                            && e.bounds.contains(&e.event.position)
-                            && s.page != Page::Terminal(id)
-                        {
-                            s.page = Page::Terminal(id);
-                            s.drop_target = None;
-                            cx.notify();
-                        }
-                    }))
-                    .on_drop(cx.listener(move |s, d: &Drag, _, cx| {
+                    .on_drop(cx.listener(|s, d: &Drag, w, cx| {
                         cx.stop_propagation();
-                        if d.pane.is_none() && d.tab != id {
-                            if let (Some(from), Some(to)) = (
-                                s.tabs.iter().position(|t| t.id == d.tab),
-                                s.tabs.iter().position(|t| t.id == id),
-                            ) {
-                                let tab = s.tabs.remove(from);
-                                s.tabs.insert(to, tab);
-                            }
-                        }
-                        s.drag_source = None;
-                        s.drop_target = None;
-                        cx.notify();
-                    })),
+                        s.finish_tab_drop(d, w, cx);
+                    }))
+                    .when_some(
+                        self.tab_drop_target.filter(|(t, _)| *t == id),
+                        |d, (_, after)| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top(px(4.))
+                                    .bottom(px(4.))
+                                    .w(px(2.))
+                                    .rounded_full()
+                                    .bg(self.c(self.col().accent))
+                                    .when(after, |d| d.right_0())
+                                    .when(!after, |d| d.left_0()),
+                            )
+                        },
+                    ),
             );
         }
-        if self.page == Page::NewTab {
+        if self.new_tab_open {
             tabs = tabs.child(
                 div()
                     .id("new-tab-title")
@@ -292,30 +307,75 @@ impl AppView {
                     .gap_3()
                     .items_center()
                     .rounded_md()
-                    .bg(self.c(self.col().card))
+                    .when(self.page == Page::NewTab, |d| d.bg(self.c(self.col().card)))
+                    .hover(|d| d.bg(self.c(self.col().hover)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|s, _, w, cx| s.activate_tab(Page::NewTab, w, cx)))
                     .child(div().flex_1().min_w_0().truncate().child("New Tab"))
                     .child(
                         self.close("close-new-tab")
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.page = Page::Hosts;
+                            .on_click(cx.listener(|s, _, w, cx| {
+                                cx.stop_propagation();
+                                s.new_tab_open = false;
+                                if s.page == Page::NewTab {
+                                    s.page = s
+                                        .tabs
+                                        .last()
+                                        .map(|t| Page::Terminal(t.id))
+                                        .unwrap_or(Page::Hosts);
+                                }
+                                s.focus_active_tab(w, cx);
                                 cx.notify();
                             })),
                     ),
             );
         }
+        let rail = div()
+            .h_full()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_shrink_0()
+            .when(metrics.overflow, |d| {
+                d.child(
+                    self.icon("tabs-prev", IconName::ChevronLeft)
+                        .w(px(26.))
+                        .h(px(30.))
+                        .opacity(if offset <= 0.5 { 0.28 } else { 1. })
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            s.scroll_tabs(-s.tab_rail.metrics.viewport * 0.8, true, cx)
+                        })),
+                )
+            })
+            .child(tabs)
+            .when(metrics.overflow, |d| {
+                d.child(
+                    self.icon("tabs-next", IconName::ChevronRight)
+                        .w(px(26.))
+                        .h(px(30.))
+                        .opacity(if offset >= metrics.max_offset() - 0.5 {
+                            0.28
+                        } else {
+                            1.
+                        })
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            s.scroll_tabs(s.tab_rail.metrics.viewport * 0.8, true, cx)
+                        })),
+                )
+            });
         div()
             .h(px(52.))
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap_2()
+            .gap_1()
             .pl_2()
             .bg(self.c(self.col().top))
             .border_b_1()
             .border_color(self.c(self.col().line))
             .child(
                 div()
-                    .w(px(160.))
+                    .w(px(152.))
                     .h_full()
                     .flex_shrink_0()
                     .flex()
@@ -337,24 +397,90 @@ impl AppView {
                             .child("TermViAI"),
                     ),
             )
-            .child(tabs.on_drop(cx.listener(|s, d: &Drag, _, cx| {
-                s.detach_pane(d, cx);
-                cx.stop_propagation();
-            })))
+            .child(rail)
             .child(
                 self.icon("new-tab", IconName::Plus)
-                    .size(px(32.))
+                    .size(px(30.))
                     .on_drop(cx.listener(|s, d: &Drag, _, cx| {
                         s.detach_pane(d, cx);
                         cx.stop_propagation();
                     }))
                     .on_click(cx.listener(|s, _, w, cx| {
-                        s.page = Page::NewTab;
-                        s.search.focus_handle(cx).focus(w);
-                        cx.notify();
+                        s.open_new_tab(w, cx);
                     })),
             )
-            .child(titlebar_drag_area("titlebar-drag").flex_1().min_w(px(16.)))
+            .when(metrics.overflow, |d| {
+                d.child(
+                    div()
+                        .id("all-tabs-toggle")
+                        .w(px(56.))
+                        .h(px(30.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .text_color(self.c(self.col().muted))
+                        .when(self.tab_picker, |d| {
+                            d.bg(self.c(self.col().soft))
+                                .text_color(self.c(self.col().accent))
+                        })
+                        .hover(|d| d.bg(self.c(self.col().icon_hover)))
+                        .child(
+                            svg()
+                                .path("termviai/list-filter.svg")
+                                .size(px(16.))
+                                .text_color(self.c(self.col().muted)),
+                        )
+                        .child((self.tabs.len() + usize::from(self.new_tab_open)).to_string())
+                        .on_click(cx.listener(|s, _, w, cx| s.toggle_tab_picker(w, cx))),
+                )
+            })
+            .child(
+                titlebar_drag_area("titlebar-drag")
+                    .flex_1()
+                    .min_w(px(26.))
+                    .relative()
+                    .on_drag_move::<Drag>(cx.listener(|s, e: &DragMoveEvent<Drag>, _, cx| {
+                        if !e.bounds.contains(&e.event.position) {
+                            if s.tab_drop_target.is_some_and(|(t, _)| t == usize::MAX) {
+                                s.tab_drop_target = None;
+                                cx.notify();
+                            }
+                            return;
+                        }
+                        let next = s
+                            .tab_drop_gap(e.drag(cx), usize::MAX, true)
+                            .map(|_| (usize::MAX, true));
+                        if s.tab_drop_target != next || s.drop_target.is_some() {
+                            s.tab_drop_target = next;
+                            s.drop_target = None;
+                            cx.notify();
+                        }
+                    }))
+                    .on_drop(cx.listener(|s, d: &Drag, _, cx| {
+                        cx.stop_propagation();
+                        s.drop_on_tab(d, usize::MAX, cx);
+                    }))
+                    .when(
+                        self.tab_drop_target.is_some_and(|(t, _)| t == usize::MAX),
+                        |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top(px(12.))
+                                    .bottom(px(12.))
+                                    .w(px(2.))
+                                    .rounded_full()
+                                    .bg(self.c(self.col().accent)),
+                            )
+                        },
+                    ),
+            )
             .child(self.window_controls(window))
             .into_any_element()
     }
@@ -468,6 +594,7 @@ impl AppView {
                         )
                         .when(self.sidebar, |d| d.child(label))
                         .on_click(cx.listener(move |s, _, _, cx| {
+                            s.host_selection.clear();
                             s.page = page;
                             s.menu = None;
                             cx.notify();
@@ -604,7 +731,8 @@ impl AppView {
                 ("Close Tab", IconName::Close, MenuAction::Close(*id)),
             ],
         };
-        let height = items.len() as f32 * 34. + 12.;
+        let interval_menu = matches!(kind, MenuKind::MonitorInterval);
+        let height = items.len() as f32 * 34. + 12. + if interval_menu { 64. } else { 0. };
         let left = pos.x.min(w.viewport_size().width - px(225.)).max(px(0.));
         let top = pos.y.min(w.viewport_size().height - px(height)).max(px(0.));
         div()
@@ -636,11 +764,13 @@ impl AppView {
                     .shadow_lg()
                     .flex()
                     .flex_col()
+                    .when(interval_menu, |d| d.child(self.muted("Sampling interval").px_3().py_2()))
                     .children(
                         items
                             .into_iter()
                             .enumerate()
                             .map(|(i, (label, icon, action))| {
+                                let selected = matches!(&action, MenuAction::MonitorInterval(v) if *v == self.monitor.interval);
                                 div()
                                     .id(("menu-action", i))
                                     .h(px(34.))
@@ -651,8 +781,11 @@ impl AppView {
                                     .gap_3()
                                     .cursor_pointer()
                                     .hover(|d| d.bg(self.c(self.col().icon_hover)))
-                                    .child(Icon::new(icon).size(px(15.)))
+                                    .when(!interval_menu, |d| d.child(Icon::new(icon).size(px(15.))))
+                                    .when(selected, |d| d.bg(self.c(self.col().soft)).text_color(self.c(self.col().accent)))
                                     .child(label)
+                                    .when(interval_menu, |d| d.child(div().flex_1()))
+                                    .when(selected, |d| d.child(Icon::new(IconName::Check).size(px(15.))))
                                     .on_click(cx.listener(move |s, _, w, cx| {
                                         cx.stop_propagation();
                                         s.menu = None;
@@ -673,8 +806,10 @@ impl AppView {
                                                 s.confirm = Some(Confirm::RemoveMonitor(*id));
                                             }
                                             MenuAction::MonitorInterval(seconds) => {
+                                                let previous = s.monitor.interval;
                                                 s.monitor.interval = *seconds;
                                                 let r = s.monitor.save();
+                                                if r.is_err() { s.monitor.interval = previous; }
                                                 s.notify_error(r, cx);
                                             }
                                             MenuAction::EditHost(h) => {
@@ -723,7 +858,8 @@ impl AppView {
                                         cx.notify();
                                     }))
                             }),
-                    ),
+                    )
+                    .when(interval_menu, |d| d.child(self.muted("Applies to all monitored hosts").px_3().py_2().border_t_1().border_color(self.c(self.col().line)))),
             )
             .into_any_element()
     }
@@ -882,9 +1018,9 @@ impl AppView {
 impl Render for AppView {
     fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.drag_source.is_some() && !cx.has_active_drag() {
-            self.drag_source = None;
-            self.drop_target = None;
+            self.clear_drag();
         }
+        self.prepare_tabs(w, cx);
         self.prepare_auth(w, cx);
         let page = match self.page {
             Page::Hosts => self.hosts_page(cx),
@@ -905,9 +1041,41 @@ impl Render for AppView {
             .font_family("Segoe UI")
             .text_size(px(14.))
             .track_focus(&self.focus)
+            .key_context("TermViAI")
             .capture_key_down(cx.listener(|s, e: &KeyDownEvent, w, cx| {
                 let k = &e.keystroke;
-                if k.key == "escape"
+                if s.picker_key(&k.key, w, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if k.modifiers.control
+                    && !k.modifiers.alt
+                    && !k.modifiers.platform
+                    && k.key == "tab"
+                    && s.drawer.is_none()
+                    && s.confirm.is_none()
+                {
+                    s.cycle_tab(k.modifiers.shift, w, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if s.page == Page::Hosts
+                    && !s.host_selection.is_empty()
+                    && s.menu.is_none()
+                    && s.confirm.is_none()
+                    && s.drawer.is_none()
+                    && !k.modifiers.alt
+                    && !k.modifiers.platform
+                    && (k.key == "enter" || k.key == "escape")
+                {
+                    cx.stop_propagation();
+                    if k.key == "enter" {
+                        s.open_selected_hosts(w, cx);
+                    } else {
+                        s.host_selection.clear();
+                        cx.notify();
+                    }
+                } else if k.key == "escape"
                     && (s.menu.is_some()
                         || s.confirm.is_some()
                         || s.drawer.is_some()
@@ -929,13 +1097,10 @@ impl Render for AppView {
                     if s.drawer.is_some() {
                         s.close_form(w, cx);
                     }
-                    s.drag_source = None;
-                    s.drop_target = None;
+                    s.clear_drag();
                     cx.notify();
                 } else if k.modifiers.control && k.key == "t" {
-                    s.page = Page::NewTab;
-                    s.search.focus_handle(cx).focus(w);
-                    cx.notify();
+                    s.open_new_tab(w, cx);
                     cx.stop_propagation();
                 } else if k.modifiers.control && k.key == "s" && s.drawer.is_none() {
                     if let Page::Terminal(id) = s.page {
@@ -966,26 +1131,11 @@ impl Render for AppView {
                     ),
             )
             .when(!self.load_error.is_empty(), |d| {
-                d.child(
-                    div()
-                        .p_2()
-                        .text_size(px(12.))
-                        .text_color(self.c(self.col().red))
-                        .child(self.load_error.clone()),
-                )
+                d.child(self.notice("Saved data could not be loaded", self.load_error.clone()))
             })
             .when(!self.error.is_empty(), |d| {
                 d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .text_size(px(12.))
-                        .bg(self.c(self.col().card))
-                        .text_color(self.c(self.col().red))
-                        .child(div().flex_1().child(self.error.clone()))
+                    self.notice("Action could not be completed", self.error.clone())
                         .child(
                             self.close("dismiss-error")
                                 .on_click(cx.listener(|s, _, _, cx| {
@@ -995,6 +1145,7 @@ impl Render for AppView {
                         ),
                 )
             })
+            .child(self.tab_picker_view(w, cx))
             .child(self.menu_view(w, cx))
             .child(self.confirm_view(cx))
     }

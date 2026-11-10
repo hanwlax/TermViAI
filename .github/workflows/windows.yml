@@ -65,10 +65,11 @@ jobs:
           workspaces: |
             .
             termviai
+            termviai-gpui
       - name: Configure Perl for native dependencies
         run: Add-Content $env:GITHUB_PATH 'C:\Strawberry\perl\bin'
       - name: Build Windows GUI
-        run: cargo build --locked --release -p wezterm-gui
+        run: cargo build --locked --release --manifest-path termviai-gpui/Cargo.toml
       - name: Test broadcast policy
         run: cargo test --locked --release --manifest-path termviai/Cargo.toml
       - name: Test SSH library
@@ -79,13 +80,13 @@ jobs:
         run: cargo test --locked --release -p wezterm-term --lib -- --test-threads=1
       - name: Test mux
         run: cargo test --locked --release -p mux -- --test-threads=1
-      - name: Test TermViAI GUI behavior
-        run: cargo test --locked --release -p wezterm-gui -- --test-threads=1
+      - name: Test native TermViAI behavior
+        run: cargo test --locked --release --manifest-path termviai-gpui/Cargo.toml --lib -- --test-threads=1
       - name: Upload GUI build
         uses: actions/upload-artifact@v7
         with:
           name: TermViAI-windows-x86_64-build
-          path: target/release/wezterm-gui.exe
+          path: termviai-gpui/target/release/TermViAI.exe
           if-no-files-found: error
           retention-days: 7
 

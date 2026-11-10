@@ -295,6 +295,29 @@ impl Drop for Entry {
     }
 }
 impl Entry {
+    fn new(host: Host) -> Self {
+        Self {
+            host,
+            paused: false,
+            snapshot: None,
+            error: String::new(),
+            updated: None,
+            results: vec![],
+            stopping: false,
+            refresh_pending: false,
+            action_error: String::new(),
+            failure: None,
+            failures: 0,
+            retryable: false,
+            settle_samples: 0,
+            pending_stop: None,
+            job_stop: false,
+            session: None,
+            rx: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            next: Instant::now(),
+        }
+    }
     pub fn busy(&self) -> bool {
         self.rx.is_some()
     }
@@ -321,6 +344,9 @@ impl Entry {
         } else {
             "Connecting"
         }
+    }
+    pub fn needs_attention(&self) -> bool {
+        self.failure == Some(FailureKind::Attention)
     }
     pub fn sampling_failed(&self) -> bool {
         self.failure == Some(FailureKind::Collector)
@@ -495,6 +521,9 @@ impl Monitor {
         m
     }
     pub fn save(&self) -> anyhow::Result<()> {
+        self.save_hosts(self.entries.iter().map(|e| e.host.clone()).collect())
+    }
+    fn save_hosts(&self, hosts: Vec<Host>) -> anyhow::Result<()> {
         ensure!(self.load_error.is_empty(), "{}", self.load_error);
         let path = HostStore::path().with_file_name("monitor.json");
         std::fs::create_dir_all(path.parent().unwrap())?;
@@ -502,7 +531,7 @@ impl Monitor {
         serde_json::to_writer_pretty(
             &mut temp,
             &Preferences {
-                hosts: self.entries.iter().map(|e| e.host.clone()).collect(),
+                hosts,
                 interval: self.interval,
             },
         )?;
@@ -515,28 +544,44 @@ impl Monitor {
     }
     pub fn add(&mut self, host: Host) {
         if !self.contains(&host) {
-            self.entries.push(Entry {
-                host,
-                paused: false,
-                snapshot: None,
-                error: String::new(),
-                updated: None,
-                results: vec![],
-                stopping: false,
-                refresh_pending: false,
-                action_error: String::new(),
-                failure: None,
-                failures: 0,
-                retryable: false,
-                settle_samples: 0,
-                pending_stop: None,
-                job_stop: false,
-                session: None,
-                rx: None,
-                cancel: Arc::new(AtomicBool::new(false)),
-                next: Instant::now(),
-            });
+            self.entries.push(Entry::new(host));
         }
+    }
+    /// Exclude every other monitor while allowing an explicit replacement of this one.
+    pub fn can_select(&self, host: &Host, replacing: Option<&Host>) -> bool {
+        !self.entries.iter().any(|e| {
+            same_host(&e.host, host) && !replacing.is_some_and(|old| same_host(&e.host, old))
+        })
+    }
+    pub fn replace_host(&mut self, original: &Host, host: Host) -> anyhow::Result<()> {
+        self.replace_host_with(original, host, |m, hosts| m.save_hosts(hosts))
+    }
+    fn replace_host_with(
+        &mut self,
+        original: &Host,
+        host: Host,
+        persist: impl FnOnce(&Self, Vec<Host>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let id = self
+            .entries
+            .iter()
+            .position(|e| same_host(&e.host, original))
+            .context("This monitor was removed. Reopen the host picker.")?;
+        ensure!(
+            self.can_select(&host, Some(original)),
+            "This host is already monitored"
+        );
+        let old = &self.entries[id];
+        ensure!(
+            !old.stopping && !old.job_stop && old.pending_stop.is_none(),
+            "Wait for the process action to complete before changing hosts"
+        );
+        let mut hosts: Vec<_> = self.entries.iter().map(|e| e.host.clone()).collect();
+        hosts[id] = host.clone();
+        // Persist first: a disk failure must leave the old monitor and its work intact.
+        persist(self, hosts)?;
+        self.entries[id] = Entry::new(host);
+        Ok(())
     }
     pub fn retry(&mut self, id: usize) {
         if let Some(e) = self.entries.get_mut(id) {
@@ -687,6 +732,77 @@ mod tests {
             },
             &AtomicBool::new(false),
         )
+    }
+    #[test]
+    fn picker_excludes_existing_hosts_and_preserves_account_identity() {
+        let mut m = Monitor::default();
+        let a = Host {
+            label: "a".into(),
+            address: "example.invalid".into(),
+            port: 22,
+            username: "alice".into(),
+            ..Host::default()
+        };
+        let mut b = a.clone();
+        b.username = "bob".into();
+        m.add(a.clone());
+        assert!(!m.can_select(&a, None));
+        assert!(m.can_select(&a, Some(&a)));
+        assert!(m.can_select(&b, None));
+        m.add(b.clone());
+        assert!(!m.can_select(&b, Some(&a)));
+        m.add(a.clone());
+        assert_eq!(m.entries.len(), 2);
+    }
+    #[test]
+    fn rebind_persists_before_cancelling_and_rejects_duplicate_or_inflight_stop() {
+        let mut m = Monitor::default();
+        let a = Host {
+            label: "a".into(),
+            address: "a.invalid".into(),
+            port: 22,
+            ..Host::default()
+        };
+        let b = Host {
+            label: "b".into(),
+            address: "b.invalid".into(),
+            port: 22,
+            ..Host::default()
+        };
+        let c = Host {
+            label: "c".into(),
+            address: "c.invalid".into(),
+            port: 22,
+            ..Host::default()
+        };
+        m.add(a.clone());
+        m.add(b.clone());
+        let cancelled = m.entries[0].cancel.clone();
+        let peer = m.entries[1].cancel.clone();
+        assert!(m
+            .replace_host_with(&a, b.clone(), |_, _| panic!("duplicate must not be saved"))
+            .is_err());
+        assert!(m
+            .replace_host_with(&a, c.clone(), |_, _| anyhow::bail!("disk full"))
+            .is_err());
+        assert_eq!(m.entries[0].host, a);
+        assert!(!cancelled.load(Ordering::Relaxed));
+        m.entries[0].stopping = true;
+        assert!(m
+            .replace_host_with(&a, c.clone(), |_, _| panic!("stop must not be interrupted"))
+            .is_err());
+        m.entries[0].stopping = false;
+        m.replace_host_with(&a, c.clone(), |_, hosts| {
+            assert_eq!(hosts, vec![c.clone(), b.clone()]);
+            Ok(())
+        })
+        .unwrap();
+        assert!(cancelled.load(Ordering::Relaxed));
+        assert!(!peer.load(Ordering::Relaxed));
+        assert_eq!(m.entries[0].host, c);
+        assert!(m.entries[0].snapshot.is_none());
+        assert!(m.entries[0].error.is_empty());
+        assert!(!m.entries[0].paused);
     }
     #[test]
     fn collector_keeps_stdin_open_until_output_and_exit_arrive() {

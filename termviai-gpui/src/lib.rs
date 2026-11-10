@@ -5,6 +5,7 @@ pub mod authentication;
 pub mod broadcast;
 #[path = "../../wezterm-gui/src/forwarding.rs"]
 pub mod forwarding;
+pub mod host_selection;
 #[path = "../../wezterm-gui/src/hosts.rs"]
 pub mod hosts;
 pub mod layout;
@@ -13,6 +14,9 @@ pub mod monitor;
 pub mod monitor_presenter;
 pub mod session;
 pub mod settings;
+pub mod tab_policy;
+pub mod tab_strip;
+pub mod terminal_ime;
 pub mod terminal_keys;
 pub mod theme;
 #[path = "../../wezterm-gui/src/workspaces.rs"]

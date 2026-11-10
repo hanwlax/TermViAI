@@ -722,8 +722,8 @@ impl AppView {
             }))
             .on_drag(drag, move |d: &Drag, _, _, cx| {
                 owner.update(cx, |s, cx| {
+                    s.clear_drag();
                     s.drag_source = Some(d.clone());
-                    s.drop_target = None;
                     cx.notify();
                 });
                 cx.new(|_| d.clone())
@@ -748,16 +748,15 @@ impl AppView {
             .child(div().flex_1().min_h_0().min_w_0().p_1().child(content))
             .on_drag_move::<Drag>(cx.listener(move |s, e: &DragMoveEvent<Drag>, _, cx| {
                 let d = e.drag(cx);
-                let source = d.pane.or_else(|| {
-                    s.tabs
-                        .iter()
-                        .find(|t| t.id == d.tab)
-                        .filter(|t| t.layout.panes().len() == 1)
-                        .map(|t| t.layout.panes()[0])
-                });
-                if source == Some(id) || !e.bounds.contains(&e.event.position) {
+                let source = s.dock_source(d);
+                if source.is_none() || source == Some(id) || !e.bounds.contains(&e.event.position) {
+                    if s.drop_target.is_some_and(|(t, p, _)| t == tab && p == id) {
+                        s.drop_target = None;
+                        cx.notify();
+                    }
                     return;
                 }
+                s.tab_drop_target = None;
                 let u = (e.event.position.x - e.bounds.left()) / e.bounds.size.width;
                 let v = (e.event.position.y - e.bounds.top()) / e.bounds.size.height;
                 let side = if u.min(1. - u) <= v.min(1. - v) {
@@ -774,7 +773,8 @@ impl AppView {
             }))
             .on_drop(cx.listener(move |s, d: &Drag, _, cx| {
                 if let Some((target_tab, target, side)) = s.drop_target {
-                    if target == id {
+                    if target_tab == tab && target == id {
+                        cx.stop_propagation();
                         s.dock(d, target_tab, target, side, cx);
                     }
                 }

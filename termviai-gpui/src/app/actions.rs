@@ -1,6 +1,40 @@
 use super::*;
 use anyhow::{Context as _, ensure};
 impl AppView {
+    pub(super) fn open_selected_hosts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page != Page::Hosts
+            || self.drawer.is_some()
+            || self.menu.is_some()
+            || self.confirm.is_some()
+        {
+            return;
+        }
+        let query = self.search.read(cx).value().to_lowercase();
+        let visible: Vec<_> = self
+            .store
+            .hosts
+            .iter()
+            .filter(|h| {
+                self.store.host_in_group(h, &self.group)
+                    && format!(
+                        "{} {} {} {}",
+                        h.label,
+                        h.address,
+                        h.username,
+                        self.store.group_path(&h.group_id)
+                    )
+                    .to_lowercase()
+                    .contains(&query)
+            })
+            .cloned()
+            .collect();
+        let hosts = self.host_selection.take(&visible);
+        for host in hosts {
+            self.connect(Some(host), window, cx);
+        }
+        cx.notify();
+    }
+
     pub(super) fn change_store(
         &mut self,
         change: impl FnOnce(&mut HostStore) -> anyhow::Result<()>,
@@ -9,6 +43,7 @@ impl AppView {
         let mut store = HostStore::load()?;
         change(&mut store)?;
         store.save()?;
+        self.host_selection.retain(&store.hosts);
         self.store = store;
         Ok(())
     }
@@ -27,8 +62,16 @@ impl AppView {
             self.settings.keepalive(),
         );
         let s = session.clone();
-        let view =
-            cx.new(|cx| TerminalView::new(s, self.settings.font_size(), self.theme, window, cx));
+        let view = cx.new(|cx| {
+            TerminalView::new(
+                s,
+                self.settings.font_size(),
+                self.theme,
+                self.ime_epoch.clone(),
+                window,
+                cx,
+            )
+        });
         cx.subscribe(&view, |s, _, e: &TerminalEvent, cx| match e {
             TerminalEvent::Input(id, input) => s.route_input(*id, input.clone(), cx),
             TerminalEvent::Focused(id) => {
@@ -62,6 +105,9 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.page == Page::NewTab {
+            self.new_tab_open = false;
+        }
         let name = host
             .as_ref()
             .map(|h| h.label.clone())
@@ -71,6 +117,7 @@ impl AppView {
         self.tabs.push(Tab {
             id,
             name,
+            custom_name: false,
             layout: Layout::Pane(pane),
             broadcast: BroadcastState::new([pane]),
             saved: None,
@@ -88,6 +135,9 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.page == Page::NewTab {
+            self.new_tab_open = false;
+        }
         let layout = Layout::restore(&saved.layout, &mut |h| {
             self.spawn_pane(Some(h.clone()), window, cx)
         });
@@ -95,6 +145,14 @@ impl AppView {
         let broadcast = BroadcastState::new(layout.panes());
         self.tabs.push(Tab {
             id,
+            custom_name: saved.name
+                != tab_policy::default_name(
+                    &layout
+                        .visual_panes()
+                        .iter()
+                        .map(|id| self.pane_label(*id))
+                        .collect::<Vec<_>>(),
+                ),
             name: saved.name,
             layout,
             broadcast,
@@ -279,8 +337,16 @@ impl AppView {
                     self.settings.keepalive(),
                 );
                 let s = session.clone();
-                let view =
-                    cx.new(|cx| TerminalView::new(s, self.settings.font_size(), self.theme, w, cx));
+                let view = cx.new(|cx| {
+                    TerminalView::new(
+                        s,
+                        self.settings.font_size(),
+                        self.theme,
+                        self.ime_epoch.clone(),
+                        w,
+                        cx,
+                    )
+                });
                 cx.subscribe(&view, |s, _, e: &TerminalEvent, cx| match e {
                     TerminalEvent::Input(id, input) => s.route_input(*id, input.clone(), cx),
                     TerminalEvent::Focused(id) => {
@@ -349,6 +415,7 @@ impl AppView {
                 self.close_tab(id, cx);
             }
         }
+        self.refresh_tab_names();
         self.confirm = None;
         cx.notify();
     }
@@ -380,12 +447,86 @@ impl AppView {
         }
         cx.notify();
     }
+    fn pane_label(&self, id: usize) -> String {
+        self.panes
+            .get(&id)
+            .and_then(|p| p.host.as_ref())
+            .map(|h| h.label.clone())
+            .unwrap_or_else(|| "Local terminal".into())
+    }
+    fn refresh_tab_names(&mut self) {
+        let names = self
+            .tabs
+            .iter()
+            .map(|t| {
+                tab_policy::default_name(
+                    &t.layout
+                        .visual_panes()
+                        .iter()
+                        .map(|id| self.pane_label(*id))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (tab, name) in self.tabs.iter_mut().zip(names) {
+            if !tab.custom_name {
+                tab.name = name;
+            }
+        }
+    }
+    pub(super) fn dock_source(&self, drag: &Drag) -> Option<usize> {
+        let tab = self.tabs.iter().find(|t| t.id == drag.tab)?;
+        tab_policy::dock_source(&tab.layout, drag.pane).filter(|id| self.panes.contains_key(id))
+    }
+    pub(super) fn clear_drag(&mut self) {
+        self.drag_source = None;
+        self.drop_target = None;
+        self.tab_drop_target = None;
+        self.tab_rail.edge = 0;
+        self.tab_rail.motion = None;
+    }
+    // The same destination rule drives the preview and the committed move.
+    pub(super) fn tab_drop_gap(&self, drag: &Drag, target: usize, after: bool) -> Option<usize> {
+        let from = self.tabs.iter().position(|t| t.id == drag.tab)?;
+        let gap = if target == usize::MAX {
+            self.tabs.len()
+        } else {
+            self.tabs.iter().position(|t| t.id == target)? + usize::from(after)
+        };
+        if drag.pane.is_some() {
+            (self.tabs[from].layout.panes().len() > 1 && self.dock_source(drag).is_some())
+                .then_some(gap)
+        } else {
+            tab_policy::reorder_destination(self.tabs.len(), from, gap).map(|_| gap)
+        }
+    }
+    pub(super) fn drop_on_tab(&mut self, drag: &Drag, target: usize, cx: &mut Context<Self>) {
+        if let Some((id, after)) = self.tab_drop_target.filter(|(id, _)| *id == target) {
+            if let Some(gap) = self.tab_drop_gap(drag, id, after) {
+                if drag.pane.is_some() {
+                    self.detach_pane_at(drag, gap, cx);
+                } else if let Some(from) = self.tabs.iter().position(|t| t.id == drag.tab) {
+                    if let Some(to) = tab_policy::reorder_destination(self.tabs.len(), from, gap) {
+                        let tab = self.tabs.remove(from);
+                        self.tabs.insert(to, tab);
+                    }
+                }
+            }
+        }
+        self.clear_drag();
+        cx.notify();
+    }
     pub(super) fn detach_pane(&mut self, drag: &Drag, cx: &mut Context<Self>) {
+        self.detach_pane_at(drag, self.tabs.len(), cx);
+        self.clear_drag();
+        cx.notify();
+    }
+    fn detach_pane_at(&mut self, drag: &Drag, gap: usize, cx: &mut Context<Self>) {
         let Some(pane) = drag.pane else { return };
         let Some(i) = self.tabs.iter().position(|t| t.id == drag.tab) else {
             return;
         };
-        if self.tabs[i].layout.panes().len() < 2 {
+        if self.tabs[i].layout.panes().len() < 2 || self.dock_source(drag) != Some(pane) {
             return;
         }
         let Some(layout) = self.tabs[i].layout.clone().remove(pane) else {
@@ -401,20 +542,24 @@ impl AppView {
             .as_ref()
             .map(|h| h.label.clone())
             .unwrap_or("Local terminal".into());
-        self.tabs.push(Tab {
-            id,
-            name,
-            layout: Layout::Pane(pane),
-            broadcast: BroadcastState::new([pane]),
-            saved: None,
-            tray: false,
-            tray_motion: None,
-            zoom: None,
-        });
+        self.tabs.insert(
+            gap.min(self.tabs.len()),
+            Tab {
+                id,
+                name,
+                custom_name: false,
+                layout: Layout::Pane(pane),
+                broadcast: BroadcastState::new([pane]),
+                saved: None,
+                tray: false,
+                tray_motion: None,
+                zoom: None,
+            },
+        );
         self.page = Page::Terminal(id);
         self.focused = Some(pane);
-        self.drag_source = None;
-        self.drop_target = None;
+        self.refresh_tab_names();
+        self.clear_drag();
         cx.notify();
     }
     pub(super) fn dock(
@@ -425,13 +570,7 @@ impl AppView {
         side: Side,
         cx: &mut Context<Self>,
     ) {
-        let source = drag.pane.or_else(|| {
-            self.tabs
-                .iter()
-                .find(|t| t.id == drag.tab)
-                .filter(|t| t.layout.panes().len() == 1)
-                .map(|t| t.layout.panes()[0])
-        });
+        let source = self.dock_source(drag);
         let Some(source) = source else { return };
         if source == target {
             return;
@@ -458,8 +597,8 @@ impl AppView {
             self.page = Page::Terminal(target_tab);
             self.focused = Some(source);
         }
-        self.drag_source = None;
-        self.drop_target = None;
+        self.refresh_tab_names();
+        self.clear_drag();
         cx.notify();
     }
     pub(super) fn confirm_action(&mut self, w: &mut Window, cx: &mut Context<Self>) {

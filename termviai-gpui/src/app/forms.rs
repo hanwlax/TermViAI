@@ -1,6 +1,274 @@
 use super::*;
 use anyhow::{Context as _, ensure};
 impl AppView {
+    fn validate_form_fields(&self, f: &Form, cx: &Context<Self>) -> BTreeMap<&'static str, String> {
+        let mut errors = BTreeMap::new();
+        let required: Vec<(&'static str, &'static str)> = match &f.kind {
+            FormKind::Host(_) => vec![("address", "Enter an IP address or hostname.")],
+            FormKind::Key(_) => vec![
+                ("label", "Enter a key name."),
+                ("path", "Enter a private key path."),
+            ],
+            FormKind::Identity(old) => {
+                if old.is_none() {
+                    vec![
+                        ("label", "Enter an identity name."),
+                        ("user", "Enter a username."),
+                        ("password", "Enter a password."),
+                    ]
+                } else {
+                    vec![
+                        ("label", "Enter an identity name."),
+                        ("user", "Enter a username."),
+                    ]
+                }
+            }
+            FormKind::Group(_) | FormKind::Rename(_) | FormKind::Forward(_) => {
+                vec![("label", "Enter a name.")]
+            }
+            _ => vec![],
+        };
+        for (key, message) in required {
+            let value = self.input(f, key, cx);
+            if (key == "password" && value.is_empty())
+                || (key != "password" && value.trim().is_empty())
+            {
+                errors.insert(key, message.into());
+            }
+        }
+        for key in ["port", "remote", "local"] {
+            if f.fields.contains_key(key)
+                && self
+                    .input(f, key, cx)
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|p| *p > 0)
+                    .is_none()
+            {
+                errors.insert(key, "Enter a port from 1 to 65535.".into());
+            }
+        }
+        errors
+    }
+    fn monitor_host_picker(&self, f: &Form, cx: &mut Context<Self>) -> AnyElement {
+        let replacing = match &f.kind {
+            FormKind::MonitorReplace(h) => Some(h),
+            _ => None,
+        };
+        let query = self.input(f, "search", cx).to_lowercase();
+        let matches = |h: &&Host| {
+            format!(
+                "{} {} {} {}",
+                h.label,
+                h.address,
+                h.username,
+                self.store.group_path(&h.group_id)
+            )
+            .to_lowercase()
+            .contains(&query)
+        };
+        let all_available: Vec<_> = self
+            .store
+            .hosts
+            .iter()
+            .filter(|h| self.monitor.can_select(h, replacing))
+            .collect();
+        let mut available: Vec<_> = all_available.iter().copied().filter(matches).collect();
+        available.sort_by_key(|h| (self.store.group_path(&h.group_id), h.label.clone()));
+        let added: Vec<_> = self
+            .store
+            .hosts
+            .iter()
+            .filter(|h| !self.monitor.can_select(h, replacing))
+            .filter(matches)
+            .collect();
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(self.muted(if replacing.is_some() {
+                "Replace this monitor's saved host reference."
+            } else {
+                "Choose from hosts not yet in Monitor."
+            }))
+            .child(self.field(f, "search", "Search hosts"));
+        if self.store.hosts.is_empty() {
+            body = body.child(
+                self.empty_state(
+                    IconName::SquareTerminal,
+                    "No saved hosts yet",
+                    "Add an SSH host in Hosts, then return here to monitor it.",
+                )
+                .child(
+                    self.action_button("picker-create-host", "Add host", IconName::Plus)
+                        .on_click(cx.listener(|s, _, w, cx| {
+                            s.page = Page::Hosts;
+                            s.open_form(FormKind::Host(None), w, cx);
+                        })),
+                ),
+            );
+        } else if available.is_empty() {
+            body = body.child(if query.is_empty() && all_available.is_empty() {
+                self.empty_state(
+                    IconName::CircleCheck,
+                    "All hosts are already monitored",
+                    "Newly saved hosts will appear here.",
+                )
+            } else {
+                self.empty_state(
+                    IconName::Search,
+                    "No available hosts match",
+                    "Try a host name, address or group.",
+                )
+                .child(
+                    self.button("picker-clear-search", "Clear search")
+                        .on_click(cx.listener(|s, _, w, cx| {
+                            if let Some(input) = s
+                                .drawer
+                                .as_ref()
+                                .and_then(|f| f.fields.get("search"))
+                                .cloned()
+                            {
+                                input.update(cx, |i, cx| i.set_value("", w, cx));
+                            }
+                        })),
+                )
+            });
+        }
+        let mut group: Option<String> = None;
+        for (i, h) in available.into_iter().enumerate() {
+            let path = self.store.group_path(&h.group_id);
+            if group.as_ref() != Some(&path) {
+                body = body.child(
+                    self.muted(if path.is_empty() {
+                        "All Hosts".to_owned()
+                    } else {
+                        path.clone()
+                    })
+                    .mt_3(),
+                );
+                group = Some(path);
+            }
+            let host = h.clone();
+            let selected = f.selected.iter().any(|p| monitor::same_host(p, h));
+            body = body.child(
+                div()
+                    .id(("monitor-host-choice", i))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .p_3()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(self.c(if selected {
+                        self.col().soft
+                    } else {
+                        self.col().bg
+                    }))
+                    .hover(|d| d.bg(self.c(self.col().hover)))
+                    .child(
+                        div()
+                            .size(px(16.))
+                            .border_1()
+                            .rounded_sm()
+                            .border_color(self.c(self.col().muted))
+                            .flex_shrink_0()
+                            .when(selected, |d| {
+                                d.child(
+                                    Icon::new(IconName::Check)
+                                        .size(px(14.))
+                                        .text_color(self.c(self.col().accent)),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(h.label.clone())
+                            .child(self.muted(format!("{}@{}", h.username, h.endpoint()))),
+                    )
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        let Some(f) = s.drawer.as_ref() else { return };
+                        let old = match &f.kind {
+                            FormKind::MonitorReplace(h) => Some(h),
+                            _ => None,
+                        };
+                        if !s.monitor.can_select(&host, old) {
+                            return;
+                        }
+                        s.edit_form(
+                            None,
+                            |f| {
+                                if matches!(f.kind, FormKind::MonitorReplace(_)) {
+                                    f.selected = vec![host.clone()];
+                                } else if let Some(i) =
+                                    f.selected.iter().position(|h| monitor::same_host(h, &host))
+                                {
+                                    f.selected.remove(i);
+                                } else {
+                                    f.selected.push(host.clone());
+                                }
+                            },
+                            cx,
+                        );
+                    })),
+            );
+        }
+        if !added.is_empty() {
+            body = body.child(
+                div()
+                    .mt_3()
+                    .pt_3()
+                    .border_t_1()
+                    .border_color(self.c(self.col().line))
+                    .child(
+                        self.action_button(
+                            "monitor-added-disclosure",
+                            format!("Already in Monitor · {}", added.len()),
+                            if f.show_added {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            },
+                        )
+                        .bg(self.c(self.col().bg))
+                        .border_0()
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            s.edit_form(None, |f| f.show_added = !f.show_added, cx)
+                        })),
+                    ),
+            );
+            if f.show_added {
+                body = body.children(added.iter().map(|h| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .px_3()
+                        .py_2()
+                        .child(
+                            Icon::new(IconName::Check)
+                                .size(px(15.))
+                                .text_color(self.c(self.col().green)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(self.muted(h.label.clone()))
+                                .child(self.muted(h.endpoint())),
+                        )
+                        .child(self.muted("Added"))
+                }));
+            }
+        }
+        if replacing.is_some() {
+            body = body.child(self.muted("Changes only this monitor's host reference. Saved hosts and terminal sessions stay unchanged.").mt_3());
+        }
+        body.into_any_element()
+    }
+
     pub(super) fn make_form(&self, kind: FormKind, w: &mut Window, cx: &mut Context<Self>) -> Form {
         let mut f = Form {
             kind: kind.clone(),
@@ -19,6 +287,8 @@ impl AppView {
             retry: true,
             challenges: vec![],
             challenge_stamp: 0,
+            show_added: false,
+            field_errors: BTreeMap::new(),
         };
         let mut fields: Vec<(&'static str, String, &'static str, bool)> = vec![];
         match &kind {
@@ -154,7 +424,9 @@ impl AppView {
                 f.group = group.clone();
                 fields.push(("search", String::new(), "Search hosts", false));
             }
-            FormKind::Monitor => fields.push(("search", String::new(), "Search hosts", false)),
+            FormKind::Monitor | FormKind::MonitorReplace(_) => {
+                fields.push(("search", String::new(), "Search hosts", false))
+            }
             FormKind::Forward(original) => {
                 let r = original.clone();
                 if let Some(r) = &r {
@@ -261,8 +533,17 @@ impl AppView {
             .child(
                 Input::new(input)
                     .bg(self.c(self.col().field))
-                    .when(key == "password", |i| i.mask_toggle()),
+                    .when(key == "password", |i| i.mask_toggle())
+                    .when(f.field_errors.contains_key(key), |i| {
+                        i.border_color(self.c(self.col().red))
+                    }),
             )
+            .when_some(f.field_errors.get(key), |d, message| {
+                d.child(
+                    self.muted(message.clone())
+                        .text_color(self.c(self.col().red)),
+                )
+            })
             .into_any_element()
     }
     fn authentication_fields(
@@ -365,7 +646,11 @@ impl AppView {
                                 }))
                         }))
                         .when(self.store.identities.is_empty(), |d| {
-                            d.child(self.muted("No saved identities. Add one in Keychain."))
+                            d.child(self.compact_state(
+                                IconName::CircleUser,
+                                "No saved identities",
+                                "Add an identity in Keychain to use it here.",
+                            ))
                         }),
                 );
             }
@@ -433,7 +718,11 @@ impl AppView {
                     }))
             }))
             .when(self.store.keys.is_empty(), |d| {
-                d.child(self.muted("No saved keys. Add one in Keychain."))
+                d.child(self.compact_state(
+                    IconName::File,
+                    "No saved keys",
+                    "Add a private key path in Keychain to use it here.",
+                ))
             })
             .into_any_element()
     }
@@ -510,7 +799,10 @@ impl AppView {
                     );
                 }
             }
-            FormKind::Existing(_) | FormKind::Monitor | FormKind::Forward(_) => {
+            FormKind::Monitor | FormKind::MonitorReplace(_) => {
+                body = body.child(self.monitor_host_picker(f, cx));
+            }
+            FormKind::Existing(_) | FormKind::Forward(_) => {
                 if matches!(f.kind, FormKind::Forward(_)) {
                     body = body
                         .child(self.field(f, "label", "Service name"))
@@ -593,12 +885,14 @@ impl AppView {
             }
         }
         if !f.error.is_empty() {
-            body = body.child(
-                div()
-                    .text_color(self.c(self.col().red))
-                    .text_size(px(12.))
-                    .child(f.error.clone()),
-            );
+            body = body.child(self.notice(
+                if matches!(f.kind, FormKind::Auth(_)) {
+                    "Authentication needs attention"
+                } else {
+                    "Could not save changes"
+                },
+                f.error.clone(),
+            ));
         }
         body.into_any_element()
     }
@@ -645,9 +939,31 @@ impl AppView {
             FormKind::Rename(_) => "Rename Tab",
             FormKind::Existing(_) => "Add Existing Hosts",
             FormKind::Monitor => "Add to Monitor",
+            FormKind::MonitorReplace(_) => "Choose current host",
             FormKind::Forward(Some(_)) => "Edit Service",
             FormKind::Forward(None) => "Add Service",
             _ => "Authentication",
+        };
+        let monitor_form = matches!(f.kind, FormKind::Monitor | FormKind::MonitorReplace(_));
+        let replacement = match &f.kind {
+            FormKind::MonitorReplace(h) => Some(h),
+            _ => None,
+        };
+        let selected_count = f
+            .selected
+            .iter()
+            .filter(|h| self.monitor.can_select(h, replacement) && self.store.hosts.contains(h))
+            .count();
+        let save_enabled = !monitor_form || selected_count > 0;
+        let save_label = if replacement.is_some() {
+            "Use host".to_owned()
+        } else if monitor_form {
+            format!(
+                "Add {selected_count} {}",
+                if selected_count == 1 { "host" } else { "hosts" }
+            )
+        } else {
+            "Save".to_owned()
         };
         let delete = match &f.kind {
             FormKind::Key(Some(k)) => Some(Confirm::Key(k.clone())),
@@ -677,7 +993,7 @@ impl AppView {
                     .relative()
                     .flex_shrink_0()
                     .occlude()
-                    .w(px(420.))
+                    .w(px(if monitor_form { 392. } else { 420. }))
                     .max_w_full()
                     .h_full()
                     .bg(self.c(self.col().bg))
@@ -735,17 +1051,28 @@ impl AppView {
                                         })),
                                 )
                             })
+                            .when(monitor_form, |d| {
+                                d.child(self.muted(format!("{selected_count} selected")))
+                            })
                             .child(div().flex_1())
                             .child(
                                 self.button("cancel", "Cancel")
                                     .on_click(cx.listener(|s, _, w, cx| s.close_form(w, cx))),
                             )
                             .child(
-                                self.button("save", "Save")
-                                    .hover(|d| {
-                                        d.bg(self.c(self.col().accent)).text_color(rgb(0xffffff))
+                                self.button("save", save_label)
+                                    .when(!save_enabled, |d| d.opacity(0.45).cursor_default())
+                                    .when(save_enabled, |d| {
+                                        d.hover(|d| {
+                                            d.bg(self.c(self.col().soft))
+                                                .text_color(self.c(self.col().accent))
+                                        })
                                     })
-                                    .on_click(cx.listener(|s, _, w, cx| s.save_form(w, cx))),
+                                    .on_click(cx.listener(move |s, _, w, cx| {
+                                        if save_enabled {
+                                            s.save_form(w, cx);
+                                        }
+                                    })),
                             ),
                     ),
             )
@@ -753,6 +1080,18 @@ impl AppView {
     }
     pub(super) fn save_form(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let Some(f) = self.drawer.clone() else { return };
+        let errors = self.validate_form_fields(&f, cx);
+        if let Some(form) = &mut self.drawer {
+            form.field_errors = errors.clone();
+            form.error.clear();
+        }
+        if let Some(key) = errors.keys().next() {
+            if let Some(input) = f.fields.get(key) {
+                input.focus_handle(cx).focus(w);
+            }
+            cx.notify();
+            return;
+        }
         let result = (|| -> anyhow::Result<()> {
             match &f.kind {
                 FormKind::Host(original) => {
@@ -911,18 +1250,38 @@ impl AppView {
                 FormKind::Rename(id) => {
                     let name = self.input(&f, "label", cx);
                     ensure!(!name.trim().is_empty(), "Enter a tab name");
-                    if let Some(t) = self.tabs.iter_mut().find(|t| t.id == *id) {
-                        if let Some(id) = &t.saved {
-                            self.workspaces.rename_saved(id, &name)?;
-                        }
-                        t.name = name;
-                    }
+                    let t = self
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.id == *id)
+                        .context("Tab closed")?;
+                    t.name = name.trim().to_owned();
+                    t.custom_name = true;
                 }
                 FormKind::Monitor => {
+                    ensure!(!f.selected.is_empty(), "Choose at least one host");
+                    ensure!(
+                        f.selected.iter().all(|h| self.store.hosts.contains(h)),
+                        "A host changed; reopen the host picker"
+                    );
+                    let old_len = self.monitor.entries.len();
                     for h in &f.selected {
                         self.monitor.add(h.clone());
                     }
-                    self.monitor.save()?;
+                    if let Err(e) = self.monitor.save() {
+                        self.monitor.entries.truncate(old_len);
+                        return Err(e);
+                    }
+                }
+                FormKind::MonitorReplace(original) => {
+                    let host = f.selected.first().context("Choose a host")?;
+                    ensure!(
+                        self.store.hosts.contains(host),
+                        "The host changed; reopen the host picker"
+                    );
+                    self.monitor.replace_host(original, host.clone())?;
+                    self.monitor_reason = None;
+                    self.monitor_technical = false;
                 }
                 FormKind::Forward(old) => {
                     let host = f.selected.first().cloned().context("Choose a host")?;

@@ -3,6 +3,8 @@ mod chrome;
 mod forms;
 mod monitor_view;
 mod pages;
+mod states;
+mod tabs;
 mod validation;
 mod workspace;
 use crate::terminal_view::{TerminalEvent, TerminalView};
@@ -26,6 +28,7 @@ use termviai_gpui::{
     monitor,
     session::{self, Session},
     settings::Settings,
+    tab_policy, tab_strip,
     theme::{Colors, Theme},
     workspaces::*,
 };
@@ -42,6 +45,7 @@ pub enum Page {
 pub struct Tab {
     id: usize,
     name: String,
+    custom_name: bool,
     layout: Layout,
     broadcast: BroadcastState<usize>,
     saved: Option<String>,
@@ -101,6 +105,7 @@ pub enum FormKind {
     Rename(usize),
     Existing(String),
     Monitor,
+    MonitorReplace(Host),
     Forward(Option<forwarding::Rule>),
     Auth(usize),
 }
@@ -122,6 +127,8 @@ pub struct Form {
     retry: bool,
     challenges: Vec<Entity<InputState>>,
     challenge_stamp: u64,
+    show_added: bool,
+    field_errors: BTreeMap<&'static str, String>,
 }
 #[derive(Clone)]
 pub enum MenuKind {
@@ -185,19 +192,28 @@ pub struct AppView {
     group: String,
     sidebar: bool,
     search: Entity<InputState>,
+    host_selection: termviai_gpui::host_selection::HostSelection,
     tabs: Vec<Tab>,
     panes: HashMap<usize, Pane>,
     next_id: usize,
     focused: Option<usize>,
+    ime_epoch: termviai_gpui::terminal_ime::ImeEpoch,
     drawer: Option<Form>,
     menu: Option<(MenuKind, Point<Pixels>)>,
     confirm: Option<Confirm>,
     focus: FocusHandle,
     drag_source: Option<Drag>,
     drop_target: Option<(usize, usize, Side)>,
+    tab_drop_target: Option<(usize, bool)>,
+    tab_rail: tabs::TabRail,
+    tab_search: Entity<InputState>,
+    tab_picker: bool,
+    tab_picker_index: usize,
+    new_tab_open: bool,
     monitor: monitor::Monitor,
     monitor_detail: Option<(usize, Option<u32>, Option<u32>)>,
     monitor_reason: Option<usize>,
+    monitor_technical: bool,
     forwarding: Vec<forwarding::View>,
     forwarding_error: String,
     last_tick: Instant,
@@ -222,12 +238,30 @@ impl AppView {
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Search hosts or connect with user@hostname")
         });
-        cx.observe(&search, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(
+            &search,
+            |s, _, event: &gpui_component::input::InputEvent, cx| {
+                if matches!(event, gpui_component::input::InputEvent::Change) {
+                    s.host_selection.clear();
+                }
+                cx.notify();
+            },
+        )
+        .detach();
         cx.subscribe_in(
             &search,
             window,
             |s, _, event: &gpui_component::input::InputEvent, w, cx| {
                 if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
+                    if s.page == Page::Hosts
+                        && !s.host_selection.is_empty()
+                        && s.drawer.is_none()
+                        && s.menu.is_none()
+                        && s.confirm.is_none()
+                    {
+                        s.open_selected_hosts(w, cx);
+                        return;
+                    }
                     let text = s.search.read(cx).value().to_string();
                     match Host::quick_connect(&text) {
                         Ok(h) => s.connect(Some(h), w, cx),
@@ -236,6 +270,23 @@ impl AppView {
                             cx.notify();
                         }
                     }
+                }
+            },
+        )
+        .detach();
+        let tab_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search name or host…"));
+        cx.subscribe(
+            &tab_search,
+            |s, _, event: &gpui_component::input::InputEvent, cx| {
+                if matches!(event, gpui_component::input::InputEvent::Change) {
+                    let query = s.tab_search.read(cx).value().to_string();
+                    if query != s.tab_rail.query {
+                        s.tab_rail.query = query;
+                        s.tab_picker_index = 0;
+                        s.scrollers["tab-picker"].set_offset(point(px(0.), px(0.)));
+                    }
+                    cx.notify();
                 }
             },
         )
@@ -275,24 +326,34 @@ impl AppView {
             group: String::new(),
             sidebar: true,
             search,
+            host_selection: Default::default(),
             tabs: vec![],
             panes: HashMap::new(),
             next_id: 1,
             focused: None,
+            ime_epoch: termviai_gpui::terminal_ime::ImeEpoch::install(window),
             drawer: None,
             menu: None,
             confirm: None,
             focus: cx.focus_handle(),
             drag_source: None,
             drop_target: None,
+            tab_drop_target: None,
+            tab_rail: tabs::TabRail::default(),
+            tab_search,
+            tab_picker: false,
+            tab_picker_index: 0,
+            new_tab_open: false,
             monitor: monitor::Monitor::load(),
             monitor_detail: None,
             monitor_reason: None,
+            monitor_technical: false,
             forwarding: vec![],
             forwarding_error: String::new(),
             last_tick: Instant::now(),
             quit_allowed: false,
             scrollers: [
+                "tab-picker",
                 "hosts-page",
                 "keychain-page",
                 "new-tab-page",

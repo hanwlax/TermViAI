@@ -6710,7 +6710,7 @@ version = "0.1.0"
 
 [[package]]
 name = "termviai-gpui"
-version = "0.1.0"
+version = "0.1.0-beta.8"
 dependencies = [
  "anyhow",
  "base64",

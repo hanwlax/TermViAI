@@ -2,9 +2,25 @@
 
 ## Architecture and scope
 
-The production terminal core, SSH libraries and PTY implementation are path dependencies. Hosts, workspaces, authentication control, Monitor and Forwarding compile directly from their existing source files. Native GPUI elements own layout, input focus, painting and application navigation. This is a separate trial executable; the production executable was not replaced.
+The production terminal core, SSH libraries and PTY implementation are path dependencies. Hosts, workspaces, authentication control, Monitor and Forwarding compile directly from their existing source files. Native GPUI elements own layout, input focus, painting and application navigation. This was initially a separate trial executable. As of v0.1.0-beta.8, the native frontend is published as TermViAI.exe; the trial-era validation entries below remain historical evidence.
 
 The previous probe's vt100 parser, example host library and navigation were not adopted. Resolved Cargo metadata contains no WebView, Wry, Tauri or vt100 package. The PE import table contains Windows system libraries; no Chromium runtime is bundled.
+
+## Host multi-selection · 2026-11-10
+
+- Hosts cards support Ctrl+left-click toggle with themed selected surfaces, borders and check marks. Plain click still opens one connection. Existing menu buttons stop propagation and do not toggle selection.
+- Enter consumes the selection before opening individual tabs in current store/list order. Root key handling is scoped to Hosts with no menu/dialog; search input Enter uses the same batch path when selections exist. Terminal keys and form submission retain their existing behavior. Escape or Clear cancels selection.
+- Search edits and group/page navigation clear selection. Store changes discard changed/deleted selected records; selection uses complete Host records rather than recycled filtered indices or labels. The selection summary shares the breadcrumb toolbar rather than inserting a new row above the cards at normal window widths.
+- Windows Release build and library suite passed: 75 passed, 0 failed, 3 ignored. New regressions cover selection toggle/list ordering/one-shot consumption, changed/deleted records, separate accounts and cancellation. A final UI-only visible-host filter was release-built after the suite. No computer-use or visible application launch is used; native pointer behavior remains unverified on screen.
+
+## Empty states and Monitor refinement · 2026-11-10
+
+- Implements the approved `termviai-states-monitor-refinement.html` interaction proposal: shared small-icon empty states for Hosts/search/groups, Keychain, workspaces/recent connections, Forwarding, Monitor and process lists; field-local required/port errors and neutral action-error notices. Existing blank Host-label defaults and password semantics remain supported.
+- Monitor uses typed collection/connection/attention failures plus the saved-host reference to choose a recovery action. Missing/changed hosts offer explicit replacement or removal, ordinary failures retain retry/pause, and technical errors expand locally. A failed collection is never presented as an idle NPU.
+- The 392px Monitor picker groups available hosts and excludes already monitored entries from selection; existing entries are available through a read-only disclosure. No saved hosts, no matches and all-added states have distinct messages. Save counts eligible selections and revalidates Host records. Replacement persists first, cancels the old collection only after success, rejects duplicates/in-flight process actions and preserves index/other monitors.
+- Sampling is a single clock / Every Ns / chevron control. Its menu marks the current 2/5/10-second choice and explains its scope; failed preference persistence restores the previous interval.
+- All colors follow the current Ink/Navy/Light palette, action buttons stay neutral until hover, and titlebar controls remain outside drawers. Validation is through source inspection, background Windows compilation and tests; no computer-use, app window launch, remote process action or on-screen visual/interaction verification is performed.
+- Executed: final Windows MSVC Release build succeeded. Library regression suite: 72 passed, 0 failed, 3 ignored; remote collector/forwarding Python suite: 34 passed. New cases cover picker account identity/duplicate exclusion, replacement persistence failure and cancellation, in-flight stop rejection, and stale-reference classification without parsing error text.
 
 ## Terminal Tab routing · 2026-11-09
 
@@ -73,3 +89,29 @@ Four idle local terminals, 1280×820 client area, 100% scale: 56.7 MiB working s
 Run `cargo test --locked --release --lib -- --test-threads=1` from the nested workspace. For SSH integration, start `tests/ssh_fixture.py` with Paramiko using a disposable directory, copy its generated keys to the Windows fixture directory, set `TERMVIAI_AUTH_FIXTURE`, and explicitly run `loopback_authentication_recovery` and `ssh_pty_adapter` with `--ignored --test-threads=1`.
 
 Native page inspection is opt-in: `--validation-page <scene>` also requires `--data-dir` and a `.gpui-validation` marker in that directory. It never runs on normal startup. Available scenes are in `src/app/validation.rs`; fixture records use documentation-only addresses and contain no usable credentials.
+
+## Tab/group follow-up · 2026-11-10
+
+- Group titles follow the legacy member-count format and refresh after docking, detaching and closing panes; user-renamed titles survive layout changes. Restored names differing from the default are treated as custom.
+- Rename Tab edits the live title independently of saved-workspace existence. Explicit Save Workspace persists the current name/layout; a deleted saved reference no longer blocks a local rename.
+- Dock previews and committed docking share source-membership validation. Whole groups remain sortable in the tab bar but never show a terminal docking preview; individual group panes remain dockable.
+- Tab left/right halves choose the insertion gap. The marker and commit share index adjustment, including hidden markers for both no-op gaps. Dragging a group pane to a tab edge, + or blank titlebar detaches it using the same pane/session, without reconnecting. The remaining group updates its default name.
+- Executed: Windows x86_64 MSVC Release build succeeded; 79 library tests passed, 0 failed, 3 external-environment tests ignored. Four new cases cover naming, docking eligibility, insertion/no-op boundaries and detached pane identity/layout. Source/mirror and archive integrity checks accompany the trial.
+- No application window or computer-use interaction was used. Actual on-screen pointer/focus behavior and drag smoothness remain manually unverified. The prior tab-overflow UX remains unimplemented pending approval.
+
+## Approved tab-overflow UX · 2026-11-10
+
+- Implements the approved single-row rail: 242px terminal tabs, overflow-only left/right buttons and searchable All tabs count button, fixed visible + and native window controls. Arrow/discrete wheel scrolling uses 160ms easing; precise trackpad deltas stay direct. Scroll offsets are clipped without GPUI's second immediate wheel handler.
+- Active tabs are revealed on selection, connect/restore, list changes and window resize. Manual browsing does not snap back on ordinary updates. Dragging near the rail edges scrolls at a time-based rate; insertion positions are recomputed against the scrolled viewport and reuse the prior no-op/group restrictions.
+- All tabs searches live names and all grouped host labels/addresses/accounts. Current-tab checkmark, offline indicator, hover-only close controls, close confirmation and no-results state use existing theme tokens. New Tab remains a single selectable placeholder until used/closed.
+- Search keeps its neutral border when focused (`focus_bordered(false)`), per the approval correction. Up/Down/Enter/Escape are scoped to this picker, including the child Input context; Ctrl+Tab / Ctrl+Shift+Tab cycle open tabs. Other input fields and terminal Tab remain covered by regression checks.
+- Executed: Windows x86_64 MSVC Release build succeeded; 84 library tests passed, 0 failed, 3 external-environment tests ignored. The initial keyboard-precedence regression failed and led to adding a descendant Input context; the final rerun passed. Five added regressions cover overflow control reservation, reveal/clamp behavior, scrolled insertion/edge limits, cycling and keyboard scope.
+- No computer-use or application window launch. On-screen geometry, actual focus interactions and perceived animation smoothness have not been manually verified; source/mirror and archive integrity checks accompany the trial. The previous pending-approval note is superseded by this approved implementation. A final UI-only adjustment appends the scrollbar after list rows to preserve ScrollHandle row indexes; that adjustment was release-built again.
+
+## Windows IME / terminal scrollbar pointer · 2026-11-10
+
+- Source diagnosis: GPUI 0.2.2 handles `WM_IME_COMPOSITION`, including explicit empty composition, but does not forward `WM_IME_ENDCOMPOSITION` to terminal unmark. TerminalView kept painting its stale preedit and rejected keydown while that string was nonempty, matching the reported phantom candidate text and ignored Enter.
+- Added a window-local subclass observer for composition-end/language-change notifications. It only advances a shared epoch, delegates native processing and releases its state on window destruction. It does not enter GPUI from the native callback or change system keyboard settings. The existing terminal refresh loop, render and keydown reconcile the epoch. New composition records its own epoch so an earlier cancellation cannot erase it; blur also clears terminal preedit. Only explicit nonempty IME commit text reaches the session.
+- Terminal scrollbar edge hover and active thumb dragging use PointingHand; normal terminal text keeps IBeam. No desktop cursor automation was performed.
+- Executed: Windows MSVC Release build succeeded. 88 library tests passed, 0 failed, 3 external-environment tests ignored. New tests cover cancellation, explicit commit/UTF-16 selection, rapid restart, and actual Windows end/language messages plus hook lifetime on an invisible test window. This test neither calls ShowWindow nor changes the user's input method or foreground window.
+- No computer-use or visible application launch. Actual third-party IME switching and scrollbar pointer appearance remain manually unverified on screen. Package/source integrity is checked separately.

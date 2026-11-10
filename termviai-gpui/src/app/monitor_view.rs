@@ -14,6 +14,143 @@ fn can_stop(e: &monitor::Entry, ps: &[monitor::Process]) -> bool {
         && ps.iter().all(|p| p.controllable && !p.token.is_empty())
 }
 impl AppView {
+    fn monitor_problem(&self, id: usize, cx: &mut Context<Self>) -> AnyElement {
+        use termviai_gpui::monitor_presenter::{Issue, issue};
+        let e = &self.monitor.entries[id];
+        let problem = issue(e, &self.store);
+        let host = e.host.clone();
+        let mut actions = div().flex().flex_wrap().gap_2();
+        if problem == Issue::MissingHost {
+            actions = actions
+                .child(
+                    self.action_button("monitor-choose-host", "Choose host", IconName::Replace)
+                        .on_click(cx.listener(move |s, _, w, cx| {
+                            s.open_form(FormKind::MonitorReplace(host.clone()), w, cx)
+                        })),
+                )
+                .child(
+                    self.button("monitor-remove-missing", "Remove monitor")
+                        .bg(self.c(self.col().card))
+                        .border_0()
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            s.confirm = Some(Confirm::RemoveMonitor(id));
+                            cx.notify();
+                        })),
+                );
+        } else {
+            if problem == Issue::Attention {
+                actions = actions.child(
+                    self.action_button(
+                        "monitor-open-host",
+                        "Open terminal",
+                        IconName::SquareTerminal,
+                    )
+                    .on_click(cx.listener(move |s, _, w, cx| s.connect(Some(host.clone()), w, cx))),
+                );
+            }
+            actions = actions.child(
+                self.action_button(
+                    "monitor-retry-state",
+                    if problem == Issue::Collector {
+                        "Retry collection"
+                    } else {
+                        "Retry now"
+                    },
+                    IconName::Redo,
+                )
+                .when(e.busy(), |d| d.opacity(0.45).cursor_default())
+                .on_click(cx.listener(move |s, _, _, cx| {
+                    if s.monitor.entries.get(id).is_some_and(|e| !e.busy()) {
+                        s.monitor.retry(id);
+                    }
+                    cx.notify();
+                })),
+            );
+            if !e.paused && !e.needs_attention() {
+                actions = actions.child(
+                    self.button("monitor-pause-retries", "Pause retries")
+                        .border_0()
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            if let Some(e) = s.monitor.entries.get_mut(id) {
+                                e.paused = true;
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        let mut copy = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(px(16.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(problem.title()),
+            )
+            .child(self.muted(problem.description()).text_size(px(13.)))
+            .when(problem != Issue::MissingHost, |d| {
+                d.child(self.muted(e.recovery_hint()))
+            })
+            .child(actions)
+            .child(
+                self.action_button(
+                    "monitor-technical-toggle",
+                    "Technical details",
+                    if self.monitor_technical {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    },
+                )
+                .border_0()
+                .text_size(px(12.))
+                .text_color(self.c(self.col().muted))
+                .on_click(cx.listener(|s, _, _, cx| {
+                    s.monitor_technical = !s.monitor_technical;
+                    cx.notify();
+                })),
+            );
+        if self.monitor_technical {
+            copy = copy.child(
+                div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(self.c(self.col().field))
+                    .text_size(px(12.))
+                    .text_color(self.c(self.col().muted))
+                    .child(e.error.clone()),
+            );
+        }
+        div()
+            .w_full()
+            .flex_shrink_0()
+            .max_w(px(580.))
+            .mx_auto()
+            .mt(px(42.))
+            .p_6()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.c(self.col().line))
+            .bg(self.c(self.col().card))
+            .flex()
+            .items_start()
+            .gap_4()
+            .child(self.state_icon(
+                match problem {
+                    Issue::MissingHost => IconName::Replace,
+                    Issue::Connection => IconName::ExternalLink,
+                    _ => IconName::TriangleAlert,
+                },
+                true,
+            ))
+            .child(copy)
+            .into_any_element()
+    }
+
     fn monitor_bar(&self, value: Option<f64>) -> Div {
         div()
             .h(px(4.))
@@ -125,7 +262,10 @@ impl AppView {
             .flex_col()
             .gap_5();
         if !self.monitor.load_error.is_empty() {
-            body = body.child(self.muted(self.monitor.load_error.clone()));
+            body = body.child(self.notice(
+                "Monitor preferences could not be loaded",
+                self.monitor.load_error.clone(),
+            ));
         }
         if let Some((id, _, _)) = selected {
             let e = &self.monitor.entries[id];
@@ -181,16 +321,27 @@ impl AppView {
                                     self.store.group_path(&e.host.group_id)
                                 ))),
                         )
-                        .child(self.monitor_action(id, cx))
-                        .child(self.monitor_stop_button(
-                            "end-host",
-                            "End all NPU processes",
-                            id,
-                            ps,
-                            cx,
-                        )),
+                        .when(e.error.is_empty(), |d| d.child(self.monitor_action(id, cx)))
+                        .when(!e.error.is_empty(), |d| {
+                            d.child(
+                                self.muted(
+                                    termviai_gpui::monitor_presenter::issue(e, &self.store)
+                                        .status(),
+                                )
+                                .text_color(self.c(self.col().red)),
+                            )
+                        })
+                        .when(e.error.is_empty() && !ps.is_empty(), |d| {
+                            d.child(self.monitor_stop_button(
+                                "end-host",
+                                "End all NPU processes",
+                                id,
+                                ps,
+                                cx,
+                            ))
+                        }),
                 );
-            if let Some(snapshot) = &e.snapshot {
+            if let Some(snapshot) = e.snapshot.as_ref().filter(|_| e.error.is_empty()) {
                 let total = metrics(&snapshot.dies.iter().collect::<Vec<_>>());
                 let per_die = if snapshot
                     .dies
@@ -226,26 +377,20 @@ impl AppView {
                             format!("Every {}s", self.monitor.interval)
                         })),
                 );
-            } else {
-                body = body.child(self.monitor_status(e));
             }
             if !e.error.is_empty() {
-                body = body.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_color(self.c(self.col().red))
-                                .child(e.error.clone()),
-                        )
-                        .child(self.muted(e.recovery_hint())),
-                );
+                body = body.child(self.monitor_problem(id, cx));
             }
             if e.error.is_empty() {
                 if let Some(snapshot) = &e.snapshot {
                     body = body
+                        .when(snapshot.dies.is_empty(), |d| {
+                            d.child(self.empty_state(
+                                IconName::GalleryVerticalEnd,
+                                "No NPU resources detected",
+                                "This host's latest collection did not report any NPU devices.",
+                            ))
+                        })
                         .child(
                             div().flex().flex_wrap().gap_3().children(
                                 snapshot
@@ -256,15 +401,16 @@ impl AppView {
                         )
                         .child(self.muted("Hover a card to preview processes · Click to inspect"));
                 } else {
-                    body = body.child(self.muted("Waiting for the first sample…"));
+                    body = body.child(self.empty_state(
+                        IconName::LoaderCircle,
+                        "Waiting for the first sample",
+                        "Connecting to the host and collecting NPU resources.",
+                    ));
                 }
             }
             if !e.action_error.is_empty() {
-                body = body.child(
-                    div()
-                        .text_color(self.c(self.col().red))
-                        .child(e.action_error.clone()),
-                );
+                body = body
+                    .child(self.notice("Process action needs attention", e.action_error.clone()));
             }
         } else {
             body = body
@@ -324,19 +470,12 @@ impl AppView {
                                 )),
                         )
                         .child(div().flex_1())
-                        .child(self.muted("Interval"))
-                        .child(
-                            self.button(
-                                "monitor-interval",
-                                format!("{}s  ⌄", self.monitor.interval),
-                            )
-                            .on_click(cx.listener(
-                                |s, e: &ClickEvent, _, cx| {
-                                    s.menu = Some((MenuKind::MonitorInterval, e.position()));
-                                    cx.notify();
-                                },
-                            )),
-                        ),
+                        .child(self.interval_button().on_click(cx.listener(
+                            |s, e: &ClickEvent, _, cx| {
+                                s.menu = Some((MenuKind::MonitorInterval, e.position()));
+                                cx.notify();
+                            },
+                        ))),
                 )
                 .child(
                     div().flex().flex_wrap().gap_3().children(
@@ -347,8 +486,20 @@ impl AppView {
                             .map(|(id, _)| self.monitor_host_card(id, card_width, cx)),
                     ),
                 );
-            if self.monitor.entries.is_empty() {
-                body = body.child(self.muted("Add existing hosts to monitor their NPU resources."));
+            if self.monitor.entries.is_empty() && self.monitor.load_error.is_empty() {
+                body = body.child(
+                    self.empty_state(
+                        IconName::ChartPie,
+                        "Keep an eye on your hosts",
+                        "Add saved SSH hosts to view NPU memory, activity and processes.",
+                    )
+                    .child(
+                        self.action_button("monitor-empty-add", "Add hosts", IconName::Plus)
+                            .on_click(
+                                cx.listener(|s, _, w, cx| s.open_form(FormKind::Monitor, w, cx)),
+                            ),
+                    ),
+                );
             }
         }
         div()
@@ -486,6 +637,7 @@ impl AppView {
         }
         card.on_click(cx.listener(move |s, _, _, cx| {
             s.monitor_detail = Some((id, None, None));
+            s.monitor_technical = false;
             s.monitor_reason = None;
             s.scrollers["monitor-detail"].set_offset(point(px(0.), px(0.)));
             cx.notify();
@@ -643,23 +795,7 @@ impl AppView {
             format!("NPU {}", scope.unwrap().1)
         };
         if reason {
-            content = content
-                .child(self.muted(format!("{}@{}", e.host.username, e.host.endpoint())))
-                .child(self.monitor_status(e))
-                .child(
-                    div()
-                        .text_color(self.c(self.col().red))
-                        .child(e.error.clone()),
-                )
-                .child(self.muted(e.recovery_hint()))
-                .child(
-                    self.button("monitor-retry-detail", "Retry monitoring")
-                        .on_click(cx.listener(move |s, _, _, cx| {
-                            s.monitor.retry(id);
-                            s.monitor_reason = None;
-                            cx.notify();
-                        })),
-                );
+            content = content.child(self.monitor_problem(id, cx));
         } else if let Some(snapshot) = &e.snapshot {
             let (_, npu, die) = scope.unwrap();
             let mut dies: Vec<_> = snapshot.dies.iter().filter(|d| d.npu == npu).collect();
@@ -718,28 +854,44 @@ impl AppView {
             );
             if !e.error.is_empty() {
                 content = content.child(
-                    div()
-                        .text_color(self.c(self.col().red))
-                        .child(e.error.clone()),
+                    self.notice("Collection is unavailable", e.recovery_hint())
+                        .child(self.button("process-error-details", "Details").on_click(
+                            cx.listener(move |s, _, _, cx| {
+                                s.monitor_reason = Some(id);
+                                s.monitor_technical = true;
+                                cx.notify();
+                            }),
+                        )),
                 );
             }
             if !can_stop(e, &ps) && !ps.is_empty() {
-                content = content.child(self.muted(if e.paused {
-                    "Resume monitoring to enable process actions.".into()
-                } else if !e.live() {
-                    "Waiting for a fresh sample before enabling process control.".into()
-                } else if !snapshot.stop_reason.is_empty() {
-                    snapshot.stop_reason.clone()
-                } else {
-                    "Process control is unavailable for this scope.".into()
-                }));
+                content = content.child(self.notice(
+                    "Process actions unavailable",
+                    if e.paused {
+                        "Resume monitoring to enable process actions.".into()
+                    } else if !e.live() {
+                        "Waiting for a fresh sample before enabling process control.".into()
+                    } else if !snapshot.stop_reason.is_empty() {
+                        snapshot.stop_reason.clone()
+                    } else {
+                        "Process control is unavailable for this scope.".into()
+                    },
+                ));
             }
             if ps.is_empty() {
-                content = content.child(self.muted(if snapshot.processes_available {
-                    "No running NPU processes in this scope."
+                content = content.child(if snapshot.processes_available && e.error.is_empty() {
+                    self.empty_state(
+                        IconName::GalleryVerticalEnd,
+                        "No running NPU processes",
+                        "This scope is idle. Processes will appear here when detected.",
+                    )
                 } else {
-                    "Process information is unavailable."
-                }));
+                    self.empty_state(
+                        IconName::TriangleAlert,
+                        "Process information unavailable",
+                        "Wait for a fresh collection before checking running processes.",
+                    )
+                });
             }
             content = content
                 .children(ps.into_iter().enumerate().map(|(i, p)| {
@@ -795,14 +947,15 @@ impl AppView {
                 }))
                 .child(self.muted("Ending a shared process affects every Die it occupies."));
         } else {
-            content = content.child(self.muted("No sample available."));
+            content = content.child(self.empty_state(
+                IconName::LoaderCircle,
+                "No sample available",
+                "Waiting for a fresh collection from this host.",
+            ));
         }
         if !e.action_error.is_empty() {
-            content = content.child(
-                div()
-                    .text_color(self.c(self.col().red))
-                    .child(e.action_error.clone()),
-            );
+            content = content
+                .child(self.notice("Process action needs attention", e.action_error.clone()));
         }
         div()
             .absolute()

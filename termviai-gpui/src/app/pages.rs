@@ -15,6 +15,7 @@ impl AppView {
                 .hover(|d| d.bg(self.c(self.col().hover)))
                 .child("All Hosts")
                 .on_click(cx.listener(|s, _, _, cx| {
+                    s.host_selection.clear();
                     s.group.clear();
                     cx.notify();
                 })),
@@ -38,6 +39,7 @@ impl AppView {
                         .hover(|d| d.bg(self.c(self.col().hover)))
                         .child(g.name.clone())
                         .on_click(cx.listener(move |s, _, _, cx| {
+                            s.host_selection.clear();
                             s.group = id.clone();
                             cx.notify();
                         })),
@@ -68,20 +70,39 @@ impl AppView {
                     ))),
             );
         let groups = self.store.child_groups(&self.group);
+        let has_hosts = self.store.hosts.iter().any(|h| {
+            self.store.host_in_group(h, &self.group)
+                && format!(
+                    "{} {} {} {}",
+                    h.label,
+                    h.address,
+                    h.username,
+                    self.store.group_path(&h.group_id)
+                )
+                .to_lowercase()
+                .contains(&query)
+        });
         let host_cards =
             self.store
                 .hosts
                 .iter()
                 .filter(|h| {
                     self.store.host_in_group(h, &self.group)
-                        && format!("{} {} {}", h.label, h.address, h.username)
-                            .to_lowercase()
-                            .contains(&query)
+                        && format!(
+                            "{} {} {} {}",
+                            h.label,
+                            h.address,
+                            h.username,
+                            self.store.group_path(&h.group_id)
+                        )
+                        .to_lowercase()
+                        .contains(&query)
                 })
                 .enumerate()
                 .map(|(i, h)| {
                     let connect = h.clone();
                     let menu = h.clone();
+                    let selected = self.host_selection.contains(h);
                     div()
                         .id(("host", i))
                         .group("host-card")
@@ -99,6 +120,10 @@ impl AppView {
                         .border_color(self.c(self.col().line))
                         .cursor_pointer()
                         .hover(|d| d.bg(self.c(self.col().hover)))
+                        .when(selected, |d| {
+                            d.bg(self.c(self.col().soft))
+                                .border_color(self.c(self.col().accent))
+                        })
                         .child(
                             Icon::new(IconName::SquareTerminal)
                                 .size(px(19.))
@@ -122,6 +147,13 @@ impl AppView {
                                         .truncate(),
                                 ),
                         )
+                        .when(selected, |d| {
+                            d.child(
+                                Icon::new(IconName::CircleCheck)
+                                    .size(px(16.))
+                                    .text_color(self.c(self.col().accent)),
+                            )
+                        })
                         .child(self.icon(("host-menu", i), IconName::Ellipsis).on_click(
                             cx.listener(move |s, e: &ClickEvent, _, cx| {
                                 cx.stop_propagation();
@@ -129,9 +161,16 @@ impl AppView {
                                 cx.notify();
                             }),
                         ))
-                        .on_click(
-                            cx.listener(move |s, _, w, cx| s.connect(Some(connect.clone()), w, cx)),
-                        )
+                        .on_click(cx.listener(move |s, event: &ClickEvent, w, cx| {
+                            if event.modifiers().control {
+                                s.host_selection.toggle(connect.clone());
+                                s.focus.focus(w);
+                                cx.notify();
+                            } else {
+                                s.host_selection.clear();
+                                s.connect(Some(connect.clone()), w, cx);
+                            }
+                        }))
                 });
         div()
             .id("hosts-page")
@@ -147,7 +186,14 @@ impl AppView {
             .gap_5()
             .child(header)
             .child(Input::new(&self.search))
-            .child(crumb)
+            .child(div().flex().flex_wrap().items_center().gap_3().min_h(px(32.))
+                .child(crumb).child(div().flex_1())
+                .when(!self.host_selection.is_empty(), |d| d
+                    .child(self.muted(format!("{} selected · Enter to open", self.host_selection.len())))
+                    .child(self.action_button("open-selected-hosts", "Open selected", IconName::SquareTerminal)
+                        .on_click(cx.listener(|s, _, w, cx| s.open_selected_hosts(w, cx))))
+                    .child(self.button("clear-selected-hosts", "Clear · Esc").on_click(cx.listener(|s, _, _, cx| { s.host_selection.clear(); cx.notify(); }))))
+            )
             .when(!groups.is_empty(), |d| {
                 d.child(div().flex().flex_wrap().gap_3().children(
                     groups.into_iter().enumerate().map(|(i, g)| {
@@ -196,15 +242,26 @@ impl AppView {
                                 }),
                             ))
                             .on_click(cx.listener(move |s, _, _, cx| {
-                                s.group = id.clone();
+                                s.host_selection.clear();
+                            s.group = id.clone();
                                 cx.notify();
                             }))
                     }),
                 ))
             })
             .child(div().flex().flex_wrap().gap_3().children(host_cards))
-            .when(self.store.hosts.is_empty(), |d| {
-                d.child(self.muted("Add your first host to connect over SSH."))
+            .when(!has_hosts && self.load_error.is_empty(), |d| {
+                if !query.is_empty() {
+                    d.child(self.empty_state(IconName::Search, format!("No hosts match “{query}”"), "Try a host name, address or group.")
+                        .child(self.button("clear-host-search", "Clear search").on_click(cx.listener(|s, _, w, cx| {
+                            s.search.update(cx, |input, cx| input.set_value("", w, cx));
+                        }))))
+                } else {
+                    d.child(self.empty_state(IconName::SquareTerminal,
+                        if in_group { "No hosts in this group" } else { "Your first connection starts here" },
+                        if in_group { "Add a host to this group to organize your connections." } else { "Save an SSH host once, then use it across terminals, Monitor and Port Forwarding." })
+                        .child(self.action_button("empty-add-host", "Add host", IconName::Plus).on_click(cx.listener(|s, _, w, cx| s.open_form(FormKind::Host(None), w, cx)))))
+                }
             })
             .into_any_element()
     }
@@ -253,7 +310,19 @@ impl AppView {
                 }),
             ))
             .when(self.store.keys.is_empty(), |d| {
-                d.child(self.muted("Store private key paths for your hosts."))
+                d.child(
+                    self.compact_state(
+                        IconName::File,
+                        "No saved keys",
+                        "Save a private key path for your hosts.",
+                    )
+                    .child(
+                        self.action_button("empty-add-key", "Add key", IconName::Plus)
+                            .on_click(
+                                cx.listener(|s, _, w, cx| s.open_form(FormKind::Key(None), w, cx)),
+                            ),
+                    ),
+                )
             })
             .child(
                 div()
@@ -272,7 +341,19 @@ impl AppView {
                 }),
             ))
             .when(self.store.identities.is_empty(), |d| {
-                d.child(self.muted("Save a username and password as a reusable identity."))
+                d.child(
+                    self.compact_state(
+                        IconName::CircleUser,
+                        "No saved identities",
+                        "Reuse a username and password across hosts.",
+                    )
+                    .child(
+                        self.action_button("empty-add-identity", "Add identity", IconName::Plus)
+                            .on_click(cx.listener(|s, _, w, cx| {
+                                s.open_form(FormKind::Identity(None), w, cx)
+                            })),
+                    ),
+                )
             })
             .into_any_element()
     }
@@ -363,7 +444,11 @@ impl AppView {
                 ),
             )
             .when(self.workspaces.saved.is_empty(), |d| {
-                d.child(self.muted("Save a terminal group from its Tab menu or with Ctrl+S."))
+                d.child(self.compact_state(
+                    IconName::LayoutDashboard,
+                    "No saved workspaces",
+                    "Save a terminal group from its Tab menu or with Ctrl+S.",
+                ))
             })
             .child(
                 div()
@@ -424,6 +509,22 @@ impl AppView {
                         }),
                 ),
             )
+            .when(self.workspaces.recent.is_empty(), |d| {
+                d.child(
+                    self.compact_state(
+                        IconName::SquareTerminal,
+                        "No recent connections",
+                        "Hosts you connect to will appear here.",
+                    )
+                    .child(
+                        self.button("empty-browse-hosts", "Browse hosts")
+                            .on_click(cx.listener(|s, _, _, cx| {
+                                s.page = Page::Hosts;
+                                cx.notify();
+                            })),
+                    ),
+                )
+            })
             .into_any_element()
     }
     pub(super) fn forwarding_page(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -451,12 +552,26 @@ impl AppView {
             )
             .child(self.muted("Publish a local service through one of your SSH hosts."))
             .when(!self.forwarding_error.is_empty(), |d| {
-                d.child(
-                    div()
-                        .text_color(self.c(self.col().red))
-                        .child(self.forwarding_error.clone()),
-                )
+                d.child(self.notice("Forwarding needs attention", self.forwarding_error.clone()))
             })
+            .when(
+                self.forwarding.is_empty() && self.forwarding_error.is_empty(),
+                |d| {
+                    d.child(
+                        self.empty_state(
+                            IconName::Globe,
+                            "No forwarding services yet",
+                            "Connect a remote port to a local service using a saved SSH host.",
+                        )
+                        .child(
+                            self.action_button("empty-add-service", "Add service", IconName::Plus)
+                                .on_click(cx.listener(|s, _, w, cx| {
+                                    s.open_form(FormKind::Forward(None), w, cx)
+                                })),
+                        ),
+                    )
+                },
+            )
             .child(div().flex().flex_wrap().gap_3().children(
                 self.forwarding.iter().enumerate().map(|(i, v)| {
                     let id = v.rule.id.clone();

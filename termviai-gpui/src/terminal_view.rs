@@ -6,6 +6,7 @@ use std::{
 };
 use termviai_gpui::{
     session::{Input, Session},
+    terminal_ime::{ImeEpoch, Preedit},
     theme::{Colors, Theme},
 };
 use wezterm_term::{KeyCode, KeyModifiers};
@@ -33,8 +34,8 @@ pub struct TerminalView {
     selection: Option<((isize, usize), (isize, usize))>,
     top: isize,
     last_bottom: isize,
-    composition: String,
-    composition_selection: Range<usize>,
+    preedit: Preedit,
+    ime_epoch: ImeEpoch,
 }
 impl EventEmitter<TerminalEvent> for TerminalView {}
 impl TerminalView {
@@ -42,6 +43,7 @@ impl TerminalView {
         session: Arc<Session>,
         font_size: f32,
         theme: Theme,
+        ime_epoch: ImeEpoch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -53,6 +55,7 @@ impl TerminalView {
         })
         .detach();
         cx.on_blur(&focus, window, |s, _, cx| {
+            s.preedit.clear();
             s.session.state.lock().unwrap().term.focus_changed(false);
             cx.notify();
         })
@@ -64,6 +67,7 @@ impl TerminalView {
                     .await;
                 if this
                     .update(cx, |s, cx| {
+                        let ime_ended = s.preedit.reconcile(&s.ime_epoch);
                         let revision = s.session.revision.load(Ordering::Acquire);
                         let follow = s.session.follow.load(Ordering::Acquire);
                         let followed = follow != s.follow;
@@ -79,7 +83,8 @@ impl TerminalView {
                         } else {
                             s.scroll = s.target;
                         }
-                        if revision != s.revision
+                        if ime_ended
+                            || revision != s.revision
                             || delta.abs() > 0.01
                             || s.last_scroll.elapsed() < Duration::from_millis(1500)
                             || followed
@@ -114,8 +119,8 @@ impl TerminalView {
             selection: None,
             top: 0,
             last_bottom: 0,
-            composition: String::new(),
-            composition_selection: 0..0,
+            preedit: Preedit::default(),
+            ime_epoch,
         }
     }
     pub fn appearance(&mut self, size: f32, theme: Theme, cx: &mut Context<Self>) {
@@ -163,7 +168,10 @@ impl TerminalView {
         }
     }
     fn key(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.composition.is_empty() {
+        if self.preedit.reconcile(&self.ime_epoch) {
+            cx.notify();
+        }
+        if !self.preedit.text.is_empty() {
             return;
         }
         let k = &e.keystroke;
@@ -453,9 +461,9 @@ impl TerminalView {
                     Bounds::new(origin, size(px(2.), self.line)),
                     Colors::color(self.theme.colors().accent),
                 ));
-                if !self.composition.is_empty() {
+                if !self.preedit.text.is_empty() {
                     let run = TextRun {
-                        len: self.composition.len(),
+                        len: self.preedit.text.len(),
                         font: font.clone(),
                         color: Colors::color(self.theme.colors().text),
                         background_color: Some(Colors::color(self.theme.colors().soft)),
@@ -467,7 +475,7 @@ impl TerminalView {
                         strikethrough: None,
                     };
                     let text = w.text_system().shape_line(
-                        self.composition.clone().into(),
+                        self.preedit.text.clone().into(),
                         px(self.font_size),
                         &[run],
                         None,
@@ -562,6 +570,7 @@ impl Focusable for TerminalView {
 }
 impl Render for TerminalView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.preedit.reconcile(&self.ime_epoch);
         let entity = cx.entity();
         div()
             .id("terminal")
@@ -570,7 +579,13 @@ impl Render for TerminalView {
             .track_focus(&self.focus)
             .key_context(termviai_gpui::terminal_keys::CONTEXT)
             .bg(Colors::color(self.theme.colors().terminal))
-            .cursor(CursorStyle::IBeam)
+            .cursor(
+                if self.thumb_drag.is_some() || (self.edge && self.history() > 0) {
+                    CursorStyle::PointingHand
+                } else {
+                    CursorStyle::IBeam
+                },
+            )
             .on_key_down(cx.listener(Self::key))
             .on_key_up(cx.listener(|s, e: &KeyUpEvent, _, cx| {
                 if let Some(key) = key_code(&e.keystroke) {
@@ -681,7 +696,7 @@ impl EntityInputHandler for TerminalView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let v: Vec<u16> = self.composition.encode_utf16().collect();
+        let v: Vec<u16> = self.preedit.text.encode_utf16().collect();
         let r = r.start.min(v.len())..r.end.min(v.len());
         *actual = Some(r.clone());
         Some(String::from_utf16_lossy(&v[r]))
@@ -693,16 +708,15 @@ impl EntityInputHandler for TerminalView {
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.composition_selection.clone(),
+            range: self.preedit.selection.clone(),
             reversed: false,
         })
     }
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        (!self.composition.is_empty()).then(|| 0..self.composition.encode_utf16().count())
+        (!self.preedit.text.is_empty()).then(|| 0..self.preedit.text.encode_utf16().count())
     }
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        self.composition.clear();
-        self.composition_selection = 0..0;
+        self.preedit.clear();
         cx.notify();
     }
     fn replace_text_in_range(
@@ -712,9 +726,11 @@ impl EntityInputHandler for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.composition.clear();
-        self.composition_selection = 0..0;
-        self.emit(Input::Text(text.into()), cx);
+        if let Some(text) = self.preedit.commit(text) {
+            self.emit(Input::Text(text), cx);
+        } else {
+            cx.notify();
+        }
     }
     fn replace_and_mark_text_in_range(
         &mut self,
@@ -724,9 +740,7 @@ impl EntityInputHandler for TerminalView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.composition = text.into();
-        let n = text.encode_utf16().count();
-        self.composition_selection = range.unwrap_or(n..n);
+        self.preedit.mark(text, range, &self.ime_epoch);
         cx.notify();
     }
     fn bounds_for_range(
