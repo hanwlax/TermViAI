@@ -8,7 +8,8 @@ use termviai_gpui::{
     session::{Input, Session},
     terminal_ime::{ImeEpoch, Preedit},
     terminal_selection::{
-        Selection, cell_at, edge_velocity, line_text_range, selected_columns, selected_text,
+        Selection, cell_at, double_click_range, edge_velocity, line_text_range, selected_columns,
+        selected_text,
     },
     theme::{Colors, Theme},
 };
@@ -320,10 +321,20 @@ impl TerminalView {
             );
             return;
         }
-        if e.click_count == 2 {
+        if e.click_count == 2 || e.click_count == 3 {
             self.selection.clear();
-            self.selection.range =
-                line_text_range(self.session.state.lock().unwrap().term.screen(), row);
+            self.selection.range = {
+                let state = self.session.state.lock().unwrap();
+                if e.click_count == 3 {
+                    line_text_range(state.term.screen(), row)
+                } else {
+                    double_click_range(
+                        state.term.screen(),
+                        (row, col),
+                        &config::configuration().selection_word_boundary,
+                    )
+                }
+            };
             self.selection_pointer = None;
             self.copy(cx);
             cx.notify();
@@ -480,9 +491,27 @@ impl TerminalView {
         } else {
             0.
         };
+        let show_cursor = self.scroll < 0.01
+            && cursor.visibility == termwiz::surface::CursorVisibility::Visible
+            && self.focus.is_focused(w);
         w.with_content_mask(Some(ContentMask { bounds }), |w| {
             for (r, line) in lines.iter().enumerate() {
                 let y = bounds.top() + self.line * (r as f32 - fractional);
+                let cursor_columns = (show_cursor
+                    && cursor.y >= 0
+                    && r == cursor.y as usize + self.scroll.ceil() as usize
+                    && cursor.x < cols)
+                    .then(|| {
+                        line.visible_cells()
+                            .find(|cell| {
+                                cell.cell_index() <= cursor.x
+                                    && cursor.x < cell.cell_index() + cell.width()
+                            })
+                            .map(|cell| {
+                                cell.cell_index()..(cell.cell_index() + cell.width()).min(cols)
+                            })
+                            .unwrap_or(cursor.x..cursor.x + 1)
+                    });
                 let selected = selected_columns(self.selection.range, top + r as isize, cols);
                 // TextRun backgrounds require a separate GPUI paint pass. Draw in
                 // terminal cell coordinates so short lines and wide glyphs stay exact.
@@ -520,6 +549,12 @@ impl TerminalView {
                     {
                         bg = palette.selection_bg;
                         fg = palette.selection_fg;
+                    }
+                    if cursor_columns
+                        .as_ref()
+                        .is_some_and(|range| range.contains(&col))
+                    {
+                        fg = palette.cursor_fg;
                     }
                     let end = (col + cell.width()).min(cols);
                     if let Some((_, previous_end, previous_bg)) = backgrounds.last_mut()
@@ -573,6 +608,17 @@ impl TerminalView {
                         rgba_color(bg),
                     ));
                 }
+                if let Some(range) = cursor_columns {
+                    // Paint behind the glyph, with contrasting cursor foreground,
+                    // so the block does not hide text when moving within a line.
+                    w.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.left() + self.cell * range.start as f32, y),
+                            size(self.cell * range.len() as f32, self.line),
+                        ),
+                        rgba_color(palette.cursor_bg),
+                    ));
+                }
                 let mut shaped =
                     w.text_system()
                         .shape_line(text.into(), px(self.font_size), &runs, None);
@@ -600,18 +646,11 @@ impl TerminalView {
                 *shaped = Arc::new(layout);
                 let _ = shaped.paint(point(bounds.left(), y), self.line, w, cx);
             }
-            if self.scroll < 0.01
-                && cursor.visibility == termwiz::surface::CursorVisibility::Visible
-                && self.focus.is_focused(w)
-            {
+            if show_cursor {
                 let origin = point(
                     bounds.left() + self.cell * cursor.x as f32,
                     bounds.top() + self.line * cursor.y as f32,
                 );
-                w.paint_quad(fill(
-                    Bounds::new(origin, size(px(2.), self.line)),
-                    Colors::color(self.theme.colors().accent),
-                ));
                 if !self.preedit.text.is_empty() {
                     let run = TextRun {
                         len: self.preedit.text.len(),

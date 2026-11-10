@@ -23,8 +23,18 @@ use wezterm_term::{KeyCode, KeyModifiers, Terminal, TerminalConfiguration, Termi
 #[derive(Debug)]
 struct TermConfig {
     theme: Theme,
+    remote: bool,
 }
 impl TerminalConfiguration for TermConfig {
+    fn canonicalize_pasted_newlines(&self) -> wezterm_term::config::NewlineCanon {
+        if self.remote {
+            // SSH input uses one Return per logical newline, regardless of the
+            // client OS. CRLF would submit twice when bracketed paste is off.
+            wezterm_term::config::NewlineCanon::CarriageReturn
+        } else {
+            wezterm_term::config::NewlineCanon::default()
+        }
+    }
     fn color_palette(&self) -> wezterm_term::color::ColorPalette {
         self.theme.terminal_palette()
     }
@@ -41,6 +51,15 @@ pub enum Input {
     KeyUp(KeyCode, KeyModifiers),
     Text(String),
     Paste(String),
+}
+
+fn send_clipboard_paste(term: &mut Terminal, text: &str) -> anyhow::Result<()> {
+    // Windows clipboard text commonly uses CRLF. Bracketed paste bypasses the
+    // core's newline canonicalization, so CRLF would reach the shell as two
+    // line breaks. Normalize here; the core still chooses the session-specific
+    // convention for unbracketed paste and removes embedded paste delimiters.
+    let text = wezterm_term::config::NewlineCanon::LineFeed.canonicalize(text);
+    term.send_paste(&text)
 }
 enum Request {
     Input(Vec<u8>),
@@ -138,7 +157,10 @@ impl Session {
         let pending_size = Arc::new(Mutex::new(None));
         let mut term = Terminal::new(
             TerminalSize::default(),
-            Arc::new(TermConfig { theme }),
+            Arc::new(TermConfig {
+                theme,
+                remote: host.is_some(),
+            }),
             "TermViAI",
             "GPUI-trial",
             Box::new(Writer(tx.clone())),
@@ -307,7 +329,7 @@ impl Session {
                     _ => st.term.send_raw_input(t.as_bytes()),
                 }
             }
-            Input::Paste(t) => st.term.send_paste(&t),
+            Input::Paste(t) => send_clipboard_paste(&mut st.term, &t),
         })
     }
     pub fn send(&self, bytes: &[u8]) -> anyhow::Result<()> {
@@ -342,7 +364,10 @@ impl Session {
 
     pub fn theme(&self, theme: Theme) {
         let mut st = self.state.lock().unwrap();
-        st.term.set_config(Arc::new(TermConfig { theme }));
+        st.term.set_config(Arc::new(TermConfig {
+            theme,
+            remote: self.host.is_some(),
+        }));
         st.term.implicit_palette_reset_if_same_as_configured();
         self.revision.fetch_add(1, Ordering::Release);
     }
@@ -438,7 +463,10 @@ mod tests {
         State {
             term: Terminal::new(
                 TerminalSize::default(),
-                Arc::new(TermConfig { theme: Theme::Ink }),
+                Arc::new(TermConfig {
+                    theme: Theme::Ink,
+                    remote: false,
+                }),
                 "TermViAI",
                 "test",
                 Box::new(Vec::new()),
@@ -496,7 +524,10 @@ mod tests {
     fn production_core_encodes_tab_and_shift_tab_for_shells() {
         let mut t = Terminal::new(
             TerminalSize::default(),
-            Arc::new(TermConfig { theme: Theme::Ink }),
+            Arc::new(TermConfig {
+                theme: Theme::Ink,
+                remote: false,
+            }),
             "TermViAI",
             "test",
             Box::new(Vec::new()),
@@ -515,7 +546,10 @@ mod tests {
     fn production_core_keeps_wide_cells_and_bracketed_paste_encoding() {
         let mut t = Terminal::new(
             TerminalSize::default(),
-            Arc::new(TermConfig { theme: Theme::Ink }),
+            Arc::new(TermConfig {
+                theme: Theme::Ink,
+                remote: false,
+            }),
             "TermViAI",
             "test",
             Box::new(Vec::new()),
@@ -525,6 +559,70 @@ mod tests {
         assert_eq!(t.cursor_pos().x, 6);
         let bytes = wezterm_term::user_input::capture(7, || t.send_paste("中文\x1b[201~")).unwrap();
         assert_eq!(bytes, "\x1b[200~中文\x1b[201~".as_bytes());
+    }
+    #[test]
+    fn clipboard_paste_normalizes_windows_newlines_without_removing_blank_lines() {
+        let mut t = output_state().term;
+        t.set_input_capture_id(1701);
+        t.advance_bytes(b"\x1b[?2004h");
+        let expected = "git apply \\\n  --exclude=python/pyproject.toml \\\n  --exclude=python/pyproject_npu.toml \\\n  patch.diff";
+        for text in [
+            expected.to_owned(),
+            expected.replace('\n', "\r\n"),
+            expected.replace('\n', "\r"),
+        ] {
+            let bytes =
+                wezterm_term::user_input::capture(1701, || send_clipboard_paste(&mut t, &text))
+                    .unwrap();
+            assert_eq!(bytes, format!("\x1b[200~{expected}\x1b[201~").as_bytes());
+        }
+        let bytes = wezterm_term::user_input::capture(1701, || {
+            send_clipboard_paste(&mut t, "中文\r\n\r\n  end\n\x1b[201~")
+        })
+        .unwrap();
+        assert_eq!(bytes, "\x1b[200~中文\n\n  end\n\x1b[201~".as_bytes());
+    }
+    #[test]
+    fn clipboard_paste_keeps_unbracketed_native_console_policy() {
+        let mut t = output_state().term;
+        t.set_input_capture_id(1702);
+        let bytes = wezterm_term::user_input::capture(1702, || {
+            send_clipboard_paste(&mut t, "one\r\n\r\ntwo\n")
+        })
+        .unwrap();
+        assert_eq!(
+            bytes,
+            wezterm_term::config::NewlineCanon::default()
+                .canonicalize("one\n\ntwo\n")
+                .as_bytes()
+        );
+    }
+    #[test]
+    fn ssh_paste_uses_one_return_per_line_with_bracketed_mode_off() {
+        let mut t = output_state().term;
+        t.set_input_capture_id(1703);
+        let text = "printf '%s\\n' \\\n  alpha \\\n  beta \\\n  gamma";
+        for theme in [Theme::Ink, Theme::Navy, Theme::Light] {
+            t.set_config(Arc::new(TermConfig {
+                theme,
+                remote: true,
+            }));
+            for mode in [false, true, false] {
+                t.advance_bytes(if mode { b"\x1b[?2004h" } else { b"\x1b[?2004l" });
+                for input in [text.to_owned(), text.replace('\n', "\r\n")] {
+                    let bytes = wezterm_term::user_input::capture(1703, || {
+                        send_clipboard_paste(&mut t, &input)
+                    })
+                    .unwrap();
+                    let expected = if mode {
+                        format!("\x1b[200~{text}\x1b[201~")
+                    } else {
+                        text.replace('\n', "\r")
+                    };
+                    assert_eq!(bytes, expected.as_bytes());
+                }
+            }
+        }
     }
     fn screen_text(s: &Session) -> String {
         let st = s.state.lock().unwrap();

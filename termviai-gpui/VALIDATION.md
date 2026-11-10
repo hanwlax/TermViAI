@@ -1,5 +1,33 @@
 # Native GPUI trial validation · 2026-11-09
 
+## Block input cursor · 2026-11-10
+
+- Replaced the fixed 2px caret with a cell-sized block painted behind terminal text. Cursor foreground/background come from each theme's terminal palette; wide glyphs use their full cell span, and empty cells still show the block.
+- Existing focus, remote visibility, scrollback hiding and IME preedit rules are retained. This changes the terminal insertion cursor, not the mouse I-beam or scrollbar pointer.
+- Windows Release build passed. No library logic changed in this adjustment; the preceding 114-pass / 3-ignored library run was reused. No visible UI was launched; appearance still needs user trial feedback.
+
+## SSH paste fallback correction · 2026-11-10
+
+- Follow-up feedback showed that the previous clipboard fix covered bracketed paste only. On Windows, the default core configuration re-expanded LF to CRLF when bracketed mode was disabled; in a POSIX shell this can submit a continuation prematurely and let the command consume subsequent pasted lines.
+- TermConfig now records whether the session is SSH. Unbracketed SSH paste uses a single CR (Return) per logical newline; local console defaults remain intact. The remote flag is preserved when changing themes. Bracketed mode still receives canonical LF inside core-generated delimiters, and the client never forces the remote mode on.
+- Windows library suite: 114 passed, 0 failed, 3 ignored. The added regression covers remote sessions with bracketed mode off/on/off, LF and CRLF input, and all themes. Existing tests retain true empty lines, escaping and local console compatibility.
+- A separate isolated Bash PTY experiment reproduced the old CRLF behavior (premature execution and later argument lines treated as commands). With the corrected bytes, a harmless four-line printf command stayed pending until Enter and printed all three arguments correctly, both with bracketed paste enabled and disabled. No user's SSH host, clipboard or visible desktop was accessed.
+- The screenshot's original clipboard bytes and live host configuration were not captured; the reproduced path is consistent with the report. Live SSH confirmation remains part of trial feedback.
+
+## Clipboard newline normalization · 2026-11-10
+
+- GPUI reads Windows Unicode clipboard text without newline conversion. The core deliberately bypasses newline canonicalization in bracketed paste, so Windows CRLF reached the shell unchanged; applications treating CR and LF as separate line breaks can show an extra blank row.
+- The native Session paste entry now canonicalizes CRLF / CR / LF to LF before calling the existing core. Actual empty lines, indentation, backslash continuations and trailing newlines remain intact. Core bracket delimiters and sanitization remain in use; unbracketed paste still follows the existing native console policy.
+- Windows library suite: 113 passed, 0 failed, 3 ignored. Added byte-level regressions cover the reported four-line command with all three newline styles, intentional blank lines, Unicode, delimiter sanitization and unbracketed behavior.
+- No user clipboard was read or changed, no visible application was launched, and no live SSH command was executed. The original clipboard bytes were not captured; this fixes the confirmed code path consistent with the screenshot, with live shell confirmation left to the trial.
+
+## Contextual double-click selection · 2026-11-10
+
+- Double-click now selects the clicked word using the existing terminal `selection_word_boundary`; bracket/quote separators select themselves. Clicking whitespace retains selection of the displayed row without trailing padding. Triple-click selects that row regardless of the clicked word.
+- Cell-coordinate hit testing includes the trailing half of wide glyphs and combining graphemes. Word selection crosses soft wraps in either direction, including scrollback, but stops at explicit newlines. Existing drag auto-copy, selection paint, scrolling and Shift override of remote mouse capture are retained.
+- Windows library suite: 111 passed, 0 failed, 3 external-environment tests ignored. Three added cases cover word/whitespace/separator behavior, wrapped history boundaries and wide/combining characters.
+- No computer-use, visible application launch or user clipboard manipulation; actual desktop interaction remains to be confirmed with the trial.
+
 ## Architecture and scope
 
 The production terminal core, SSH libraries and PTY implementation are path dependencies. Hosts, workspaces, authentication control, Monitor and Forwarding compile directly from their existing source files. Native GPUI elements own layout, input focus, painting and application navigation. This was initially a separate trial executable. As of v0.1.0-beta.8, the native frontend is published as TermViAI.exe; the trial-era validation entries below remain historical evidence.

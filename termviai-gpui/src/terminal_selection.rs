@@ -94,7 +94,7 @@ pub fn selected_columns(
     (start < end).then_some(start..end)
 }
 
-/// Double-click selects this displayed row, retaining indentation, excluding padding.
+/// Select this displayed row, retaining indentation, excluding padding.
 pub fn line_text_range(screen: &Screen, row: isize) -> Option<(Cell, Cell)> {
     let physical = screen.stable_row_to_phys(row)?;
     let lines = screen.lines_in_phys_range(physical..physical + 1);
@@ -105,6 +105,61 @@ pub fn line_text_range(screen: &Screen, row: isize) -> Option<(Cell, Cell)> {
         .map(|cell| cell.cell_index() + cell.width())
         .last()?;
     Some(((row, 0), (row, end - 1)))
+}
+
+/// Prefer the clicked word; whitespace keeps the existing whole-row gesture.
+/// Work in visible cells, not bytes, including both halves of wide glyphs.
+pub fn double_click_range(screen: &Screen, at: Cell, boundaries: &str) -> Option<(Cell, Cell)> {
+    let physical = screen.stable_row_to_phys(at.0)?;
+    let mut first = physical;
+    while first > 0 && screen.lines_in_phys_range(first - 1..first)[0].last_cell_was_wrapped() {
+        first -= 1;
+    }
+    let mut last = physical;
+    while last + 1 < screen.scrollback_rows()
+        && screen.lines_in_phys_range(last..last + 1)[0].last_cell_was_wrapped()
+    {
+        last += 1;
+    }
+    let lines = screen.lines_in_phys_range(first..last + 1);
+    let cells: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .flat_map(|(offset, line)| {
+            let row = screen.phys_to_stable_row_index(first + offset);
+            line.visible_cells().map(move |cell| {
+                let text = cell.str();
+                let blank = text.chars().all(char::is_whitespace);
+                let word = !blank && (text.chars().count() > 1 || !boundaries.contains(text));
+                (
+                    (row, cell.cell_index()),
+                    (row, cell.cell_index() + cell.width() - 1),
+                    blank,
+                    word,
+                )
+            })
+        })
+        .collect();
+    let Some(index) = cells
+        .iter()
+        .position(|(start, end, _, _)| *start <= at && at <= *end)
+    else {
+        return line_text_range(screen, at.0);
+    };
+    if cells[index].2 {
+        return line_text_range(screen, at.0);
+    }
+    let mut left = index;
+    let mut right = index;
+    if cells[index].3 {
+        while left > 0 && cells[left - 1].3 {
+            left -= 1;
+        }
+        while right + 1 < cells.len() && cells[right + 1].3 {
+            right += 1;
+        }
+    }
+    Some((cells[left].0, cells[right].1))
 }
 
 pub fn selected_text(screen: &Screen, range: (Cell, Cell)) -> Option<String> {
@@ -234,7 +289,7 @@ mod tests {
         );
     }
     #[test]
-    fn double_click_selects_the_line_without_trailing_padding() {
+    fn line_selection_excludes_trailing_padding() {
         let mut t = terminal();
         t.advance_bytes("  中文  \r\nx   \r\n   ".as_bytes());
         let first = t.screen().phys_to_stable_row_index(0);
@@ -246,6 +301,48 @@ mod tests {
             Some(((first + 1, 0), (first + 1, 0)))
         );
         assert_eq!(line_text_range(t.screen(), first + 2), None);
+    }
+    fn double_clicked(t: &Terminal, row: usize, col: usize) -> Option<String> {
+        let range = double_click_range(
+            t.screen(),
+            (t.screen().phys_to_stable_row_index(row), col),
+            " \t\n{[}]()\"'`",
+        )?;
+        selected_text(t.screen(), range)
+    }
+    #[test]
+    fn double_click_prefers_words_but_blank_space_selects_the_row() {
+        let mut t = terminal();
+        t.advance_bytes(b"one two\r\n(x_y)\r\n   ");
+        assert_eq!(double_clicked(&t, 0, 1).as_deref(), Some("one"));
+        assert_eq!(double_clicked(&t, 0, 5).as_deref(), Some("two"));
+        assert_eq!(double_clicked(&t, 0, 3).as_deref(), Some("one two"));
+        assert_eq!(double_clicked(&t, 0, 7).as_deref(), Some("one two"));
+        assert_eq!(double_clicked(&t, 1, 2).as_deref(), Some("x_y"));
+        assert_eq!(double_clicked(&t, 1, 0).as_deref(), Some("("));
+        assert_eq!(double_clicked(&t, 2, 1), None);
+    }
+    #[test]
+    fn double_click_follows_soft_wraps_in_scrollback_but_not_newlines() {
+        let mut t = terminal();
+        t.advance_bytes(b" abcdefghijkl\r\nnext\r\nlast");
+        assert!(t.screen().phys_row(0) > 0);
+        for (row, col) in [(0, 3), (1, 2)] {
+            assert_eq!(
+                double_clicked(&t, row, col).as_deref(),
+                Some("abcdefghijkl")
+            );
+        }
+        assert_eq!(double_clicked(&t, 2, 1).as_deref(), Some("next"));
+    }
+    #[test]
+    fn double_click_preserves_wide_and_combining_graphemes() {
+        let mut t = terminal();
+        t.advance_bytes(" 中文 e\u{301}\r\n".as_bytes());
+        for col in 1..5 {
+            assert_eq!(double_clicked(&t, 0, col).as_deref(), Some("中文"));
+        }
+        assert_eq!(double_clicked(&t, 0, 6).as_deref(), Some("e\u{301}"));
     }
     #[test]
     fn highlight_covers_only_selected_columns_in_both_directions() {
