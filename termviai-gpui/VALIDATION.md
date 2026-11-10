@@ -6,6 +6,23 @@ The production terminal core, SSH libraries and PTY implementation are path depe
 
 The previous probe's vt100 parser, example host library and navigation were not adopted. Resolved Cargo metadata contains no WebView, Wry, Tauri or vt100 package. The PE import table contains Windows system libraries; no Chromium runtime is bundled.
 
+## System broadcast notifications · 2026-11-10
+
+- Implements the approved terminal-local blue bell / unread count, hover preview, pinned details, notification/error tabs, clear and expandable original text. All content uses selectable native GPUI text with Ctrl+C, with no copy buttons. Remote text is escaped before native text parsing, so it cannot inject markup or clickable actions. Existing error-click credential-save retry behavior is retained.
+- A source terminal owns its inbox; changing pages/zoom dismisses its overlay. Hover does not focus the popup or mark messages read. Clicking opens/marks the current snapshot read. Selecting pins the preview; incoming messages update the badge without moving text in a pinned snapshot. The popup is non-modal, bounded below the titlebar, and does not disable native window controls/dragging.
+- The reader uses a bounded streaming recognizer before terminal parsing. Only the known util-linux wall envelope (79-space framing, English banner, sender/TTY/date fields, double BEL, matching line endings and nonempty body lines) is accepted. The 250ms collection window rejects mixed output and ambiguous blank-line continuation. EOF, incomplete/oversized frames, malformed UTF-8/control text and unknown formats release original bytes; raw wire bytes are retained for accepted session notifications. Other programs can deliberately print the same format; this is a conservative presentation heuristic, not authenticated framing or universal broadcast detection.
+- Inspected upstream util-linux wall.c (v2.37.2 and master). A local isolated Python PTY experiment verified ONLCR transforms CRLF to CRCRLF; regression fixtures cover both dialects and reject mixed endings. No wall broadcast was sent to any host or local logged-in user.
+- Windows MSVC Release build and library suite passed: 108 passed, 0 failed, 3 ignored. Twelve new regressions cover all split points, byte-at-a-time input, old truncated banners, Chinese, multiple frames, normal surrounding output, unknown/control/invalid UTF-8 data, stream control-string context, timeout/EOF, size limits, ambiguous mixed output, inbox capacity/read/clear, literal markup, ONLCR and terminal cursor/prompt preservation. Final UI-only snapshot/focus/styling refinements are release-built after this suite.
+- No computer-use, visible application launch, live SSH connection or user clipboard manipulation. On-screen appearance, hover selection and Ctrl+C behavior still require trial feedback; source checks confirm GPUI TextView's native focus, selection and copy action paths.
+
+## Terminal selection restoration · 2026-11-10
+
+- Restores copy-on-left-release, including release outside the source pane. Plain clicks and cancelled drags do not replace the clipboard. Double-click selects the displayed row, including indentation but excluding trailing blank cells, and immediately copies it.
+- Selection endpoints use stable rows and refresh as the viewport scrolls, including a stationary pointer. Wheel scrolling during a drag stays with the source pane. Edge scrolling ramps with pointer distance, clamps to scrollback and uses the existing smooth viewport animation. Focus/window deactivation cancels dragging.
+- Fixes missing terminal selection backgrounds: GPUI `ShapedLine::paint` paints glyphs without the background pass. Terminal backgrounds now paint as merged cell-aligned rectangles, including ANSI backgrounds, wide cells and selected padding. IME backgrounds use the separate GPUI background pass.
+- Windows MSVC Release build passed. Library suite: 96 passed, 0 failed, 3 ignored; eight new tests cover selection lifecycle, stationary-pointer scrolling, edge direction/limits, cross-scrollback copying, reversed selections, soft wraps/wide characters, expired history, line trimming and highlight column spans. Final mouse-release propagation guard is compile-checked after this suite; it does not change the tested selection module.
+- No visible application launch, computer-use, clipboard interaction on the desktop or live SSH testing performed. Pointer smoothness and actual screen appearance still need user verification in the trial.
+
 ## Host multi-selection · 2026-11-10
 
 - Hosts cards support Ctrl+left-click toggle with themed selected surfaces, borders and check marks. Plain click still opens one connection. Existing menu buttons stop propagation and do not toggle selection.

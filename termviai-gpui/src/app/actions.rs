@@ -81,12 +81,33 @@ impl AppView {
         })
         .detach();
         view.focus_handle(cx).focus(window);
+        let notices = cx.new(|cx| {
+            crate::notice_view::NoticeView::new(
+                session.clone(),
+                view.downgrade(),
+                host.as_ref()
+                    .map(|h| h.label.clone())
+                    .unwrap_or_else(|| "Local terminal".into()),
+                self.theme,
+                cx,
+            )
+        });
+        cx.subscribe(
+            &notices,
+            |s, _, e: &crate::notice_view::RetryCredentialSave, _| {
+                if let Some(p) = s.panes.get_mut(&e.0) {
+                    p.save_attempted = false;
+                }
+            },
+        )
+        .detach();
         self.panes.insert(
             id,
             Pane {
                 host,
                 session,
                 view,
+                notices,
                 form: None,
                 pending: None,
                 save_attempted: false,
@@ -355,12 +376,33 @@ impl AppView {
                     }
                 })
                 .detach();
+                let notices = cx.new(|cx| {
+                    crate::notice_view::NoticeView::new(
+                        session.clone(),
+                        view.downgrade(),
+                        host.as_ref()
+                            .map(|h| h.label.clone())
+                            .unwrap_or_else(|| "Local terminal".into()),
+                        self.theme,
+                        cx,
+                    )
+                });
+                cx.subscribe(
+                    &notices,
+                    |s, _, e: &crate::notice_view::RetryCredentialSave, _| {
+                        if let Some(p) = s.panes.get_mut(&e.0) {
+                            p.save_attempted = false;
+                        }
+                    },
+                )
+                .detach();
                 self.panes.insert(
                     id,
                     Pane {
                         host,
                         session,
                         view,
+                        notices,
                         form: None,
                         pending: None,
                         save_attempted: false,

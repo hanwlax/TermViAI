@@ -1022,6 +1022,29 @@ impl Render for AppView {
         }
         self.prepare_tabs(w, cx);
         self.prepare_auth(w, cx);
+        let visible = if let Page::Terminal(tab) = self.page {
+            self.tabs
+                .iter()
+                .find(|t| t.id == tab)
+                .map(|t| {
+                    t.zoom
+                        .map(|id| vec![id])
+                        .unwrap_or_else(|| t.layout.panes())
+                })
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+        for (&id, p) in &self.panes {
+            let error = if !p.error.is_empty() {
+                p.error.clone()
+            } else {
+                p.session.state.lock().unwrap().error.clone()
+            };
+            p.notices.update(cx, |n, cx| {
+                n.appearance(self.theme, error, visible.contains(&id), cx)
+            });
+        }
         let page = match self.page {
             Page::Hosts => self.hosts_page(cx),
             Page::Keychain => self.keychain_page(cx),

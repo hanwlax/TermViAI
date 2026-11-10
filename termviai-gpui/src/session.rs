@@ -3,6 +3,7 @@
 use crate::{
     authentication::{self, Candidate, Control, Phase},
     hosts::{Authentication, Host, HostStore},
+    terminal_notifications::{Filter as BroadcastFilter, Inbox},
     theme::Theme,
 };
 use anyhow::{Context, ensure};
@@ -15,7 +16,7 @@ use std::{
         mpsc::{self, SyncSender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use wezterm_term::{KeyCode, KeyModifiers, Terminal, TerminalConfiguration, TerminalSize};
 
@@ -79,6 +80,27 @@ pub struct State {
     pub ended: bool,
     pub error: String,
     pub bytes: u64,
+    pub notifications: Inbox,
+    broadcast_filter: BroadcastFilter,
+}
+impl State {
+    fn advance_output(&mut self, bytes: &[u8], now: Instant, remote: bool) -> bool {
+        self.bytes += bytes.len() as u64;
+        if !remote {
+            self.term.advance_bytes(bytes);
+            return !bytes.is_empty();
+        }
+        let output = self.broadcast_filter.feed(bytes, now);
+        let changed = !output.terminal.is_empty() || !output.notices.is_empty();
+        self.term.advance_bytes(&output.terminal);
+        for notice in output.notices {
+            self.notifications.push(notice);
+        }
+        changed
+    }
+    fn finish_output(&mut self) {
+        self.term.advance_bytes(&self.broadcast_filter.finish());
+    }
 }
 pub struct Session {
     pub id: usize,
@@ -135,6 +157,8 @@ impl Session {
                 ended: false,
                 error: String::new(),
                 bytes: 0,
+                notifications: Inbox::default(),
+                broadcast_filter: BroadcastFilter::default(),
             })),
             auth: Control::new(),
             revision: Arc::new(AtomicU64::new(0)),
@@ -199,8 +223,7 @@ impl Session {
                                     break;
                                 }
                                 let mut state = s.state.lock().unwrap();
-                                state.term.advance_bytes(&buf[..n]);
-                                state.bytes += n as u64;
+                                state.advance_output(&buf[..n], Instant::now(), s.host.is_some());
                                 s.revision.fetch_add(1, Ordering::Release);
                             }
                             Err(e) => {
@@ -213,6 +236,7 @@ impl Session {
                     }
                     if let Some(s) = read_weak.upgrade() {
                         let mut st = s.state.lock().unwrap();
+                        st.finish_output();
                         st.connected = false;
                         st.ended = true;
                         s.revision.fetch_add(1, Ordering::Release);
@@ -233,6 +257,15 @@ impl Session {
                             break;
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    if let Some(s) = weak.upgrade() {
+                        if s.state.lock().unwrap().advance_output(
+                            &[],
+                            Instant::now(),
+                            s.host.is_some(),
+                        ) {
+                            s.revision.fetch_add(1, Ordering::Release);
+                        }
                     }
                     if let Some(size) = pending_size.lock().unwrap().take() {
                         pty.resize(size)?;
@@ -401,6 +434,64 @@ pub fn authentication_plan(host: &Host, store: &HostStore, keepalive: u64) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn output_state() -> State {
+        State {
+            term: Terminal::new(
+                TerminalSize::default(),
+                Arc::new(TermConfig { theme: Theme::Ink }),
+                "TermViAI",
+                "test",
+                Box::new(Vec::new()),
+            ),
+            connected: true,
+            ended: false,
+            error: String::new(),
+            bytes: 0,
+            notifications: Inbox::default(),
+            broadcast_filter: BroadcastFilter::default(),
+        }
+    }
+    #[test]
+    fn remote_broadcast_does_not_change_prompt_or_cursor_and_local_is_untouched() {
+        let frame = format!(
+            "\r{}\r\n{:<79}\x07\x07\r\n{}\r\nhello\r\n{}\r\n",
+            " ".repeat(79),
+            "Broadcast message from root@host (pts/12) (Tue Nov 10 16:35:48 2026):",
+            " ".repeat(79),
+            " ".repeat(79)
+        );
+        let now = Instant::now();
+        let mut state = output_state();
+        state.advance_output(b"prompt> ", now, true);
+        let cursor = state.term.cursor_pos();
+        state.advance_output(frame.as_bytes(), now, true);
+        state.advance_output(&[], now + Duration::from_millis(300), true);
+        assert_eq!(state.notifications.items.len(), 1);
+        assert_eq!(state.term.cursor_pos().x, cursor.x);
+        assert_eq!(state.term.cursor_pos().y, cursor.y);
+        assert_eq!(state.bytes, frame.len() as u64 + 8);
+        state.advance_output(b"next", now + Duration::from_millis(300), true);
+        assert_eq!(state.term.cursor_pos().x, 12);
+        let mut local = output_state();
+        local.advance_output(frame.as_bytes(), now, false);
+        assert!(local.notifications.items.is_empty());
+        assert!(local.term.cursor_pos().y > 0);
+    }
+    #[test]
+    fn remote_output_eof_flushes_an_unfinished_candidate() {
+        let now = Instant::now();
+        let mut state = output_state();
+        let text = format!("\r{}\r\nBroadcast message from root@host", " ".repeat(79));
+        state.advance_output(text.as_bytes(), now, true);
+        state.finish_output();
+        assert!(state.notifications.items.is_empty());
+        let sc = state.term.screen();
+        let rows = sc.lines_in_phys_range(0..sc.scrollback_rows());
+        assert!(
+            rows.iter()
+                .any(|line| line.as_str().contains("Broadcast message from"))
+        );
+    }
     #[test]
     fn production_core_encodes_tab_and_shift_tab_for_shells() {
         let mut t = Terminal::new(

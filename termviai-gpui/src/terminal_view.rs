@@ -7,6 +7,9 @@ use std::{
 use termviai_gpui::{
     session::{Input, Session},
     terminal_ime::{ImeEpoch, Preedit},
+    terminal_selection::{
+        Selection, cell_at, edge_velocity, line_text_range, selected_columns, selected_text,
+    },
     theme::{Colors, Theme},
 };
 use wezterm_term::{KeyCode, KeyModifiers};
@@ -30,8 +33,9 @@ pub struct TerminalView {
     last_scroll: Instant,
     edge: bool,
     thumb_drag: Option<f32>,
-    selecting: bool,
-    selection: Option<((isize, usize), (isize, usize))>,
+    selection: Selection,
+    selection_pointer: Option<Point<Pixels>>,
+    selection_tick: Instant,
     top: isize,
     last_bottom: isize,
     preedit: Preedit,
@@ -56,8 +60,20 @@ impl TerminalView {
         .detach();
         cx.on_blur(&focus, window, |s, _, cx| {
             s.preedit.clear();
+            s.selection.dragging = false;
+            s.selection_pointer = None;
+            s.thumb_drag = None;
             s.session.state.lock().unwrap().term.focus_changed(false);
             cx.notify();
+        })
+        .detach();
+        cx.observe_window_activation(window, |s, w, cx| {
+            if !w.is_window_active() {
+                s.selection.dragging = false;
+                s.selection_pointer = None;
+                s.thumb_drag = None;
+                cx.notify();
+            }
         })
         .detach();
         cx.spawn(async move |this, cx| {
@@ -75,7 +91,33 @@ impl TerminalView {
                             s.follow = follow;
                             s.scroll = 0.;
                             s.target = 0.;
-                            s.selection = None;
+                            s.selection.clear();
+                            s.selection_pointer = None;
+                        }
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(s.selection_tick).as_secs_f32().min(0.05);
+                        s.selection_tick = now;
+                        if s.selection.dragging {
+                            if let Some(p) = s.selection_pointer {
+                                let speed = if s.selection.has_extended()
+                                    || p.y < s.bounds.top()
+                                    || p.y > s.bounds.bottom()
+                                {
+                                    edge_velocity(
+                                        f32::from(p.y - s.bounds.top()),
+                                        f32::from(s.bounds.size.height),
+                                        f32::from(s.line),
+                                    )
+                                } else {
+                                    0.
+                                };
+                                let target =
+                                    (s.target + speed * elapsed).clamp(0., s.history() as f32);
+                                if target != s.target {
+                                    s.target = target;
+                                    s.last_scroll = now;
+                                }
+                            }
                         }
                         let delta = s.target - s.scroll;
                         if delta.abs() > 0.01 {
@@ -115,8 +157,9 @@ impl TerminalView {
             last_scroll: Instant::now() - Duration::from_secs(5),
             edge: false,
             thumb_drag: None,
-            selecting: false,
-            selection: None,
+            selection: Selection::default(),
+            selection_pointer: None,
+            selection_tick: Instant::now(),
             top: 0,
             last_bottom: 0,
             preedit: Preedit::default(),
@@ -133,38 +176,50 @@ impl TerminalView {
         if !matches!(input, Input::KeyUp(_, _)) {
             self.scroll = 0.;
             self.target = 0.;
-            self.selection = None;
+            self.selection.clear();
+            self.selection_pointer = None;
         }
         cx.emit(TerminalEvent::Input(self.session.id, input));
         cx.notify();
     }
     fn coord(&self, p: Point<Pixels>) -> (isize, usize) {
-        (
-            self.top + ((p.y - self.bounds.top()) / self.line).floor().max(0.) as isize,
-            ((p.x - self.bounds.left()) / self.cell).floor().max(0.) as usize,
+        let fractional = if self.scroll.fract() > 0. {
+            1. - self.scroll.fract()
+        } else {
+            0.
+        };
+        cell_at(
+            self.top,
+            f32::from(p.x - self.bounds.left()),
+            f32::from(p.y - self.bounds.top()),
+            f32::from(self.cell),
+            f32::from(self.line),
+            f32::from(self.bounds.size.width),
+            f32::from(self.bounds.size.height),
+            fractional,
         )
     }
-    fn copy(&self, cx: &mut App) {
-        if let Some((a, b)) = self.selection {
-            let (a, b) = if a <= b { (a, b) } else { (b, a) };
-            let st = self.session.state.lock().unwrap();
-            let screen = st.term.screen();
-            let range = screen.stable_range(&(a.0..b.0 + 1));
-            let lines = screen.lines_in_phys_range(range);
-            let mut text = String::new();
-            for (i, line) in lines.iter().enumerate() {
-                let start = if i == 0 { a.1 } else { 0 };
-                let end = if i + 1 == lines.len() {
-                    b.1 + 1
-                } else {
-                    line.len()
-                };
-                text.push_str(line.columns_as_str(start..end).trim_end());
-                if i + 1 < lines.len() && !line.last_cell_was_wrapped() {
-                    text.push('\n');
-                }
+    fn extend_selection(&mut self, p: Point<Pixels>) {
+        self.selection_pointer = Some(p);
+        self.selection.extend(self.coord(p));
+    }
+    fn finish_selection(&mut self, p: Point<Pixels>, cx: &mut App) {
+        if self.selection.dragging {
+            self.extend_selection(p);
+            self.target = self.scroll;
+            if self.selection.finish() {
+                self.copy(cx);
             }
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        self.selection_pointer = None;
+        self.thumb_drag = None;
+    }
+    fn copy(&self, cx: &mut App) {
+        if let Some(range) = self.selection.range {
+            let st = self.session.state.lock().unwrap();
+            if let Some(text) = selected_text(st.term.screen(), range) {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
         }
     }
     fn key(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -265,8 +320,19 @@ impl TerminalView {
             );
             return;
         }
-        self.selecting = true;
-        self.selection = Some(((row, col), (row, col)));
+        if e.click_count == 2 {
+            self.selection.clear();
+            self.selection.range =
+                line_text_range(self.session.state.lock().unwrap().term.screen(), row);
+            self.selection_pointer = None;
+            self.copy(cx);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        self.selection.begin((row, col));
+        self.selection_pointer = Some(e.position);
+        self.selection_tick = Instant::now();
         cx.notify();
     }
     fn send_mouse(
@@ -307,6 +373,55 @@ impl TerminalView {
         self.last_scroll = Instant::now();
     }
     fn paint(&mut self, bounds: Bounds<Pixels>, w: &mut Window, cx: &mut Context<Self>) {
+        // Element move handlers are hit-tested. Capture an active drag at window
+        // level so leaving this pane cannot freeze the endpoint or affect a sibling.
+        let view = cx.entity().downgrade();
+        w.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture {
+                let _ = view.update(cx, |s, cx| {
+                    if s.selection.dragging || s.thumb_drag.is_some() {
+                        if e.pressed_button != Some(MouseButton::Left) {
+                            s.selection.dragging = false;
+                            s.selection_pointer = None;
+                            s.thumb_drag = None;
+                        } else if s.thumb_drag.is_some() {
+                            s.drag_scroll(e.position);
+                        } else {
+                            s.extend_selection(e.position);
+                        }
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                });
+            }
+        });
+        let view = cx.entity().downgrade();
+        w.on_mouse_event(move |e: &MouseUpEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture && e.button == MouseButton::Left {
+                let _ = view.update(cx, |s, cx| {
+                    if s.selection.dragging || s.thumb_drag.is_some() {
+                        s.finish_selection(e.position, cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                });
+            }
+        });
+        let view = cx.entity().downgrade();
+        w.on_mouse_event(move |e: &ScrollWheelEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture && !e.modifiers.control {
+                let _ = view.update(cx, |s, cx| {
+                    if s.selection.dragging {
+                        s.extend_selection(e.position);
+                        s.target = (s.target + e.delta.pixel_delta(s.line).y / s.line)
+                            .clamp(0., s.history() as f32);
+                        s.last_scroll = Instant::now();
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
+                });
+            }
+        });
         let mut font = font("JetBrainsMono Nerd Font Mono");
         font.fallbacks = Some(FontFallbacks::from_fonts(vec![
             "JetBrains Mono".into(),
@@ -355,6 +470,11 @@ impl TerminalView {
             )
         };
         self.top = top;
+        if self.selection.dragging {
+            if let Some(p) = self.selection_pointer {
+                self.selection.extend(self.coord(p));
+            }
+        }
         let fractional = if self.scroll.fract() > 0. {
             1. - self.scroll.fract()
         } else {
@@ -362,6 +482,21 @@ impl TerminalView {
         };
         w.with_content_mask(Some(ContentMask { bounds }), |w| {
             for (r, line) in lines.iter().enumerate() {
+                let y = bounds.top() + self.line * (r as f32 - fractional);
+                let selected = selected_columns(self.selection.range, top + r as isize, cols);
+                // TextRun backgrounds require a separate GPUI paint pass. Draw in
+                // terminal cell coordinates so short lines and wide glyphs stay exact.
+                if let Some(range) = &selected {
+                    w.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.left() + self.cell * range.start as f32, y),
+                            size(self.cell * range.len() as f32, self.line),
+                        ),
+                        rgba_color(palette.selection_bg),
+                    ));
+                }
+                let mut backgrounds: Vec<(usize, usize, wezterm_term::color::SrgbaTuple)> =
+                    Vec::new();
                 let mut text = String::new();
                 let mut runs = Vec::new();
                 let mut starts = Vec::new();
@@ -379,13 +514,21 @@ impl TerminalView {
                     if attrs.invisible() {
                         fg = bg;
                     }
-                    let selected = self.selection.is_some_and(|(a, b)| {
-                        let (a, b) = if a <= b { (a, b) } else { (b, a) };
-                        (top + r as isize, col) >= a && (top + r as isize, col) <= b
-                    });
-                    if selected {
+                    if selected
+                        .as_ref()
+                        .is_some_and(|range| col < range.end && col + cell.width() > range.start)
+                    {
                         bg = palette.selection_bg;
                         fg = palette.selection_fg;
+                    }
+                    let end = (col + cell.width()).min(cols);
+                    if let Some((_, previous_end, previous_bg)) = backgrounds.last_mut()
+                        && *previous_bg == bg
+                        && *previous_end == col
+                    {
+                        *previous_end = end;
+                    } else {
+                        backgrounds.push((col, end, bg));
                     }
                     let mut f = font.clone();
                     if attrs.intensity() == wezterm_term::Intensity::Bold {
@@ -401,7 +544,7 @@ impl TerminalView {
                         len: s.len(),
                         font: f,
                         color: rgba_color(fg),
-                        background_color: Some(rgba_color(bg)),
+                        background_color: None,
                         underline: if attrs.underline() != wezterm_term::Underline::None {
                             Some(UnderlineStyle {
                                 color: None,
@@ -420,6 +563,15 @@ impl TerminalView {
                             None
                         },
                     });
+                }
+                for (start, end, bg) in backgrounds {
+                    w.paint_quad(fill(
+                        Bounds::new(
+                            point(bounds.left() + self.cell * start as f32, y),
+                            size(self.cell * (end - start) as f32, self.line),
+                        ),
+                        rgba_color(bg),
+                    ));
                 }
                 let mut shaped =
                     w.text_system()
@@ -446,7 +598,6 @@ impl TerminalView {
                     }
                 }
                 *shaped = Arc::new(layout);
-                let y = bounds.top() + self.line * (r as f32 - fractional);
                 let _ = shaped.paint(point(bounds.left(), y), self.line, w, cx);
             }
             if self.scroll < 0.01
@@ -480,6 +631,7 @@ impl TerminalView {
                         &[run],
                         None,
                     );
+                    let _ = text.paint_background(origin, self.line, w, cx);
                     let _ = text.paint(origin, self.line, w, cx);
                 }
             }
@@ -604,11 +756,9 @@ impl Render for TerminalView {
                 if s.thumb_drag.is_some() {
                     s.drag_scroll(e.position);
                     cx.notify();
-                } else if s.selecting {
-                    if let Some((a, _)) = s.selection {
-                        s.selection = Some((a, s.coord(e.position)));
-                        cx.notify();
-                    }
+                } else if s.selection.dragging {
+                    s.extend_selection(e.position);
+                    cx.notify();
                 } else if s.session.state.lock().unwrap().term.is_mouse_grabbed() {
                     s.send_mouse(
                         e.position,
@@ -621,7 +771,7 @@ impl Render for TerminalView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|s, e: &MouseUpEvent, _, cx| {
-                    if !s.selecting && s.thumb_drag.is_none() {
+                    if !s.selection.dragging && s.thumb_drag.is_none() {
                         s.send_mouse(
                             e.position,
                             wezterm_term::MouseEventKind::Release,
@@ -629,17 +779,18 @@ impl Render for TerminalView {
                             e.modifiers,
                         );
                     }
-                    s.selecting = false;
-                    s.thumb_drag = None;
+                    s.finish_selection(e.position, cx);
                     cx.notify();
                 }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|s, _, _, cx| {
-                    s.selecting = false;
-                    s.thumb_drag = None;
-                    cx.notify();
+                cx.listener(|s, e: &MouseUpEvent, _, cx| {
+                    if s.selection.dragging || s.thumb_drag.is_some() {
+                        s.finish_selection(e.position, cx);
+                        cx.notify();
+                        cx.stop_propagation();
+                    }
                 }),
             )
             .on_hover(cx.listener(|s, hover, _, cx| {
@@ -659,6 +810,7 @@ impl Render for TerminalView {
                     .clamp(8., 64.);
                 } else if s.session.state.lock().unwrap().term.is_mouse_grabbed()
                     && !e.modifiers.shift
+                    && !s.selection.dragging
                 {
                     let button = if e.delta.pixel_delta(s.line).y > px(0.) {
                         wezterm_term::MouseButton::WheelUp(3)
@@ -672,6 +824,9 @@ impl Render for TerminalView {
                         e.modifiers,
                     );
                 } else {
+                    if s.selection.dragging {
+                        s.extend_selection(e.position);
+                    }
                     s.target = (s.target + e.delta.pixel_delta(s.line).y / s.line)
                         .clamp(0., s.history() as f32);
                     s.last_scroll = Instant::now();

@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod app;
+mod notice_view;
 mod terminal_view;
 use gpui::*;
 use gpui_component::Root;

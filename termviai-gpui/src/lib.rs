@@ -18,6 +18,8 @@ pub mod tab_policy;
 pub mod tab_strip;
 pub mod terminal_ime;
 pub mod terminal_keys;
+pub mod terminal_notifications;
+pub mod terminal_selection;
 pub mod theme;
 #[path = "../../wezterm-gui/src/workspaces.rs"]
 pub mod workspaces;

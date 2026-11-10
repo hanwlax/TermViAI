@@ -618,11 +618,6 @@ impl AppView {
         };
         let state = p.session.auth.view();
         let has_terminal = p.session.online() || p.session.state.lock().unwrap().bytes > 0;
-        let error = if !p.error.is_empty() {
-            p.error.clone()
-        } else {
-            p.session.state.lock().unwrap().error.clone()
-        };
         let owner = cx.entity();
         let header = div()
             .id(("pane-header", id))
@@ -642,31 +637,7 @@ impl AppView {
             .cursor(CursorStyle::PointingHand)
             .child(Icon::new(IconName::SquareTerminal).size(px(14.)))
             .child(div().flex_1().min_w_0().truncate().child(label))
-            .when(!error.is_empty(), |d| {
-                let message = error.clone();
-                d.child(
-                    div()
-                        .id(("pane-error", id))
-                        .size(px(17.))
-                        .rounded_full()
-                        .bg(self.c(self.col().red))
-                        .text_color(rgb(0xffffff))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(12.))
-                        .child("!")
-                        .on_click(cx.listener(move |s, _, _, cx| {
-                            if let Some(p) = s.panes.get_mut(&id) {
-                                p.save_attempted = false;
-                            }
-                            cx.stop_propagation();
-                        }))
-                        .tooltip(move |w, cx| {
-                            gpui_component::tooltip::Tooltip::new(message.clone()).build(w, cx)
-                        }),
-                )
-            })
+            .child(p.notices.clone())
             .when(group, |d| {
                 d.child(
                     div()

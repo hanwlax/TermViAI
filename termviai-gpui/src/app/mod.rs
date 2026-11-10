@@ -73,6 +73,7 @@ pub struct Pane {
     host: Option<Host>,
     session: Arc<Session>,
     view: Entity<TerminalView>,
+    notices: Entity<crate::notice_view::NoticeView>,
     form: Option<Form>,
     pending: Option<Pending>,
     save_attempted: bool,

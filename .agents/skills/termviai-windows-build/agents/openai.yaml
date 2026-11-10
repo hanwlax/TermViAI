@@ -1,0 +1,3 @@
+interface:
+  display_name: "TermViAI Windows 构建"
+  short_description: "编译、测试和打包 TermViAI Windows 原生产物，校验源码与产物一致性"
