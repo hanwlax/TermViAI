@@ -4,12 +4,12 @@
 
 TermViAI combines WezTerm's terminal, SSH and PTY foundations with a native Rust GPUI interface, a focused host library, multi-host tab groups and selective input broadcasting. Settings offers Ink, Navy and Light themes across the interface and terminal; the default font is JetBrainsMono Nerd Font Mono.
 
-> Current version: **v0.1.0-beta.8**. This beta targets Windows 10/11 x86_64.
+> Current version: **v0.1.0-beta.9**. This beta targets Windows 10/11 x86_64.
 
 ## Features
 
 - Native GPUI interface with shared terminal/SSH engines, without WebView or Electron.
-- Ctrl+click Host multi-selection and Enter to open separate terminal tabs.
+- Ctrl+click to select hosts and press Enter to open them as panes in one tab.
 - Overflow tab navigation with scrolling, searchable All tabs, automatic active-tab reveal and Ctrl+Tab cycling.
 - Nested Host groups with breadcrumbs, host moves and safe group deletion.
 - Exclusive Password / SSH Key / Identity authentication, with passwords saved in Windows Credential Manager.
@@ -19,30 +19,30 @@ TermViAI combines WezTerm's terminal, SSH and PTY foundations with a native Rust
 - Three switchable themes with instant preview and persistent Settings.
 - Tab menus for workspace actions; Ctrl + click to open terminal links.
 - Editable Keychain keys and identities, with consistent delete controls.
-- Saved SSH tab groups and recent connections, with hover-only removal and Identity-aware deduplication.
+- Save and restore tab groups from New Tab, reorder groups in the sidebar, and remove individual recent connections.
 - NPU Monitor for existing Linux hosts: card/Die metrics, process details and guarded process termination.
-- Port Forwarding from saved Hosts, with owned-tunnel recovery.
+- Port Forwarding waits for a network path and automatically reconnects eligible tunnels. Manually stopped services stay stopped.
 - Inline SSH authentication recovery with Keychain → Identity → manual fallback.
 - Configurable tab-close confirmation, enabled by default.
 - In-place SSH reconnect with scrollback preserved, including whole-group reconnect.
-- Right-side add/edit drawers, animated sidebar and broadcast toolbar.
+- Edit keys and identities in their cards, and find or create a group while editing a host.
 - Per-session `Ctrl` + mouse-wheel font sizing and a persistent global font size.
 - Configurable SSH keepalive interval, defaulting to 30 seconds; `0` disables it.
 - A real empty Hosts start page: no hidden local terminal is created at launch.
 
 ## Download
 
-Download **TermViAI-v0.1.0-beta.8-windows-x86_64.zip** from the [v0.1.0-beta.8 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.8), extract it, and run `TermViAI.exe`.
+Download **TermViAI-v0.1.0-beta.9-windows-x86_64.zip** from the [v0.1.0-beta.9 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.9), extract it, and run `TermViAI.exe`.
 
 This portable package contains `TermViAI.exe`, `README.txt` and `LICENSES.txt`. Extract into a new folder; no WebView or separate Chromium runtime is required. Existing Hosts, Keychain references and workspaces are reused.
 
 ## Basic use
 
-1. Open **Hosts** and select **Add Host**.
+1. Open **Hosts**, open the **Add** menu, and select **Add Host**.
 2. Enter the address and port, then choose **Password**, **SSH Key**, or **Identity**. Passwords are saved with the Host; SSH keys support a file path or Keychain selection.
 3. Open hosts in separate tabs, then drag a tab into another terminal to combine them.
 4. Use the tab broadcast control for the whole group, or choose individual terminals from pane headers and the bottom toolbar.
-5. Press `Ctrl+S` to save a multi-host tab group.
+5. Save a workspace from the tab menu. Right-click a sidebar tab group to save its set of tabs.
 
 Settings and local host data stay on this device. On Windows the application data directory is normally `%APPDATA%\wezterm\termviai`; `TERMVIAI_DATA_DIR` can override it.
 
@@ -58,7 +58,7 @@ The Cargo output is `termviai-gpui/target/release/TermViAI.exe`, with TermViAI W
 
 CI builds the Windows x86_64 GUI and runs broadcast policy, SSH, terminal core, window, mux, and GUI tests on relevant pushes and pull requests to `main`. Rust formatting and the Linux remote collector tests are checked separately. Windows CI can also be started manually; scheduled upstream builds and publishing workflows are archived under [`ci/upstream-workflows`](ci/upstream-workflows).
 
-Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.8.md](docs/termviai/RELEASE_V0.1.0_BETA.8.md).
+Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.9.md](docs/termviai/RELEASE_V0.1.0_BETA.9.md).
 
 ## Project origin and license
 

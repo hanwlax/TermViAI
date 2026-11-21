@@ -53,4 +53,4 @@ cargo build --locked --release --manifest-path termviai-gpui/Cargo.toml
 cargo test --locked --release --manifest-path termviai-gpui/Cargo.toml --lib -- --test-threads=1
 ```
 
-便携发布包仅含 EXE、README.txt 和 LICENSES.txt；许可证合并保留全文。源码、构建日志及验证记录放在独立的 developer 压缩包中，运行应用无需解压它。`VALIDATION.md` 记录实测与范围；`validation/source-sha256.json` 标识实际构建使用的共享源文件。当前发布版本为 v0.1.0-beta.8；目录/库名保留 termviai-gpui，公开应用名和可执行文件统一为 TermViAI。
+当前 Windows 便携版为 v0.1.0-beta.9，压缩包内含 `TermViAI.exe`、`README.txt` 和 `LICENSES.txt`。发布页同时提供 ZIP 的 SHA256 校验文件。
