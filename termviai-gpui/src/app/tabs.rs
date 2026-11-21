@@ -1,5 +1,25 @@
 use super::*;
 
+pub(super) struct TabGroup {
+    pub name: String,
+    pub(super) saved_id: Option<String>,
+    pub(super) number: usize,
+    last_page: Option<Page>,
+    pub new_tab_open: bool,
+}
+
+impl TabGroup {
+    fn new(number: usize) -> Self {
+        Self {
+            name: number.to_string(),
+            saved_id: None,
+            number,
+            last_page: None,
+            new_tab_open: false,
+        }
+    }
+}
+
 pub(super) struct TabRail {
     pub scroll: ScrollHandle,
     pub metrics: tab_strip::Metrics,
@@ -45,10 +65,421 @@ struct Entry {
     grouped: bool,
 }
 impl AppView {
-    fn tab_entries(&self) -> Vec<Entry> {
-        let mut entries = self
+    pub(super) fn group_tabs(&self) -> impl DoubleEndedIterator<Item = &Tab> {
+        self.tabs
+            .iter()
+            .filter(|t| t.group == self.active_tab_group)
+    }
+
+    pub(super) fn new_tab_open(&self) -> bool {
+        self.tab_groups
+            .get(self.active_tab_group)
+            .is_some_and(|group| group.new_tab_open)
+    }
+
+    pub(super) fn ensure_tab_group(&mut self) {
+        if self.tab_groups.is_empty() {
+            self.tab_groups.push(TabGroup::new(1));
+        }
+    }
+
+    pub(super) fn set_new_tab_open(&mut self, open: bool) {
+        if open {
+            self.ensure_tab_group();
+        }
+        if let Some(group) = self.tab_groups.get_mut(self.active_tab_group) {
+            group.new_tab_open = open;
+        }
+    }
+
+    pub(super) fn group_page(&self, group: usize) -> Page {
+        let Some(state) = self.tab_groups.get(group) else {
+            return Page::EmptyTabGroup;
+        };
+        match state.last_page {
+            Some(Page::Terminal(id))
+                if self.tabs.iter().any(|t| t.id == id && t.group == group) =>
+            {
+                return Page::Terminal(id);
+            }
+            Some(Page::NewTab) if state.new_tab_open => return Page::NewTab,
+            _ => {}
+        }
+        self.tabs
+            .iter()
+            .rev()
+            .find(|t| t.group == group)
+            .map(|t| Page::Terminal(t.id))
+            .unwrap_or(if state.new_tab_open {
+                Page::NewTab
+            } else {
+                Page::EmptyTabGroup
+            })
+    }
+
+    fn remember_group_page(&mut self) {
+        if matches!(self.page, Page::Terminal(_) | Page::NewTab)
+            && let Some(group) = self.tab_groups.get_mut(self.active_tab_group)
+        {
+            group.last_page = Some(self.page);
+        }
+        if let Page::Terminal(id) = self.page
+            && let Some(pane) = self.focused
+            && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id)
+            && tab.layout.panes().contains(&pane)
+        {
+            tab.last_focused = Some(pane);
+        }
+    }
+
+    fn create_tab_group(&mut self) -> usize {
+        let number = (1..)
+            .find(|number| {
+                let name = number.to_string();
+                !self
+                    .tab_groups
+                    .iter()
+                    .any(|group| group.number == *number || group.name == name)
+            })
+            .expect("A tab group number is available");
+        let group = self.tab_groups.len();
+        self.tab_groups.push(TabGroup {
+            new_tab_open: true,
+            ..TabGroup::new(number)
+        });
+        group
+    }
+
+    // Consume the launching New Tab before showing the destination. Removing an
+    // empty source can shift the destination index, so callers use active_tab_group.
+    fn enter_launched_group(&mut self, target: usize) {
+        self.remember_group_page();
+        let source = self.active_tab_group;
+        let from_new_tab = self.page == Page::NewTab;
+        if from_new_tab {
+            self.set_new_tab_open(false);
+        }
+        self.active_tab_group = target;
+        self.clear_drag();
+        if from_new_tab && source != target {
+            self.remove_empty_tab_group(source);
+        }
+    }
+
+    pub(super) fn add_tab_group(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let target = self.create_tab_group();
+        self.enter_launched_group(target);
+        self.show_page(Page::NewTab, w, cx);
+    }
+
+    pub(super) fn group_has_terminals(&self, index: usize) -> bool {
+        self.tabs.iter().any(|tab| tab.group == index)
+    }
+
+    pub(super) fn save_tab_group(&mut self, index: usize) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let group = self.tab_groups.get(index).context("Tab group closed")?;
+        let mut tabs = Vec::new();
+        let mut active_tab = None;
+        let active = if index == self.active_tab_group
+            && matches!(self.page, Page::Terminal(_) | Page::NewTab)
+        {
+            self.page
+        } else {
+            self.group_page(index)
+        };
+        for tab in self.tabs.iter().filter(|t| t.group == index) {
+            let focused = if self.page == Page::Terminal(tab.id) {
+                self.focused
+            } else {
+                tab.last_focused
+            };
+            let layout = tab
+                .layout
+                .save(&|id| {
+                    self.panes.get(&id).map(|p| SavedGroupPane {
+                        host: p.host.clone(),
+                        focused: focused == Some(id),
+                        broadcast_member: tab.broadcast.is_member(id),
+                    })
+                })
+                .context("A terminal in this group has closed")?;
+            if active == Page::Terminal(tab.id) {
+                active_tab = Some(tabs.len());
+            }
+            tabs.push(SavedGroupTab {
+                name: tab.name.clone(),
+                custom_name: tab.custom_name,
+                layout,
+                workspace_id: tab.saved.clone(),
+            });
+        }
+        let id = self.workspaces.save_tab_group(
+            group.saved_id.as_deref(),
+            &group.name,
+            tabs,
+            group.new_tab_open,
+            active_tab,
+        )?;
+        self.tab_groups[index].saved_id = Some(id);
+        Ok(())
+    }
+
+    pub(super) fn open_saved_group(
+        &mut self,
+        saved: &SavedTabGroup,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self
+            .tab_groups
+            .iter()
+            .position(|g| g.saved_id.as_ref() == Some(&saved.id));
+        if let Some(index) = existing.filter(|index| self.group_has_terminals(*index)) {
+            self.enter_launched_group(index);
+            self.show_page(self.group_page(self.active_tab_group), w, cx);
+            return;
+        }
+
+        // Restore into the emptied live group, or reuse a launcher-only group.
+        let target = existing.unwrap_or_else(|| {
+            if self.page == Page::NewTab
+                && self.new_tab_open()
+                && !self.group_has_terminals(self.active_tab_group)
+            {
+                self.active_tab_group
+            } else {
+                self.create_tab_group()
+            }
+        });
+        self.enter_launched_group(target);
+        let index = self.active_tab_group;
+        let mut name = saved.name.clone();
+        let mut suffix = 2;
+        while self
+            .tab_groups
+            .iter()
+            .enumerate()
+            .any(|(i, g)| i != index && g.name == name)
+        {
+            name = format!("{} ({suffix})", saved.name);
+            suffix += 1;
+        }
+        let group = &mut self.tab_groups[index];
+        group.name = name;
+        group.saved_id = Some(saved.id.clone());
+        group.new_tab_open = saved.new_tab_open || saved.tabs.is_empty();
+        let mut page = Page::NewTab;
+        for (i, tab) in saved.tabs.iter().enumerate() {
+            let mut focused = None;
+            let mut broadcast = BroadcastState::default();
+            let mut members = Vec::new();
+            let layout = Layout::restore(&tab.layout, &mut |pane| {
+                let id = self.spawn_pane(pane.host.clone(), w, cx);
+                if pane.focused {
+                    focused = Some(id);
+                }
+                members.push((id, pane.broadcast_member));
+                id
+            });
+            broadcast.sync_panes(layout.panes());
+            for (id, member) in members {
+                let _ = broadcast.set_member(id, member);
+            }
+            let id = self.id();
+            if saved.active_tab == Some(i) || (i == 0 && !saved.new_tab_open) {
+                page = Page::Terminal(id);
+            }
+            self.tabs.push(Tab {
+                id,
+                group: index,
+                last_focused: focused,
+                name: tab.name.clone(),
+                custom_name: tab.custom_name,
+                layout,
+                broadcast,
+                saved: tab.workspace_id.clone(),
+                tray: false,
+                tray_motion: None,
+                zoom: None,
+            });
+        }
+        self.focused = self
             .tabs
             .iter()
+            .find(|t| page == Page::Terminal(t.id))
+            .and_then(|t| t.last_focused);
+        self.show_page(page, w, cx);
+    }
+
+    pub(super) fn switch_tab_group(
+        &mut self,
+        group: usize,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.remember_group_page();
+        self.active_tab_group = group;
+        self.clear_drag();
+        self.show_page(self.group_page(group), w, cx);
+    }
+
+    pub(super) fn close_new_tab(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let group = self.active_tab_group;
+        self.set_new_tab_open(false);
+        if self.page == Page::NewTab {
+            self.activate_tab(self.group_page(group), w, cx);
+        }
+        self.remove_empty_tab_group(group);
+        self.focus_active_tab(w, cx);
+        cx.notify();
+    }
+
+    pub(super) fn remove_empty_tab_group(&mut self, group: usize) {
+        if self.tab_groups.get(group).is_some_and(|g| !g.new_tab_open)
+            && !self.group_has_terminals(group)
+        {
+            self.remove_tab_group(group);
+        }
+    }
+
+    pub(super) fn move_tab_group(
+        &mut self,
+        source_number: usize,
+        gap: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = self
+            .tab_groups
+            .iter()
+            .position(|g| g.number == source_number)
+        else {
+            return;
+        };
+        let Some(target) = tab_policy::reorder_destination(self.tab_groups.len(), source, gap)
+        else {
+            return;
+        };
+        let group = self.tab_groups.remove(source);
+        self.tab_groups.insert(target, group);
+        let remap = |index: &mut usize| {
+            *index = tab_policy::index_after_move(*index, source, target);
+        };
+        for tab in &mut self.tabs {
+            remap(&mut tab.group);
+        }
+        remap(&mut self.active_tab_group);
+        if let Some(Form {
+            kind: FormKind::RenameTabGroup(id),
+            ..
+        }) = &mut self.drawer
+        {
+            remap(id);
+        }
+        if let Some(Confirm::TabGroup(id)) = &mut self.confirm {
+            remap(id);
+        }
+        self.menu = None;
+        self.hovered_tab_group = None;
+        cx.notify();
+    }
+
+    fn remove_tab_group(&mut self, group: usize) {
+        self.hovered_tab_group = None;
+        self.tab_groups.remove(group);
+        for tab in &mut self.tabs {
+            if tab.group > group {
+                tab.group -= 1;
+            }
+        }
+        if let Some(form) = &mut self.drawer
+            && let FormKind::RenameTabGroup(id) = &mut form.kind
+        {
+            if *id == group {
+                self.drawer = None;
+            } else if *id > group {
+                *id -= 1;
+            }
+        }
+        self.menu = None;
+        if let Some(Confirm::TabGroup(id)) = &mut self.confirm {
+            if *id == group {
+                self.confirm = None;
+            } else if *id > group {
+                *id -= 1;
+            }
+        }
+        if self.active_tab_group > group {
+            self.active_tab_group -= 1;
+        } else if self.active_tab_group == group {
+            self.active_tab_group = group.min(self.tab_groups.len().saturating_sub(1));
+            self.tab_picker = false;
+            if matches!(
+                self.page,
+                Page::Terminal(_) | Page::NewTab | Page::EmptyTabGroup
+            ) {
+                self.page = if self.tab_groups.is_empty() {
+                    Page::Hosts
+                } else {
+                    self.group_page(self.active_tab_group)
+                };
+            }
+        }
+    }
+
+    pub(super) fn close_tab_group(&mut self, group: usize, w: &mut Window, cx: &mut Context<Self>) {
+        let active = self.active_tab_group == group;
+        if active {
+            self.clear_page_search(w, cx);
+        }
+        self.tabs.retain(|tab| {
+            if tab.group != group {
+                return true;
+            }
+            for pane in tab.layout.panes() {
+                self.panes.remove(&pane);
+            }
+            false
+        });
+        self.remove_tab_group(group);
+        self.clear_drag();
+        if active {
+            self.focus_active_tab(w, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn can_drop_on_group(&self, drag: &Drag, group: usize) -> bool {
+        drag.pane.is_none()
+            && self
+                .tabs
+                .iter()
+                .any(|t| t.id == drag.tab && t.group != group)
+    }
+
+    pub(super) fn drop_on_group(
+        &mut self,
+        drag: &Drag,
+        group: usize,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_drop_on_group(drag, group) {
+            return;
+        }
+        let index = self.tabs.iter().position(|t| t.id == drag.tab).unwrap();
+        let mut tab = self.tabs.remove(index);
+        let source = tab.group;
+        tab.group = group;
+        self.tabs.push(tab);
+        self.clear_drag();
+        self.activate_tab(Page::Terminal(drag.tab), w, cx);
+        self.remove_empty_tab_group(source);
+    }
+
+    fn tab_entries(&self) -> Vec<Entry> {
+        let mut entries = self
+            .group_tabs()
             .map(|t| {
                 let members = t.layout.visual_panes();
                 let hosts = members
@@ -80,7 +511,7 @@ impl AppView {
                 }
             })
             .collect::<Vec<_>>();
-        if self.new_tab_open {
+        if self.new_tab_open() {
             entries.push(Entry {
                 page: Page::NewTab,
                 name: "New Tab".into(),
@@ -103,8 +534,9 @@ impl AppView {
         match self.page {
             Page::Terminal(id) => {
                 if let Some(t) = self.tabs.iter().find(|t| t.id == id) {
-                    let pane = self
-                        .focused
+                    let pane = t
+                        .zoom
+                        .or(t.last_focused)
                         .filter(|p| t.layout.panes().contains(p))
                         .or_else(|| t.layout.visual_panes().first().copied());
                     if let Some(id) = pane {
@@ -115,13 +547,27 @@ impl AppView {
                     }
                 }
             }
-            Page::NewTab => self.search.focus_handle(cx).focus(w),
+            Page::NewTab => self.new_tab_search.focus_handle(cx).focus(w),
             _ => self.focus.focus(w),
         }
     }
     pub(super) fn activate_tab(&mut self, page: Page, w: &mut Window, cx: &mut Context<Self>) {
-        self.host_selection.clear();
+        self.remember_group_page();
+        if let Page::Terminal(id) = page {
+            if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+                self.active_tab_group = tab.group;
+            }
+        }
+        self.show_page(page, w, cx);
+    }
+
+    fn show_page(&mut self, page: Page, w: &mut Window, cx: &mut Context<Self>) {
+        if self.drawer.is_some() {
+            self.close_form(w, cx);
+        }
+        self.clear_page_search(w, cx);
         self.page = page;
+        self.remember_group_page();
         self.tab_picker = false;
         self.menu = None;
         self.tab_rail.reveal_pending = true;
@@ -129,7 +575,7 @@ impl AppView {
         cx.notify();
     }
     pub(super) fn open_new_tab(&mut self, w: &mut Window, cx: &mut Context<Self>) {
-        self.new_tab_open = true;
+        self.set_new_tab_open(true);
         self.activate_tab(Page::NewTab, w, cx);
     }
     pub(super) fn cycle_tab(&mut self, reverse: bool, w: &mut Window, cx: &mut Context<Self>) {
@@ -205,11 +651,14 @@ impl AppView {
     }
     pub(super) fn prepare_tabs(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if self.page == Page::NewTab {
-            self.new_tab_open = true;
+            self.set_new_tab_open(true);
         }
-        let count = self.tabs.len() + usize::from(self.new_tab_open);
-        let metrics = tab_strip::Metrics::new(w.viewport_size().width / px(1.), count);
-        let ids = self.tabs.iter().map(|t| t.id).collect::<Vec<_>>();
+        self.remember_group_page();
+        let ids = self.group_tabs().map(|t| t.id).collect::<Vec<_>>();
+        let count = ids.len() + usize::from(self.new_tab_open());
+        // Metrics use a 152px brand slot as their baseline.
+        let width = w.viewport_size().width / px(1.) - (self.brand_width() - 152.);
+        let metrics = tab_strip::Metrics::new(width, count);
         if self.tab_rail.last_tabs != ids
             || self.tab_rail.last_active != Some(self.page)
             || self.tab_rail.metrics.viewport != metrics.viewport
@@ -217,7 +666,6 @@ impl AppView {
         {
             self.tab_rail.reveal_pending = true;
         }
-        self.tab_rail.last_tabs = ids;
         self.tab_rail.last_active = Some(self.page);
         self.tab_rail.metrics = metrics;
         if !metrics.overflow && self.tab_picker {
@@ -243,8 +691,8 @@ impl AppView {
         self.tab_rail.set_offset(self.tab_rail.offset());
         if self.drag_source.is_none() && self.tab_rail.reveal_pending {
             let index = match self.page {
-                Page::Terminal(id) => self.tabs.iter().position(|t| t.id == id),
-                Page::NewTab => Some(self.tabs.len()),
+                Page::Terminal(id) => ids.iter().position(|t| *t == id),
+                Page::NewTab => Some(ids.len()),
                 _ => None,
             };
             if let Some(index) = index {
@@ -256,6 +704,7 @@ impl AppView {
             }
             self.tab_rail.reveal_pending = false;
         }
+        self.tab_rail.last_tabs = ids;
         if let Some(drag) = self.drag_source.clone() {
             if self.tab_rail.edge != 0 {
                 self.tab_rail.motion = None;
@@ -280,6 +729,7 @@ impl AppView {
         let bounds = self.tab_rail.scroll.bounds();
         if !bounds.contains(&position) {
             self.tab_rail.edge = 0;
+            self.tab_join_target = None;
             if self.tab_drop_target.is_some_and(|(id, _)| id != usize::MAX) {
                 self.tab_drop_target = None;
                 cx.notify();
@@ -288,14 +738,26 @@ impl AppView {
         }
         let x = (position.x - bounds.left()) / px(1.);
         self.tab_rail.edge = self.tab_rail.metrics.edge(x);
+        self.tab_join_target = None;
         let next = self
             .tab_rail
             .metrics
-            .insertion(self.tab_rail.offset(), x, self.tabs.len())
+            .insertion(self.tab_rail.offset(), x, self.tab_rail.last_tabs.len())
             .and_then(|(index, after)| {
-                let id = self.tabs[index].id;
+                let id = self.tab_rail.last_tabs[index];
+                let center =
+                    self.tab_rail
+                        .metrics
+                        .over_tab_center(self.tab_rail.offset(), x, index);
+                if drag.tab == id && center {
+                    return None;
+                }
                 if drag.tab != id && self.dock_source(drag).is_some() {
                     self.page = Page::Terminal(id);
+                    if center {
+                        self.tab_join_target = Some(id);
+                        return None;
+                    }
                 }
                 self.tab_drop_gap(drag, id, after).map(|_| (id, after))
             });
@@ -304,7 +766,15 @@ impl AppView {
         cx.notify();
     }
     pub(super) fn finish_tab_drop(&mut self, drag: &Drag, w: &mut Window, cx: &mut Context<Self>) {
-        if let Some((id, _)) = self.tab_drop_target {
+        if let Some(id) = self.tab_join_target.take()
+            && let Some(target) = self
+                .tabs
+                .iter()
+                .find(|t| t.id == id)
+                .and_then(|t| t.layout.visual_panes().last().copied())
+        {
+            self.dock(drag, id, target, Side::Right, cx);
+        } else if let Some((id, _)) = self.tab_drop_target {
             self.drop_on_tab(drag, id, cx);
         } else {
             self.clear_drag();
@@ -322,6 +792,7 @@ impl AppView {
             .id("all-tab-list")
             .flex()
             .flex_col()
+            .gap(px(2.))
             .max_h(px(286.))
             .relative()
             .overflow_y_scroll()
@@ -358,10 +829,11 @@ impl AppView {
                     .gap_1()
                     .p_1()
                     .rounded_md()
+                    .border_1()
+                    .border_color(transparent_black())
                     .cursor_pointer()
-                    .when(current, |d| d.bg(self.c(self.col().soft)))
-                    .when(!current && i == self.tab_picker_index, |d| {
-                        d.bg(self.c(self.col().hover))
+                    .when(i == self.tab_picker_index, |d| {
+                        d.border_color(self.c(self.col().accent))
                     })
                     .hover(|d| d.bg(self.c(self.col().hover)))
                     .child(
@@ -402,9 +874,15 @@ impl AppView {
                             })
                             .when(current, |d| {
                                 d.child(
-                                    Icon::new(IconName::Check)
-                                        .size(px(15.))
-                                        .text_color(self.c(self.col().accent)),
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .text_size(px(11.))
+                                        .text_color(self.c(self.col().accent))
+                                        .child(Icon::new(IconName::Check).size(px(13.)))
+                                        .child("Current"),
                                 )
                             }),
                     )
@@ -419,17 +897,10 @@ impl AppView {
                                         s.tab_picker = false;
                                         s.confirm = Some(Confirm::Tab(id));
                                     } else {
-                                        s.close_tab(id, cx);
+                                        s.close_tab(id, w, cx);
                                     }
                                 } else {
-                                    s.new_tab_open = false;
-                                    if s.page == Page::NewTab {
-                                        s.page = s
-                                            .tabs
-                                            .last()
-                                            .map(|t| Page::Terminal(t.id))
-                                            .unwrap_or(Page::Hosts);
-                                    }
+                                    s.close_new_tab(w, cx);
                                 }
                                 if !s.tab_picker {
                                     s.focus_active_tab(w, cx);
@@ -472,10 +943,13 @@ impl AppView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("All tabs"))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Group tabs"))
                     .child(
-                        self.muted((self.tabs.len() + usize::from(self.new_tab_open)).to_string())
-                            .flex_1(),
+                        self.muted(
+                            (self.group_tabs().count() + usize::from(self.new_tab_open()))
+                                .to_string(),
+                        )
+                        .flex_1(),
                     )
                     .child(
                         self.close("all-tabs-dismiss")

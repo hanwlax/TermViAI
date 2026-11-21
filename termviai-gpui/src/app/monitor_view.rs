@@ -13,6 +13,15 @@ fn can_stop(e: &monitor::Entry, ps: &[monitor::Process]) -> bool {
         && !ps.is_empty()
         && ps.iter().all(|p| p.controllable && !p.token.is_empty())
 }
+pub(super) fn sampling_icon(e: &monitor::Entry) -> &'static str {
+    if !e.error.is_empty() {
+        "termviai/reconnect.svg"
+    } else if e.paused {
+        "termviai/play.svg"
+    } else {
+        "termviai/pause.svg"
+    }
+}
 impl AppView {
     fn monitor_problem(&self, id: usize, cx: &mut Context<Self>) -> AnyElement {
         use termviai_gpui::monitor_presenter::{Issue, issue};
@@ -61,9 +70,9 @@ impl AppView {
                 .when(e.busy(), |d| d.opacity(0.45).cursor_default())
                 .on_click(cx.listener(move |s, _, _, cx| {
                     if s.monitor.entries.get(id).is_some_and(|e| !e.busy()) {
-                        s.monitor.retry(id);
+                        let result = s.monitor.set_paused(id, false);
+                        s.notify_error(result, cx);
                     }
-                    cx.notify();
                 })),
             );
             if !e.paused && !e.needs_attention() {
@@ -71,10 +80,8 @@ impl AppView {
                     self.button("monitor-pause-retries", "Pause retries")
                         .border_0()
                         .on_click(cx.listener(move |s, _, _, cx| {
-                            if let Some(e) = s.monitor.entries.get_mut(id) {
-                                e.paused = true;
-                            }
-                            cx.notify();
+                            let result = s.monitor.set_paused(id, true);
+                            s.notify_error(result, cx);
                         })),
                 );
             }
@@ -174,35 +181,35 @@ impl AppView {
             } else {
                 self.col().muted
             }))
-            .child(format!(
-                "{}{}",
-                if e.live() { "• " } else { "" },
-                e.status()
-            ))
+            .child(e.status().to_owned())
+    }
+    pub(super) fn toggle_monitor_sampling(&mut self, id: usize, cx: &mut Context<Self>) {
+        if let Some(entry) = self.monitor.entries.get(id) {
+            let pause = !entry.paused && entry.error.is_empty();
+            let result = self.monitor.set_paused(id, pause);
+            self.notify_error(result, cx);
+        }
     }
     fn monitor_action(&self, id: usize, cx: &mut Context<Self>) -> Stateful<Div> {
         let e = &self.monitor.entries[id];
-        self.button(
-            ("monitor-pause", id),
-            if !e.error.is_empty() {
-                "↻  Retry"
-            } else if e.paused {
-                "▷  Resume"
-            } else {
-                "Ⅱ  Pause"
-            },
-        )
-        .on_click(cx.listener(move |s, _, _, cx| {
-            cx.stop_propagation();
-            if let Some(e) = s.monitor.entries.get_mut(id) {
-                if e.error.is_empty() && !e.paused {
-                    e.paused = true;
-                } else {
-                    s.monitor.retry(id);
-                }
-            }
-            cx.notify();
-        }))
+        let label = if !e.error.is_empty() {
+            "Retry"
+        } else if e.paused {
+            "Resume"
+        } else {
+            "Pause"
+        };
+        self.button(("monitor-pause", id), "")
+            .child(
+                Icon::new(IconName::Redo)
+                    .path(sampling_icon(e))
+                    .size(px(15.)),
+            )
+            .child(label)
+            .on_click(cx.listener(move |s, _, _, cx| {
+                cx.stop_propagation();
+                s.toggle_monitor_sampling(id, cx);
+            }))
     }
     fn monitor_stop_button(
         &self,
@@ -238,29 +245,17 @@ impl AppView {
         } else {
             "monitor-page"
         };
-        let width =
-            (f32::from(w.viewport_size().width) - if self.sidebar { 176. } else { 48. } - 48.)
-                .max(200.);
-        let cols = if width >= 800. {
-            3
-        } else if width >= 520. {
-            2
+        let width = self.tool_content_width(w);
+        let inspect = selected.is_some_and(|(_, card, _)| card.is_some());
+        let beside = inspect && width >= 850.;
+        let inspector_width = (width * 0.38).clamp(330., 490.);
+        let width = if beside {
+            width - inspector_width
         } else {
-            1
+            width
         };
-        let card_width = (width - 12. * (cols - 1) as f32) / cols as f32;
-        let mut body = div()
-            .id(scroll)
-            .flex_1()
-            .min_h_0()
-            .relative()
-            .overflow_y_scroll()
-            .track_scroll(&self.scrollers[scroll])
-            .vertical_scrollbar(&self.scrollers[scroll])
-            .p_6()
-            .flex()
-            .flex_col()
-            .gap_5();
+        let card_width = Self::grid_tile_width(width, 322.);
+        let mut body = self.tool_content(w);
         if !self.monitor.load_error.is_empty() {
             body = body.child(self.notice(
                 "Monitor preferences could not be loaded",
@@ -419,17 +414,24 @@ impl AppView {
                         .flex()
                         .items_center()
                         .justify_between()
+                        .gap_2()
+                        .flex_wrap()
+                        .child(self.title("Monitor"))
+                        .child(div().flex_1())
+                        .child(self.interval_button().on_click(cx.listener(
+                            |s, e: &ClickEvent, _, cx| {
+                                s.menu = Some((MenuKind::MonitorInterval, e.position()));
+                                cx.notify();
+                            },
+                        )))
                         .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(self.title("Monitor"))
-                                .child(self.muted("Ascend NPU · Host resources")),
-                        )
-                        .child(self.button("monitor-add", "+  Add hosts").on_click(
-                            cx.listener(|s, _, w, cx| s.open_form(FormKind::Monitor, w, cx)),
-                        )),
+                            self.action_button("monitor-add", "Add hosts", IconName::Plus)
+                                .on_click(
+                                    cx.listener(|s, _, w, cx| {
+                                        s.open_form(FormKind::Monitor, w, cx)
+                                    }),
+                                ),
+                        ),
                 )
                 .child(
                     div()
@@ -468,14 +470,7 @@ impl AppView {
                                         .filter(|e| !e.paused && !e.error.is_empty())
                                         .count()
                                 )),
-                        )
-                        .child(div().flex_1())
-                        .child(self.interval_button().on_click(cx.listener(
-                            |s, e: &ClickEvent, _, cx| {
-                                s.menu = Some((MenuKind::MonitorInterval, e.position()));
-                                cx.notify();
-                            },
-                        ))),
+                        ),
                 )
                 .child(
                     div().flex().flex_wrap().gap_3().children(
@@ -504,12 +499,28 @@ impl AppView {
         }
         div()
             .relative()
+            .w_full()
+            .max_w(px(self.tool_content_width(w) + 2. * Self::tool_gutter(w)))
             .flex_1()
             .min_h_0()
             .flex()
-            .flex_col()
-            .child(body)
-            .child(self.monitor_overlay(cx))
+            .when(!beside, |d| d.flex_col())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(self.tool_scroll(scroll, body)),
+            )
+            .when(inspect, |d| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .when(beside, |d| d.w(px(inspector_width)).h_full())
+                        .when(!beside, |d| d.h(relative(0.52)).w_full())
+                        .child(self.monitor_inspector(cx)),
+                )
+            })
             .into_any_element()
     }
     fn monitor_host_card(&self, id: usize, width: f32, cx: &mut Context<Self>) -> AnyElement {
@@ -611,38 +622,54 @@ impl AppView {
             );
         } else {
             card = card.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        self.muted(if e.error.is_empty() {
-                            "Waiting for resource data"
-                        } else {
-                            "HBM and AICore data unavailable"
-                        })
-                        .flex_1(),
-                    )
-                    .when(!e.error.is_empty(), |d| {
-                        d.child(
-                            self.button(("retry-host", id), "↻ Retry")
-                                .on_click(cx.listener(move |s, _, _, cx| {
-                                    cx.stop_propagation();
-                                    s.monitor.retry(id);
-                                    cx.notify();
-                                })),
-                        )
-                    }),
+                div().flex().items_center().gap_2().child(
+                    self.muted(if e.error.is_empty() {
+                        "Waiting for resource data"
+                    } else {
+                        "HBM and AICore data unavailable"
+                    })
+                    .flex_1(),
+                ),
             );
         }
-        card.on_click(cx.listener(move |s, _, _, cx| {
+        let card = card.on_click(cx.listener(move |s, _, _, cx| {
             s.monitor_detail = Some((id, None, None));
             s.monitor_technical = false;
             s.monitor_reason = None;
             s.scrollers["monitor-detail"].set_offset(point(px(0.), px(0.)));
             cx.notify();
-        }))
-        .into_any_element()
+        }));
+        div()
+            .w(px(width))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(card)
+            .when(self.monitor_reason == Some(id), |d| {
+                d.child(
+                    div()
+                        .rounded_lg()
+                        .p_3()
+                        .bg(self.c(self.col().card))
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child("SSH connection")
+                        .child(self.muted(e.host.endpoint()))
+                        .child(self.muted(e.status().to_owned()))
+                        .when(!e.error.is_empty(), |d| {
+                            d.child(self.monitor_problem(id, cx))
+                        })
+                        .child(
+                            self.button(("close-connection", id), "Close details")
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    s.monitor_reason = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .into_any_element()
     }
     fn monitor_npu_card(
         &self,
@@ -765,6 +792,7 @@ impl AppView {
                 .build(w, cx)
             })
             .on_click(cx.listener(move |s, _, _, cx| {
+                s.expanded_process = None;
                 s.monitor_detail = Some((id, Some(npu), None));
                 s.monitor_reason = None;
                 s.scrollers["monitor-process"].set_offset(point(px(0.), px(0.)));
@@ -772,7 +800,7 @@ impl AppView {
             }))
             .into_any_element()
     }
-    fn monitor_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn monitor_inspector(&self, cx: &mut Context<Self>) -> AnyElement {
         let scope = self
             .monitor_detail
             .and_then(|(id, n, d)| n.map(|n| (id, n, d)));
@@ -930,19 +958,43 @@ impl AppView {
                             "HBM {} GB · selected scope",
                             gb(process_memory(snapshot, p.pid, npu, die))
                         )))
-                        .child(div().text_size(px(13.)).child(format!(
-                            "Working directory: {}",
-                            if p.cwd.is_empty() {
-                                "Unavailable"
+                        .child(
+                            self.action_button(
+                                ("inspect-command", i),
+                                "Command and working directory",
+                                if self.expanded_process == Some((id, p.pid)) {
+                                    IconName::ChevronUp
+                                } else {
+                                    IconName::ChevronDown
+                                },
+                            )
+                            .on_click(cx.listener({
+                                let pid = p.pid;
+                                move |s, _, _, cx| {
+                                    s.expanded_process = if s.expanded_process == Some((id, pid)) {
+                                        None
+                                    } else {
+                                        Some((id, pid))
+                                    };
+                                    cx.notify();
+                                }
+                            })),
+                        )
+                        .when(self.expanded_process == Some((id, p.pid)), |d| {
+                            d.child(div().text_size(px(13.)).child(format!(
+                                "Working directory: {}",
+                                if p.cwd.is_empty() {
+                                    "Unavailable"
+                                } else {
+                                    &p.cwd
+                                }
+                            )))
+                            .child(div().text_size(px(13.)).child(if p.command.is_empty() {
+                                "Command unavailable".into()
                             } else {
-                                &p.cwd
-                            }
-                        )))
-                        .child(div().text_size(px(13.)).child(if p.command.is_empty() {
-                            "Command unavailable".into()
-                        } else {
-                            p.command.clone()
-                        }))
+                                p.command.clone()
+                            }))
+                        })
                         .child(self.muted(locations(snapshot, p.pid)))
                 }))
                 .child(self.muted("Ending a shared process affects every Die it occupies."));
@@ -958,96 +1010,61 @@ impl AppView {
                 .child(self.notice("Process action needs attention", e.action_error.clone()));
         }
         div()
-            .absolute()
-            .inset_0()
+            .id("monitor-inspector")
+            .relative()
+            .w_full()
+            .max_w_full()
+            .h_full()
+            .flex_shrink_0()
+            .occlude()
+            .bg(self.c(self.col().bg))
+            .border_l_1()
+            .border_color(self.c(self.col().line))
             .flex()
-            .justify_end()
+            .flex_col()
             .child(
                 div()
-                    .id("monitor-overlay-shade")
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .bg(rgba(0x00000055))
-                    .occlude()
-                    .on_click(cx.listener(|s, _, _, cx| s.close_monitor_overlay(cx))),
-            )
-            .child(
-                div()
-                    .id("monitor-overlay")
-                    .relative()
-                    .w(px(520.))
-                    .max_w_full()
-                    .h_full()
-                    .flex_shrink_0()
-                    .occlude()
-                    .bg(self.c(self.col().bg))
-                    .border_l_1()
-                    .border_color(self.c(self.col().line))
+                    .p_5()
                     .flex()
-                    .flex_col()
+                    .items_center()
+                    .gap_3()
+                    .flex_shrink_0()
                     .child(
                         div()
-                            .p_5()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .flex_shrink_0()
+                            .flex_1()
                             .child(
                                 div()
-                                    .flex_1()
-                                    .child(
-                                        div()
-                                            .text_size(px(18.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child(title),
-                                    )
-                                    .child(self.muted(format!(
-                                        "{} · {}",
-                                        e.host.label,
-                                        e.status()
-                                    ))),
+                                    .text_size(px(18.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(title),
                             )
-                            .child(
-                                self.close("close-monitor-overlay").on_click(
-                                    cx.listener(|s, _, _, cx| s.close_monitor_overlay(cx)),
-                                ),
-                            ),
-                    )
-                    .when(!reason && e.snapshot.is_some(), |d| {
-                        d.child(controls.px_5().pb_4().flex_shrink_0())
-                    })
-                    .child(
-                        div()
-                            .id("monitor-process-scroll")
-                            .relative()
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scrollers["monitor-process"])
-                            .vertical_scrollbar(&self.scrollers["monitor-process"])
-                            .px_5()
-                            .pb_5()
-                            .child(content),
+                            .child(self.muted(format!("{} · {}", e.host.label, e.status()))),
                     )
                     .child(
-                        div()
-                            .p_4()
-                            .flex()
-                            .justify_end()
-                            .flex_shrink_0()
-                            .border_t_1()
-                            .border_color(self.c(self.col().line))
-                            .child(
-                                self.button("close-monitor-detail", "Close").on_click(
-                                    cx.listener(|s, _, _, cx| s.close_monitor_overlay(cx)),
-                                ),
-                            ),
+                        self.close("close-monitor-overlay")
+                            .on_click(cx.listener(|s, _, _, cx| s.close_monitor_overlay(cx))),
                     ),
+            )
+            .when(!reason && e.snapshot.is_some(), |d| {
+                d.child(controls.px_5().pb_4().flex_shrink_0())
+            })
+            .child(
+                div()
+                    .id("monitor-process-scroll")
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scrollers["monitor-process"])
+                    .vertical_scrollbar(&self.scrollers["monitor-process"])
+                    .px_5()
+                    .pb_5()
+                    .child(content),
             )
             .into_any_element()
     }
     pub(super) fn close_monitor_overlay(&mut self, cx: &mut Context<Self>) {
+        self.expanded_process = None;
         self.monitor_reason = None;
         if let Some((id, _, _)) = self.monitor_detail {
             self.monitor_detail = Some((id, None, None));

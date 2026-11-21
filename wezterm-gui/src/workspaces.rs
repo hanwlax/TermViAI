@@ -27,19 +27,19 @@ pub enum SplitAxis {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SavedLayout {
+pub enum SavedLayout<T = Host> {
     Pane {
-        host: Host,
+        host: T,
     },
     Split {
         axis: SplitAxis,
         first_percent: u8,
-        first: Box<SavedLayout>,
-        second: Box<SavedLayout>,
+        first: Box<SavedLayout<T>>,
+        second: Box<SavedLayout<T>>,
     },
 }
 
-impl SavedLayout {
+impl<T> SavedLayout<T> {
     pub fn pane_count(&self) -> usize {
         match self {
             Self::Pane { .. } => 1,
@@ -47,13 +47,13 @@ impl SavedLayout {
         }
     }
 
-    pub fn hosts(&self) -> Vec<&Host> {
+    pub fn hosts(&self) -> Vec<&T> {
         let mut hosts = Vec::new();
         self.collect_hosts(&mut hosts);
         hosts
     }
 
-    fn collect_hosts<'a>(&'a self, hosts: &mut Vec<&'a Host>) {
+    fn collect_hosts<'a>(&'a self, hosts: &mut Vec<&'a T>) {
         match self {
             Self::Pane { host } => hosts.push(host),
             Self::Split { first, second, .. } => {
@@ -63,7 +63,12 @@ impl SavedLayout {
         }
     }
 
-    fn validate(&self, depth: usize, panes: &mut usize) -> anyhow::Result<()> {
+    fn validate_with(
+        &self,
+        depth: usize,
+        panes: &mut usize,
+        check: &impl Fn(&T) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         if depth > MAX_DEPTH {
             bail!("The workspace layout has too many nested splits.");
         }
@@ -76,7 +81,7 @@ impl SavedLayout {
                         MAX_PANES
                     );
                 }
-                validate_host(host)
+                check(host)
             }
             Self::Split {
                 first_percent,
@@ -87,8 +92,8 @@ impl SavedLayout {
                 if !(1..=99).contains(first_percent) {
                     bail!("A workspace split must leave space for both terminals.");
                 }
-                first.validate(depth + 1, panes)?;
-                second.validate(depth + 1, panes)
+                first.validate_with(depth + 1, panes, check)?;
+                second.validate_with(depth + 1, panes, check)
             }
         }
     }
@@ -108,11 +113,36 @@ pub struct SavedWorkspace {
     pub updated_at_ms: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedGroupPane {
+    pub host: Option<Host>,
+    pub broadcast_member: bool,
+    pub focused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedGroupTab {
+    pub name: String,
+    pub custom_name: bool,
+    pub layout: SavedLayout<SavedGroupPane>,
+    pub workspace_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedTabGroup {
+    pub id: String,
+    pub name: String,
+    pub tabs: Vec<SavedGroupTab>,
+    pub new_tab_open: bool,
+    pub active_tab: Option<usize>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorkspaceStore {
     pub recent: Vec<RecentConnection>,
     pub saved: Vec<SavedWorkspace>,
+    pub tab_groups: Vec<SavedTabGroup>,
     version: u32,
     // Retain unrelated metadata written by a compatible newer application.
     #[serde(flatten)]
@@ -130,6 +160,7 @@ impl Default for WorkspaceStore {
         Self {
             recent: Vec::new(),
             saved: Vec::new(),
+            tab_groups: Vec::new(),
             version: SCHEMA_VERSION,
             extra: BTreeMap::new(),
             source: None,
@@ -219,7 +250,7 @@ impl WorkspaceStore {
         name: &str,
         layout: SavedLayout,
     ) -> anyhow::Result<String> {
-        layout.validate(0, &mut 0)?;
+        layout.validate_with(0, &mut 0, &validate_host)?;
         if layout.pane_count() < 2 {
             bail!("Save a workspace after adding at least two SSH terminals.");
         }
@@ -247,6 +278,63 @@ impl WorkspaceStore {
         })
     }
 
+    /// Store a group independently of individual workspace shortcuts.
+    pub fn save_tab_group(
+        &mut self,
+        id: Option<&str>,
+        name: &str,
+        tabs: Vec<SavedGroupTab>,
+        new_tab_open: bool,
+        active_tab: Option<usize>,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            !tabs.is_empty(),
+            "Open a terminal before saving this tab group."
+        );
+        let id = id.map(str::to_owned).unwrap_or_else(new_id);
+        let name = workspace_name(name)?;
+        self.mutate(|latest| {
+            latest.tab_groups.retain(|group| group.id != id);
+            latest.tab_groups.insert(
+                0,
+                SavedTabGroup {
+                    id: id.clone(),
+                    name,
+                    tabs,
+                    new_tab_open,
+                    active_tab,
+                },
+            );
+            Ok(id)
+        })
+    }
+
+    pub fn remove_tab_group(&mut self, group: &SavedTabGroup) -> anyhow::Result<()> {
+        self.mutate(|latest| {
+            if let Some(current) = latest.tab_groups.iter().find(|g| g.id == group.id) {
+                anyhow::ensure!(
+                    current == group,
+                    "This saved group has changed. Reopen it before removing it."
+                );
+            }
+            latest.tab_groups.retain(|g| g.id != group.id);
+            Ok(())
+        })
+    }
+
+    pub fn rename_tab_group(&mut self, id: &str, name: &str) -> anyhow::Result<()> {
+        let name = workspace_name(name)?;
+        self.mutate(|latest| {
+            let group = latest
+                .tab_groups
+                .iter_mut()
+                .find(|g| g.id == id)
+                .context("The saved tab group no longer exists.")?;
+            group.name = name;
+            Ok(())
+        })
+    }
+
     pub fn rename_saved(&mut self, id: &str, name: &str) -> anyhow::Result<()> {
         let name = workspace_name(name)?;
         self.mutate(|latest| {
@@ -256,8 +344,16 @@ impl WorkspaceStore {
                 .iter_mut()
                 .find(|entry| entry.id == id)
                 .context("The saved workspace no longer exists.")?;
-            entry.name = name;
+            entry.name.clone_from(&name);
             entry.updated_at_ms = stamp;
+            for group in &mut latest.tab_groups {
+                for tab in &mut group.tabs {
+                    if tab.workspace_id.as_deref() == Some(id) {
+                        tab.name.clone_from(&name);
+                        tab.custom_name = true;
+                    }
+                }
+            }
             Ok(())
         })
     }
@@ -340,12 +436,26 @@ impl WorkspaceStore {
         for entry in &self.recent {
             validate_host(&entry.host)?;
         }
+        for group in &self.tab_groups {
+            workspace_name(&group.name)?;
+            anyhow::ensure!(
+                !group.id.is_empty() && group.active_tab.map_or(true, |i| i < group.tabs.len()),
+                "Invalid saved tab group."
+            );
+            for tab in &group.tabs {
+                tab.layout
+                    .validate_with(0, &mut 0, &|pane| match &pane.host {
+                        Some(host) => validate_host(host),
+                        None => Ok(()),
+                    })?;
+            }
+        }
         for entry in &self.saved {
             if entry.id.is_empty() || entry.id.chars().any(char::is_control) {
                 bail!("The workspace library contains an invalid ID.");
             }
             workspace_name(&entry.name)?;
-            entry.layout.validate(0, &mut 0)?;
+            entry.layout.validate_with(0, &mut 0, &validate_host)?;
         }
         Ok(())
     }
@@ -697,6 +807,97 @@ mod tests {
         store.record_recent(&host("alice@SERVER-34")).unwrap();
         assert_eq!(store.recent[0].host.username, "alice");
         assert_eq!(store.recent[1].host.label, "Staging");
+    }
+
+    #[test]
+    fn saved_tab_group_round_trip_and_stale_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspaces.json");
+        std::fs::write(&path, br#"{"version":1,"saved":[],"recent":[]}"#).unwrap();
+        let mut store = WorkspaceStore::load_from(&path).unwrap();
+        let mut stale = store.clone();
+        let workspace_id = store.save_group(None, "Build", group()).unwrap();
+        let tab = SavedGroupTab {
+            name: "Build".into(),
+            custom_name: true,
+            layout: SavedLayout::Split {
+                axis: SplitAxis::Horizontal,
+                first_percent: 35,
+                first: Box::new(SavedLayout::Pane {
+                    host: SavedGroupPane {
+                        host: None,
+                        focused: false,
+                        broadcast_member: false,
+                    },
+                }),
+                second: Box::new(SavedLayout::Pane {
+                    host: SavedGroupPane {
+                        host: Some(host("build")),
+                        focused: true,
+                        broadcast_member: true,
+                    },
+                }),
+            },
+            workspace_id: Some(workspace_id.clone()),
+        };
+        let id = store
+            .save_tab_group(None, "Lab", vec![tab.clone()], true, Some(0))
+            .unwrap();
+        let first = store.tab_groups[0].clone();
+        stale.record_recent(&host("other")).unwrap();
+        assert_eq!(stale.tab_groups, vec![first.clone()]);
+        assert_eq!(stale.tab_groups[0].tabs, vec![tab.clone()]);
+        store.rename_saved(&workspace_id, "Build nodes").unwrap();
+        stale.rename_tab_group(&id, "Renamed").unwrap();
+        let mut expected = first.clone();
+        expected.name = "Renamed".into();
+        expected.tabs[0].name = "Build nodes".into();
+        expected.tabs[0].custom_name = true;
+        assert_eq!(stale.tab_groups, vec![expected.clone()]);
+        assert_eq!(stale.saved[0].name, "Build nodes");
+        assert!(stale.remove_tab_group(&first).is_err());
+        let loaded = WorkspaceStore::load_from(&path).unwrap();
+        assert_eq!(loaded.tab_groups.len(), 1);
+        assert_eq!(loaded.tab_groups[0], expected);
+        store.remove_tab_group(&loaded.tab_groups[0]).unwrap();
+        stale.save().unwrap();
+        assert!(stale.tab_groups.is_empty());
+        assert_eq!(stale.recent.len(), 1);
+    }
+
+    #[test]
+    fn saving_a_launcher_only_group_cannot_create_or_replace_a_template() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("workspaces.json");
+        let mut store = WorkspaceStore::load_from(&path).unwrap();
+        let tab = SavedGroupTab {
+            name: "Local terminal".into(),
+            custom_name: false,
+            layout: SavedLayout::Pane {
+                host: SavedGroupPane {
+                    host: None,
+                    focused: true,
+                    broadcast_member: false,
+                },
+            },
+            workspace_id: None,
+        };
+        let id = store
+            .save_tab_group(None, "Lab", vec![tab], false, Some(0))
+            .unwrap();
+        let original = store.tab_groups.clone();
+        for new_tab_open in [false, true] {
+            for target in [None, Some(id.as_str())] {
+                assert!(store
+                    .save_tab_group(target, "Empty", vec![], new_tab_open, None)
+                    .is_err());
+            }
+        }
+        assert_eq!(store.tab_groups, original);
+        assert_eq!(
+            WorkspaceStore::load_from(&path).unwrap().tab_groups,
+            original
+        );
     }
 
     #[test]

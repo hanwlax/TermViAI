@@ -33,17 +33,47 @@ use termviai_gpui::{
     workspaces::*,
 };
 
+/// Instant toolbar actions must not let the focusable root steal keyboard input.
+/// Suppress only automatic focus on mouse-down; keep click/drag propagation and
+/// explicit focus changes (dialogs, tab switching, text inputs) intact.
+fn preserve_input_focus(_: &MouseDownEvent, window: &mut Window, _: &mut App) {
+    window.prevent_default();
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Hosts,
     Keychain,
     NewTab,
+    EmptyTabGroup,
     Terminal(usize),
     Monitor,
     Forwarding,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForwardFilter {
+    All,
+    Active,
+    Attention,
+    Stopped,
+}
+impl ForwardFilter {
+    fn matches(self, state: forwarding::State) -> bool {
+        match self {
+            Self::All => true,
+            Self::Active => state.active(),
+            Self::Attention => matches!(
+                state,
+                forwarding::State::Attention | forwarding::State::Failed
+            ),
+            Self::Stopped => state == forwarding::State::Stopped,
+        }
+    }
+}
 pub struct Tab {
     id: usize,
+    group: usize,
+    last_focused: Option<usize>,
     name: String,
     custom_name: bool,
     layout: Layout,
@@ -102,6 +132,8 @@ pub enum FormKind {
     Key(Option<KeyFile>),
     Identity(Option<Identity>),
     Group(String),
+    RenameTabGroup(usize),
+    RenameWorkspace(SavedWorkspace),
     Settings,
     Rename(usize),
     Existing(String),
@@ -119,11 +151,14 @@ pub struct Form {
     key: String,
     identity: String,
     group: String,
+    group_list_open: bool,
+    highlighted_group: Option<usize>,
     selected: Vec<Host>,
     error: String,
     theme: Theme,
     confirm: bool,
     bell: bool,
+    npu_monitor_enabled: bool,
     network: bool,
     retry: bool,
     challenges: Vec<Entity<InputState>>,
@@ -133,9 +168,15 @@ pub struct Form {
 }
 #[derive(Clone)]
 pub enum MenuKind {
+    Pane(usize, usize),
+    Saved(SavedWorkspace),
+    SavedGroup(SavedTabGroup),
+    AddCredential,
+    Forward(String),
     Host(Host),
     Group(HostGroup),
     Tab(usize),
+    TabGroup(usize),
     AddHost(String),
     Monitor(usize),
     MonitorInterval,
@@ -147,6 +188,7 @@ pub enum Confirm {
     Key(KeyFile),
     Identity(Identity),
     Tab(usize),
+    TabGroup(usize),
     Pane(usize),
     Quit,
     Stop(usize, Vec<monitor::Process>),
@@ -192,9 +234,14 @@ pub struct AppView {
     page: Page,
     group: String,
     sidebar: bool,
-    search: Entity<InputState>,
+    hosts_search: Entity<InputState>,
+    new_tab_search: Entity<InputState>,
     host_selection: termviai_gpui::host_selection::HostSelection,
     tabs: Vec<Tab>,
+    tab_groups: Vec<tabs::TabGroup>,
+    hovered_tab: Option<(usize, Instant)>,
+    hovered_tab_group: Option<(usize, Instant)>,
+    active_tab_group: usize,
     panes: HashMap<usize, Pane>,
     next_id: usize,
     focused: Option<usize>,
@@ -205,16 +252,19 @@ pub struct AppView {
     focus: FocusHandle,
     drag_source: Option<Drag>,
     drop_target: Option<(usize, usize, Side)>,
+    tab_join_target: Option<usize>,
     tab_drop_target: Option<(usize, bool)>,
     tab_rail: tabs::TabRail,
     tab_search: Entity<InputState>,
     tab_picker: bool,
     tab_picker_index: usize,
-    new_tab_open: bool,
     monitor: monitor::Monitor,
     monitor_detail: Option<(usize, Option<u32>, Option<u32>)>,
     monitor_reason: Option<usize>,
     monitor_technical: bool,
+    forward_filter: ForwardFilter,
+    forward_detail: Option<String>,
+    expanded_process: Option<(usize, u32)>,
     forwarding: Vec<forwarding::View>,
     forwarding_error: String,
     last_tick: Instant,
@@ -222,6 +272,62 @@ pub struct AppView {
     scrollers: HashMap<&'static str, ScrollHandle>,
 }
 impl AppView {
+    fn page_search_input(
+        page: Page,
+        placeholder: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        use gpui_component::input::InputEvent;
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        cx.subscribe_in(
+            &input,
+            window,
+            move |s, input, event: &InputEvent, w, cx| {
+                if s.page != page {
+                    return;
+                }
+                match event {
+                    InputEvent::Change => {
+                        s.host_selection.clear();
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. }
+                        if s.drawer.is_none() && s.menu.is_none() && s.confirm.is_none() =>
+                    {
+                        if !s.host_selection.is_empty() {
+                            s.open_selected_hosts(w, cx);
+                        } else {
+                            let value = input.read(cx).value().to_string();
+                            s.quick_connect(&value, w, cx);
+                        }
+                    }
+                    _ => {}
+                }
+            },
+        )
+        .detach();
+        input
+    }
+
+    fn clear_page_search(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        for input in [&self.hosts_search, &self.new_tab_search] {
+            if !input.read(cx).value().is_empty() {
+                input.update(cx, |input, cx| input.set_value("", w, cx));
+            }
+        }
+        self.host_selection.clear();
+    }
+
+    fn quick_connect(&mut self, text: &str, w: &mut Window, cx: &mut Context<Self>) {
+        match Host::quick_connect(text) {
+            Ok(host) => self.connect(Some(host), w, cx),
+            Err(e) => {
+                self.fail(e);
+                cx.notify();
+            }
+        }
+    }
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut errors = vec![];
         let store = HostStore::load().unwrap_or_else(|e| {
@@ -236,45 +342,18 @@ impl AppView {
             errors.push(format!("{e:#}"));
             Settings::default()
         });
-        let search = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search hosts or connect with user@hostname")
-        });
-        cx.subscribe(
-            &search,
-            |s, _, event: &gpui_component::input::InputEvent, cx| {
-                if matches!(event, gpui_component::input::InputEvent::Change) {
-                    s.host_selection.clear();
-                }
-                cx.notify();
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &search,
+        let hosts_search = Self::page_search_input(
+            Page::Hosts,
+            "Search hosts or connect with user@hostname",
             window,
-            |s, _, event: &gpui_component::input::InputEvent, w, cx| {
-                if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
-                    if s.page == Page::Hosts
-                        && !s.host_selection.is_empty()
-                        && s.drawer.is_none()
-                        && s.menu.is_none()
-                        && s.confirm.is_none()
-                    {
-                        s.open_selected_hosts(w, cx);
-                        return;
-                    }
-                    let text = s.search.read(cx).value().to_string();
-                    match Host::quick_connect(&text) {
-                        Ok(h) => s.connect(Some(h), w, cx),
-                        Err(e) => {
-                            s.fail(e);
-                            cx.notify();
-                        }
-                    }
-                }
-            },
-        )
-        .detach();
+            cx,
+        );
+        let new_tab_search = Self::page_search_input(
+            Page::NewTab,
+            "Find a workspace, host or user@hostname",
+            window,
+            cx,
+        );
         let tab_search =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search name or host…"));
         cx.subscribe(
@@ -326,9 +405,14 @@ impl AppView {
             page: Page::Hosts,
             group: String::new(),
             sidebar: true,
-            search,
+            hosts_search,
+            new_tab_search,
             host_selection: Default::default(),
             tabs: vec![],
+            tab_groups: vec![],
+            hovered_tab: None,
+            hovered_tab_group: None,
+            active_tab_group: 0,
             panes: HashMap::new(),
             next_id: 1,
             focused: None,
@@ -339,16 +423,19 @@ impl AppView {
             focus: cx.focus_handle(),
             drag_source: None,
             drop_target: None,
+            tab_join_target: None,
             tab_drop_target: None,
             tab_rail: tabs::TabRail::default(),
             tab_search,
             tab_picker: false,
             tab_picker_index: 0,
-            new_tab_open: false,
             monitor: monitor::Monitor::load(),
             monitor_detail: None,
             monitor_reason: None,
             monitor_technical: false,
+            expanded_process: None,
+            forward_detail: None,
+            forward_filter: ForwardFilter::All,
             forwarding: vec![],
             forwarding_error: String::new(),
             last_tick: Instant::now(),

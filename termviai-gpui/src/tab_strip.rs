@@ -13,7 +13,11 @@ pub fn bindings() -> Vec<KeyBinding> {
     ];
     for key in ["up", "down", "enter", "escape"] {
         // Match at Input depth: a parent-only binding loses to Input's actions.
-        for context in [PICKER_CONTEXT, "TermViAITabPicker > Input"] {
+        for context in [
+            PICKER_CONTEXT,
+            "TermViAITabPicker > Input",
+            "TermViAIHostGroup > Input",
+        ] {
             keys.push(KeyBinding::new(key, NoAction, Some(context)));
         }
     }
@@ -75,6 +79,10 @@ impl Metrics {
         let index = ((position / STRIDE) as usize).min(count - 1);
         Some((index, position - index as f32 * STRIDE >= TAB_WIDTH / 2.))
     }
+    pub fn over_tab_center(self, offset: f32, x: f32, index: usize) -> bool {
+        let fraction = (self.clamp(offset) + x - index as f32 * STRIDE) / TAB_WIDTH;
+        (0.28..=0.72).contains(&fraction)
+    }
     pub fn edge(self, x: f32) -> i8 {
         if !self.overflow || x < 0. || x > self.viewport {
             0
@@ -106,7 +114,7 @@ mod tests {
     #[test]
     fn overflow_preserves_tab_width_and_reserves_controls() {
         assert!(!Metrics::new(1280., 2).overflow);
-        assert_eq!(Metrics::new(1280., 2).viewport, 490.);
+        assert_eq!(Metrics::new(1280., 2).viewport, 2. * TAB_WIDTH + GAP);
         let m = Metrics::new(780., 16);
         assert!(m.overflow);
         assert_eq!(m.viewport, 302.);
@@ -128,12 +136,27 @@ mod tests {
     fn insertion_tracks_scroll_and_edges_do_not_leak_outside_rail() {
         let m = Metrics::new(1280., 16);
         assert_eq!(m.insertion(STRIDE * 5., 10., 16), Some((5, false)));
-        assert_eq!(m.insertion(STRIDE * 5., 200., 16), Some((5, true)));
+        assert_eq!(
+            m.insertion(STRIDE * 5., TAB_WIDTH - 8., 16),
+            Some((5, true))
+        );
         assert_eq!(m.insertion(0., -1., 16), None);
         assert_eq!(m.edge(-1.), 0);
         assert_eq!(m.edge(10.), -1);
         assert_eq!(m.edge(m.viewport - 10.), 1);
         assert_eq!(m.edge(m.viewport + 1.), 0);
+    }
+    #[test]
+    fn join_zone_preserves_both_insertion_edges_after_scrolling() {
+        let m = Metrics::new(800., 12);
+        for (x, center) in [
+            (0., false),
+            (TAB_WIDTH * 0.5, true),
+            (TAB_WIDTH - 1., false),
+            (TAB_WIDTH + 2., false),
+        ] {
+            assert_eq!(m.over_tab_center(STRIDE * 3., x, 3), center);
+        }
     }
     #[test]
     fn keyboard_cycles_both_directions_and_handles_no_tabs() {

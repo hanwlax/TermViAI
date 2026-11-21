@@ -2,36 +2,41 @@ use super::*;
 use anyhow::{Context as _, ensure};
 impl AppView {
     pub(super) fn open_selected_hosts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.page != Page::Hosts
+        if !matches!(self.page, Page::Hosts | Page::NewTab)
             || self.drawer.is_some()
             || self.menu.is_some()
             || self.confirm.is_some()
         {
             return;
         }
-        let query = self.search.read(cx).value().to_lowercase();
+        let input = if self.page == Page::NewTab {
+            &self.new_tab_search
+        } else {
+            &self.hosts_search
+        };
+        let query = input.read(cx).value().trim().to_lowercase();
         let visible: Vec<_> = self
             .store
             .hosts
             .iter()
             .filter(|h| {
-                self.store.host_in_group(h, &self.group)
-                    && format!(
-                        "{} {} {} {}",
-                        h.label,
-                        h.address,
-                        h.username,
-                        self.store.group_path(&h.group_id)
-                    )
-                    .to_lowercase()
-                    .contains(&query)
+                self.matches_host(
+                    h,
+                    &query,
+                    if self.page == Page::NewTab {
+                        ""
+                    } else {
+                        &self.group
+                    },
+                )
             })
             .cloned()
             .collect();
         let hosts = self.host_selection.take(&visible);
-        for host in hosts {
-            self.connect(Some(host), window, cx);
+        if hosts.is_empty() {
+            return;
         }
+        self.connect_panes(hosts.into_iter().map(Some).collect(), window, cx);
         cx.notify();
     }
 
@@ -126,21 +131,40 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.connect_panes(vec![host], window, cx);
+    }
+    fn connect_panes(
+        &mut self,
+        hosts: Vec<Option<Host>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_page_search(window, cx);
+        self.ensure_tab_group();
         if self.page == Page::NewTab {
-            self.new_tab_open = false;
+            self.set_new_tab_open(false);
         }
-        let name = host
-            .as_ref()
-            .map(|h| h.label.clone())
-            .unwrap_or("Local terminal".into());
-        let pane = self.spawn_pane(host, window, cx);
+        let panes: Vec<_> = hosts
+            .into_iter()
+            .map(|host| self.spawn_pane(host, window, cx))
+            .collect();
+        let layout = Layout::balanced(&panes, SplitAxis::Vertical);
+        let name = tab_policy::default_name(
+            &layout
+                .visual_panes()
+                .into_iter()
+                .map(|p| self.pane_label(p))
+                .collect::<Vec<_>>(),
+        );
         let id = self.id();
         self.tabs.push(Tab {
             id,
+            group: self.active_tab_group,
+            last_focused: self.focused,
             name,
             custom_name: false,
-            layout: Layout::Pane(pane),
-            broadcast: BroadcastState::new([pane]),
+            layout,
+            broadcast: BroadcastState::new(panes),
             saved: None,
             tray: false,
             tray_motion: None,
@@ -156,8 +180,10 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.clear_page_search(window, cx);
+        self.ensure_tab_group();
         if self.page == Page::NewTab {
-            self.new_tab_open = false;
+            self.set_new_tab_open(false);
         }
         let layout = Layout::restore(&saved.layout, &mut |h| {
             self.spawn_pane(Some(h.clone()), window, cx)
@@ -166,6 +192,8 @@ impl AppView {
         let broadcast = BroadcastState::new(layout.panes());
         self.tabs.push(Tab {
             id,
+            group: self.active_tab_group,
+            last_focused: self.focused,
             custom_name: saved.name
                 != tab_policy::default_name(
                     &layout
@@ -274,9 +302,11 @@ impl AppView {
         }
         if self.last_tick.elapsed() >= Duration::from_millis(500) {
             self.last_tick = Instant::now();
-            let keepalive = self.settings.keepalive();
-            self.monitor
-                .tick(&self.store, |h| session::connection_config(h, keepalive));
+            if self.settings.npu_monitor_enabled {
+                let keepalive = self.settings.keepalive();
+                self.monitor
+                    .tick(&self.store, |h| session::connection_config(h, keepalive));
+            }
             let mut manager = forwarding::manager().lock().unwrap();
             self.forwarding = manager.views();
             self.forwarding_error = manager.load_error.clone();
@@ -422,25 +452,32 @@ impl AppView {
         }
         cx.notify();
     }
-    pub(super) fn close_tab(&mut self, id: usize, cx: &mut Context<Self>) {
+    pub(super) fn close_tab(&mut self, id: usize, w: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
             let tab = self.tabs.remove(index);
             for p in tab.layout.panes() {
                 self.panes.remove(&p);
             }
-            if self.page == Page::Terminal(id) {
-                self.page = self
-                    .tabs
-                    .get(index.min(self.tabs.len().saturating_sub(1)))
+            let was_active = self.page == Page::Terminal(id);
+            if was_active {
+                let next = self.tabs[index..]
+                    .iter()
+                    .chain(self.tabs[..index].iter().rev())
+                    .find(|t| t.group == tab.group)
                     .map(|t| Page::Terminal(t.id))
-                    .unwrap_or(Page::Hosts);
+                    .unwrap_or_else(|| self.group_page(tab.group));
+                self.page = next;
+            }
+            self.remove_empty_tab_group(tab.group);
+            if was_active {
+                self.focus_active_tab(w, cx);
             }
         }
         self.menu = None;
         self.confirm = None;
         cx.notify();
     }
-    pub(super) fn close_pane(&mut self, id: usize, cx: &mut Context<Self>) {
+    pub(super) fn close_pane(&mut self, id: usize, w: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self
             .tabs
             .iter()
@@ -454,7 +491,7 @@ impl AppView {
                 self.panes.remove(&id);
             } else {
                 let id = tab.id;
-                self.close_tab(id, cx);
+                self.close_tab(id, w, cx);
             }
         }
         self.refresh_tab_names();
@@ -489,7 +526,7 @@ impl AppView {
         }
         cx.notify();
     }
-    fn pane_label(&self, id: usize) -> String {
+    pub(super) fn pane_label(&self, id: usize) -> String {
         self.panes
             .get(&id)
             .and_then(|p| p.host.as_ref())
@@ -523,6 +560,7 @@ impl AppView {
     pub(super) fn clear_drag(&mut self) {
         self.drag_source = None;
         self.drop_target = None;
+        self.tab_join_target = None;
         self.tab_drop_target = None;
         self.tab_rail.edge = 0;
         self.tab_rail.motion = None;
@@ -530,6 +568,13 @@ impl AppView {
     // The same destination rule drives the preview and the committed move.
     pub(super) fn tab_drop_gap(&self, drag: &Drag, target: usize, after: bool) -> Option<usize> {
         let from = self.tabs.iter().position(|t| t.id == drag.tab)?;
+        let visible = self.group_tabs().map(|t| t.id).collect::<Vec<_>>();
+        let source = visible.iter().position(|id| *id == drag.tab)?;
+        let visible_gap = if target == usize::MAX {
+            visible.len()
+        } else {
+            visible.iter().position(|id| *id == target)? + usize::from(after)
+        };
         let gap = if target == usize::MAX {
             self.tabs.len()
         } else {
@@ -539,7 +584,7 @@ impl AppView {
             (self.tabs[from].layout.panes().len() > 1 && self.dock_source(drag).is_some())
                 .then_some(gap)
         } else {
-            tab_policy::reorder_destination(self.tabs.len(), from, gap).map(|_| gap)
+            tab_policy::reorder_destination(visible.len(), source, visible_gap).map(|_| gap)
         }
     }
     pub(super) fn drop_on_tab(&mut self, drag: &Drag, target: usize, cx: &mut Context<Self>) {
@@ -588,6 +633,8 @@ impl AppView {
             gap.min(self.tabs.len()),
             Tab {
                 id,
+                group: self.active_tab_group,
+                last_focused: Some(pane),
                 name,
                 custom_name: false,
                 layout: Layout::Pane(pane),
@@ -621,6 +668,8 @@ impl AppView {
             return;
         };
         if self.tabs[target_index].layout.dock(source, target, side) {
+            self.active_tab_group = self.tabs[target_index].group;
+            let mut emptied_group = None;
             if drag.tab != target_tab {
                 if let Some(i) = self.tabs.iter().position(|t| t.id == drag.tab) {
                     if let Some(l) = self.tabs[i].layout.clone().remove(source) {
@@ -628,16 +677,24 @@ impl AppView {
                         let ids = self.tabs[i].layout.panes();
                         self.tabs[i].broadcast.sync_panes(ids);
                     } else {
-                        self.tabs.remove(i);
+                        emptied_group = Some(self.tabs.remove(i).group);
                     }
                 }
             }
             for t in &mut self.tabs {
-                t.broadcast.sync_panes(t.layout.panes());
-                t.zoom = None;
+                if t.id == target_tab || t.id == drag.tab {
+                    t.broadcast.sync_panes(t.layout.panes());
+                    t.zoom = None;
+                }
             }
             self.page = Page::Terminal(target_tab);
             self.focused = Some(source);
+            if let Some(t) = self.tabs.iter_mut().find(|t| t.id == target_tab) {
+                t.last_focused = Some(source);
+            }
+            if let Some(group) = emptied_group {
+                self.remove_empty_tab_group(group);
+            }
         }
         self.refresh_tab_names();
         self.clear_drag();
@@ -667,8 +724,9 @@ impl AppView {
                     })?;
                     self.drawer = None;
                 }
-                Confirm::Tab(id) => self.close_tab(id, cx),
-                Confirm::Pane(id) => self.close_pane(id, cx),
+                Confirm::TabGroup(id) => self.close_tab_group(id, w, cx),
+                Confirm::Tab(id) => self.close_tab(id, w, cx),
+                Confirm::Pane(id) => self.close_pane(id, w, cx),
                 Confirm::Quit => {
                     self.quit_allowed = true;
                     w.remove_window();

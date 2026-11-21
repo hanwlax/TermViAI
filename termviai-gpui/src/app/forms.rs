@@ -1,5 +1,10 @@
 use super::*;
 use anyhow::{Context as _, ensure};
+use gpui_component::{
+    Disableable, Sizable,
+    button::{Button, ButtonVariants},
+    radio::Radio,
+};
 impl AppView {
     fn validate_form_fields(&self, f: &Form, cx: &Context<Self>) -> BTreeMap<&'static str, String> {
         let mut errors = BTreeMap::new();
@@ -23,7 +28,11 @@ impl AppView {
                     ]
                 }
             }
-            FormKind::Group(_) | FormKind::Rename(_) | FormKind::Forward(_) => {
+            FormKind::Group(_)
+            | FormKind::RenameWorkspace(_)
+            | FormKind::RenameTabGroup(_)
+            | FormKind::Rename(_)
+            | FormKind::Forward(_) => {
                 vec![("label", "Enter a name.")]
             }
             _ => vec![],
@@ -278,11 +287,14 @@ impl AppView {
             key: String::new(),
             identity: String::new(),
             group: self.group.clone(),
+            group_list_open: false,
+            highlighted_group: None,
             selected: vec![],
             error: String::new(),
             theme: self.theme,
             confirm: self.settings.confirm_close(),
             bell: self.settings.bell(),
+            npu_monitor_enabled: self.settings.npu_monitor_enabled,
             network: false,
             retry: true,
             challenges: vec![],
@@ -302,9 +314,15 @@ impl AppView {
                 f.key = h.key_label.clone();
                 f.keychain = !h.key_label.is_empty();
                 f.identity = h.identity_id.clone();
-                f.group = h.group_id.clone();
+                f.group = self.store.host_group_id(&h).to_owned();
                 fields = vec![
                     ("label", h.label.clone(), "Host label", false),
+                    (
+                        "group",
+                        self.store.group_path(&f.group),
+                        "Search or enter a group name",
+                        false,
+                    ),
                     (
                         "address",
                         h.address.clone(),
@@ -394,6 +412,15 @@ impl AppView {
                 f.group = parent.clone();
                 fields.push(("label", String::new(), "Group name", false));
             }
+            FormKind::RenameWorkspace(entry) => {
+                fields.push(("label", entry.name.clone(), "Workspace name", false))
+            }
+            FormKind::RenameTabGroup(id) => fields.push((
+                "label",
+                self.tab_groups[*id].name.clone(),
+                "Group name",
+                false,
+            )),
             FormKind::Settings => {
                 fields = vec![
                     (
@@ -468,13 +495,52 @@ impl AppView {
                 s.set_value(value, w, cx);
                 s
             });
+            if key == "group" {
+                use gpui_component::input::InputEvent;
+                cx.subscribe_in(&input, w, |s, field, event: &InputEvent, w, cx| {
+                    let Some(f) = &mut s.drawer else { return };
+                    if f.fields.get("group") != Some(&field) {
+                        return;
+                    }
+                    match event {
+                        InputEvent::Focus => f.group_list_open = true,
+                        InputEvent::Blur => f.group_list_open = false,
+                        InputEvent::Change => {
+                            // Setting a picked path writes to the same editable input.
+                            if !f.group.is_empty()
+                                && field.read(cx).value().as_str() == s.store.group_path(&f.group)
+                            {
+                                return;
+                            }
+                            f.group.clear();
+                            f.group_list_open = field.focus_handle(cx).is_focused(w);
+                        }
+                        _ => return,
+                    }
+                    f.highlighted_group = None;
+                    s.scrollers["group-picker"].set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                })
+                .detach();
+            }
             cx.observe(&input, |_, _, cx| cx.notify()).detach();
             f.fields.insert(key, input);
         }
         f
     }
     pub(super) fn open_form(&mut self, kind: FormKind, w: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            &kind,
+            FormKind::Host(Some(_)) | FormKind::RenameWorkspace(_) | FormKind::Existing(_)
+        ) {
+            self.host_selection.clear();
+        } else {
+            self.clear_page_search(w, cx);
+        }
         self.menu = None;
+        if matches!(kind, FormKind::RenameTabGroup(_)) {
+            self.sidebar = true;
+        }
         self.scrollers["drawer-scroll"].set_offset(point(px(0.), px(0.)));
         self.drawer = Some(self.make_form(kind, w, cx));
         if let Some(f) = &self.drawer {
@@ -516,6 +582,101 @@ impl AppView {
         }
         cx.notify();
     }
+    fn setting_toggle(
+        &self,
+        label: &'static str,
+        checked: bool,
+        set: fn(&mut Form, bool),
+        cx: &mut Context<Self>,
+    ) -> Radio {
+        Radio::new(label)
+            .label(label)
+            .checked(checked)
+            .w_full()
+            .min_h(px(32.))
+            .flex_row_reverse()
+            .items_center()
+            .on_click(cx.listener(move |s, checked: &bool, _, cx| {
+                s.edit_form(None, |f| set(f, *checked), cx)
+            }))
+    }
+
+    fn settings_section(&self, title: &'static str) -> Div {
+        div()
+            .w_full()
+            .rounded_lg()
+            .border_1()
+            .border_color(self.c(self.col().line))
+            .bg(self.c(self.col().card))
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+    }
+
+    fn setting_number(
+        &self,
+        f: &Form,
+        key: &'static str,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let field = &f.fields[key];
+        let raw = self.input(f, key, cx);
+        let (value, step, min, max) = if key == "size" {
+            (
+                raw.parse::<f64>().ok().filter(|v| v.is_finite()),
+                0.5,
+                6.,
+                48.,
+            )
+        } else {
+            (raw.parse::<u64>().ok().map(|v| v as f64), 1., 0., 86400.)
+        };
+        let increment = |increase: bool| {
+            let next = value.map(|v| (v + if increase { step } else { -step }).clamp(min, max));
+            let direction = if increase { "Increase" } else { "Decrease" };
+            let key_id = SharedString::from(format!("{key}-{direction}"));
+            let field = field.clone();
+            Button::new(key_id)
+                .ghost()
+                .small()
+                .icon(if increase {
+                    IconName::Plus
+                } else {
+                    IconName::Minus
+                })
+                .tooltip(format!("{direction} {label}"))
+                .disabled(next.is_none() || next == value)
+                .on_click(move |_, w, cx| {
+                    if let Some(value) = next {
+                        field.update(cx, |i, cx| i.set_value(value.to_string(), w, cx));
+                    }
+                })
+        };
+        div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .justify_between()
+            .gap_2()
+            .child(label)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(increment(false))
+                    .child(
+                        div()
+                            .w(px(72.))
+                            .child(Input::new(field).bg(self.c(self.col().field))),
+                    )
+                    .child(increment(true)),
+            )
+    }
+
     fn field(&self, f: &Form, key: &str, label: &str) -> AnyElement {
         let Some(input) = f.fields.get(key) else {
             return div().into_any_element();
@@ -664,6 +825,17 @@ impl AppView {
         detail: &str,
         selected: bool,
     ) -> Stateful<Div> {
+        self.choice_with_colors(id, title, detail, selected, self.col())
+    }
+
+    fn choice_with_colors(
+        &self,
+        id: &str,
+        title: &str,
+        detail: &str,
+        selected: bool,
+        colors: &Colors,
+    ) -> Stateful<Div> {
         div()
             .id(SharedString::from(id.to_owned()))
             .flex()
@@ -672,13 +844,13 @@ impl AppView {
             .p_3()
             .rounded_md()
             .border_1()
-            .border_color(self.c(if selected {
-                self.col().accent
+            .border_color(Colors::color(if selected {
+                colors.accent
             } else {
-                self.col().line
+                colors.line
             }))
             .cursor_pointer()
-            .hover(|d| d.bg(self.c(self.col().hover)))
+            .hover(|d| d.bg(Colors::color(colors.hover)))
             .child(
                 div()
                     .flex_1()
@@ -695,7 +867,7 @@ impl AppView {
                 d.child(
                     Icon::new(IconName::Check)
                         .size(px(16.))
-                        .text_color(self.c(self.col().accent)),
+                        .text_color(Colors::color(colors.accent)),
                 )
             })
     }
@@ -757,47 +929,101 @@ impl AppView {
                     .child(self.field(f, "user", "Username"))
                     .child(self.field(f, "password", "Password"))
             }
-            FormKind::Group(_) | FormKind::Rename(_) => {
-                body = body.child(self.field(f, "label", "Name"))
-            }
+            FormKind::Group(_)
+            | FormKind::RenameWorkspace(_)
+            | FormKind::RenameTabGroup(_)
+            | FormKind::Rename(_) => body = body.child(self.field(f, "label", "Name")),
             FormKind::Settings => {
-                body = body
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Appearance"))
+                let themes = div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
                     .children(Theme::ALL.into_iter().map(|theme| {
-                        let c = theme.colors();
-                        self.choice(theme.label(), theme.label(), "", f.theme == theme)
-                            .bg(Colors::color(c.card))
-                            .text_color(Colors::color(c.text))
+                        let preview = theme.colors();
+                        let selected = f.theme == theme;
+                        div()
+                            .id(theme.label())
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .flex_grow()
+                            .flex_basis(px(164.))
+                            .min_h(px(48.))
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(self.c(if selected {
+                                self.col().accent
+                            } else {
+                                self.col().line
+                            }))
+                            .when(selected, |d| d.bg(self.c(self.col().soft)))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(self.c(self.col().hover)))
+                            .child(
+                                div()
+                                    .size(px(30.))
+                                    .flex_shrink_0()
+                                    .rounded_md()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(Colors::color(preview.card))
+                                    .text_color(Colors::color(preview.accent))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Aa"),
+                            )
+                            .child(div().min_w_0().flex_1().child(theme.label()))
+                            .when(selected, |d| {
+                                d.child(
+                                    Icon::new(IconName::Check)
+                                        .size(px(15.))
+                                        .text_color(self.c(self.col().accent)),
+                                )
+                            })
                             .on_click(cx.listener(move |s, _, w, cx| {
                                 if let Some(f) = &mut s.drawer {
                                     f.theme = theme;
                                 }
                                 s.apply_theme(theme, w, cx);
                             }))
-                    }))
-                    .child(self.field(f, "size", "Terminal font size (pt)"))
-                    .child(self.field(f, "keepalive", "SSH keepalive interval (seconds)"));
-                for (which, label, value) in [
-                    (0, "Confirm before closing terminals", f.confirm),
-                    (1, "Terminal bell sound", f.bell),
-                ] {
-                    body = body.child(
-                        self.choice(label, label, if value { "On" } else { "Off" }, value)
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                s.edit_form(
-                                    None,
-                                    |f| {
-                                        if which == 0 {
-                                            f.confirm = !f.confirm
-                                        } else {
-                                            f.bell = !f.bell
-                                        }
-                                    },
-                                    cx,
-                                )
-                            })),
+                    }));
+                let terminal = self
+                    .settings_section("Terminal")
+                    .child(self.setting_number(f, "size", "Font size (pt)", cx))
+                    .child(self.setting_toggle(
+                        "Confirm before closing terminals",
+                        f.confirm,
+                        |f, on| f.confirm = on,
+                        cx,
+                    ))
+                    .child(self.setting_toggle(
+                        "Terminal bell sound",
+                        f.bell,
+                        |f, on| f.bell = on,
+                        cx,
+                    ));
+                body = body
+                    .child(self.settings_section("Appearance").child(themes))
+                    .child(terminal)
+                    .child(
+                        self.settings_section("Connection")
+                            .child(self.setting_number(
+                                f,
+                                "keepalive",
+                                "SSH keepalive interval (seconds)",
+                                cx,
+                            )),
+                    )
+                    .child(
+                        self.settings_section("Monitoring")
+                            .child(self.setting_toggle(
+                                "Enable NPU Monitor",
+                                f.npu_monitor_enabled,
+                                |f, on| f.npu_monitor_enabled = on,
+                                cx,
+                            )),
                     );
-                }
             }
             FormKind::Monitor | FormKind::MonitorReplace(_) => {
                 body = body.child(self.monitor_host_picker(f, cx));
@@ -813,7 +1039,15 @@ impl AppView {
                                 .child(div().flex_1().child(self.field(f, "remote", "Remote port")))
                                 .child(div().flex_1().child(self.field(f, "local", "Local port"))),
                         )
-                        .child(self.muted("Remote listener → this computer's 127.0.0.1 service"));
+                        .child(self.muted(format!(
+                                "{}:{} → This computer · 127.0.0.1:{}",
+                                f.selected
+                                    .first()
+                                    .map(|h| h.label.as_str())
+                                    .unwrap_or("Remote host"),
+                                self.input(f, "remote", cx),
+                                self.input(f, "local", cx)
+                            )));
                     for (which, label, value) in [
                         (0, "Allow network access to remote port", f.network),
                         (1, "Automatically reconnect", f.retry),
@@ -896,37 +1130,305 @@ impl AppView {
         }
         body.into_any_element()
     }
+    fn matching_groups(&self, f: &Form, cx: &App) -> Vec<(String, String)> {
+        let query = if f.group.is_empty() {
+            f.fields["group"].read(cx).value().trim().to_lowercase()
+        } else {
+            String::new()
+        };
+        let mut options: Vec<_> = self
+            .store
+            .groups
+            .iter()
+            .map(|g| (g.id.clone(), self.store.group_path(&g.id)))
+            .filter(|(_, path)| path.to_lowercase().contains(&query))
+            .collect();
+        options.sort_by_cached_key(|(_, path)| path.to_lowercase());
+        options
+    }
+
+    pub(super) fn pick_host_group(&mut self, id: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if let Some(f) = &mut self.drawer {
+            let path = self.store.group_path(id);
+            f.group = id.to_owned();
+            f.fields["group"].update(cx, |input, cx| input.set_value(path, w, cx));
+            f.group_list_open = false;
+            f.highlighted_group = None;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn host_group_key(
+        &mut self,
+        key: &str,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(f) = &self.drawer else { return false };
+        let Some(input) = f.fields.get("group") else {
+            return false;
+        };
+        if !input.focus_handle(cx).is_focused(w) {
+            return false;
+        }
+        match key {
+            "up" | "down" => {
+                let count = self.matching_groups(f, cx).len();
+                let next = match (count, f.highlighted_group, key) {
+                    (0, _, _) => None,
+                    (_, Some(i), "up") => Some(i.saturating_sub(1)),
+                    (_, Some(i), _) => Some((i + 1).min(count - 1)),
+                    (_, None, "up") => Some(count - 1),
+                    _ => Some(0),
+                };
+                if let Some(i) = next {
+                    self.scrollers["group-picker"].scroll_to_item(i);
+                }
+                self.edit_form(
+                    None,
+                    |f| {
+                        f.group_list_open = true;
+                        f.highlighted_group = next;
+                    },
+                    cx,
+                );
+            }
+            "escape" | "enter" if f.group_list_open => {
+                if key == "enter"
+                    && let Some(index) = f.highlighted_group
+                    && let Some((id, _)) = self.matching_groups(f, cx).get(index)
+                {
+                    self.pick_host_group(id, w, cx);
+                } else {
+                    self.edit_form(
+                        None,
+                        |f| {
+                            f.group_list_open = false;
+                            f.highlighted_group = None;
+                        },
+                        cx,
+                    );
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn group_picker(&self, f: &Form, cx: &mut Context<Self>) -> AnyElement {
-        let mut groups = vec![(String::new(), "All Hosts".to_owned())];
-        groups.extend(
-            self.store
-                .groups
-                .iter()
-                .map(|g| (g.id.clone(), self.store.group_path(&g.id))),
-        );
+        let field = &f.fields["group"];
+        let toggle = self
+            .icon("host-group-toggle", IconName::ChevronDown)
+            .on_mouse_down(MouseButton::Left, preserve_input_focus)
+            .on_click(cx.listener(|s, _, w, cx| {
+                cx.stop_propagation();
+                if let Some(f) = &mut s.drawer {
+                    f.group_list_open = !f.group_list_open;
+                    f.highlighted_group = None;
+                    f.fields["group"].focus_handle(cx).focus(w);
+                    cx.notify();
+                }
+            }));
+        let input = Input::new(field)
+            .suffix(toggle)
+            .bg(self.c(self.col().field));
         div()
-            .id("group-picker")
-            .max_h(px(150.))
+            .id("host-group-combobox")
+            .key_context("TermViAIHostGroup")
             .relative()
-            .overflow_y_scroll()
-            .track_scroll(&self.scrollers["group-picker"])
-            .vertical_scrollbar(&self.scrollers["group-picker"])
-            .flex()
-            .flex_col()
-            .gap_1()
-            .children(groups.into_iter().map(|(id, label)| {
-                self.choice(&format!("group-{id}"), &label, "", f.group == id)
-                    .py_2()
-                    .on_click(cx.listener(move |s, _, _, cx| {
-                        s.edit_form(None, |f| f.group = id.clone(), cx)
-                    }))
+            .child(input)
+            .on_click(cx.listener(|s, _, _, cx| {
+                if let Some(f) = &mut s.drawer
+                    && !f.group_list_open
+                {
+                    f.group_list_open = true;
+                    cx.notify();
+                }
             }))
+            .when(f.group_list_open, |d| {
+                let groups = self.matching_groups(f, cx);
+                let empty = groups.is_empty();
+                let list = div()
+                    .id("group-picker")
+                    .max_h(px(160.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scrollers["group-picker"])
+                    .flex()
+                    .flex_col()
+                    .children(groups.into_iter().enumerate().map(|(index, (id, path))| {
+                        div()
+                            .id(("group-option", index))
+                            .flex_shrink_0()
+                            .h(px(30.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .when(f.highlighted_group == Some(index), |d| {
+                                d.bg(self.c(self.col().soft))
+                            })
+                            .hover(|d| d.bg(self.c(self.col().hover)))
+                            .child(div().flex_1().truncate().child(path))
+                            .when(f.group == id, |d| {
+                                d.child(Icon::new(IconName::Check).size(px(14.)))
+                            })
+                            .on_mouse_down(MouseButton::Left, preserve_input_focus)
+                            .on_click(cx.listener(move |s, _, w, cx| {
+                                cx.stop_propagation();
+                                s.pick_host_group(&id, w, cx);
+                            }))
+                    }))
+                    .when(empty, |d| {
+                        d.child(
+                            self.muted(if field.read(cx).value().trim().is_empty() {
+                                "Type a name to create a group."
+                            } else {
+                                "Save to create this group."
+                            })
+                            .px_2()
+                            .py_1(),
+                        )
+                    });
+                // Group is the last field. Open toward the form so Save stays accessible.
+                d.child(deferred(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom(relative(1.))
+                        .occlude()
+                        .bg(self.c(self.col().card))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(self.c(self.col().line))
+                        .shadow_md()
+                        .p_1()
+                        .child(list)
+                        .vertical_scrollbar(&self.scrollers["group-picker"]),
+                ))
+            })
             .into_any_element()
     }
-    pub(super) fn drawer_view(&self, cx: &mut Context<Self>) -> AnyElement {
+
+    pub(super) fn name_editor(&self, f: &Form, cx: &mut Context<Self>) -> Div {
+        let error = f
+            .field_errors
+            .get("label")
+            .cloned()
+            .unwrap_or_else(|| f.error.clone());
+        div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .child(Input::new(&f.fields["label"])),
+                    )
+                    .child(
+                        self.icon("commit-name", IconName::Check)
+                            .on_click(cx.listener(|s, _, w, cx| s.save_form(w, cx))),
+                    ),
+            )
+            .when(!error.is_empty(), |d| {
+                d.child(self.muted(error).text_color(self.c(self.col().red)))
+            })
+    }
+    pub(super) fn inline_credential(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        let f = self.drawer.as_ref().unwrap();
+        let (title, delete) = match &f.kind {
+            FormKind::Key(key) => ("Key", key.clone().map(Confirm::Key)),
+            FormKind::Identity(identity) => ("Identity", identity.clone().map(Confirm::Identity)),
+            _ => return div().into_any_element(),
+        };
+        div()
+            .w(px(width))
+            .rounded_lg()
+            .border_1()
+            .border_color(self.c(self.col().accent))
+            .bg(self.c(self.col().card))
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(title)
+            .child(self.form_content(f, None, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(
+                        self.button("save-credential", "Save")
+                            .on_click(cx.listener(|s, _, w, cx| s.save_form(w, cx))),
+                    )
+                    .child(
+                        self.button("cancel-credential", "Cancel")
+                            .on_click(cx.listener(|s, _, w, cx| s.close_form(w, cx))),
+                    )
+                    .when_some(delete, |d, action| {
+                        d.child(
+                            self.button("delete-credential", "Delete")
+                                .text_color(self.c(self.col().red))
+                                .on_click(cx.listener(move |s, _, _, cx| {
+                                    s.confirm = Some(action.clone());
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn drawer_view(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(f) = &self.drawer else {
             return div().into_any_element();
         };
+        if matches!(
+            f.kind,
+            FormKind::Key(_)
+                | FormKind::Identity(_)
+                | FormKind::Rename(_)
+                | FormKind::RenameWorkspace(_)
+                | FormKind::RenameTabGroup(_)
+                | FormKind::Group(_)
+        ) {
+            return div().into_any_element();
+        }
+        if matches!(f.kind, FormKind::Settings) {
+            let body = self
+                .tool_content(window)
+                .max_w(px(720. + 2. * Self::tool_gutter(window)))
+                .child(self.title("Settings"))
+                .child(self.form_content(f, None, cx))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(self.c(self.col().line))
+                        .child(
+                            self.button("cancel", "Cancel")
+                                .on_click(cx.listener(|s, _, w, cx| s.close_form(w, cx))),
+                        )
+                        .child(
+                            self.button("save", "Save")
+                                .bg(self.c(self.col().soft))
+                                .on_click(cx.listener(|s, _, w, cx| s.save_form(w, cx))),
+                        ),
+                );
+            return self.tool_scroll("drawer-scroll", body).into_any_element();
+        }
         let title = match &f.kind {
             FormKind::Host(Some(_)) => "Edit Host",
             FormKind::Host(None) => "Add Host",
@@ -935,6 +1437,8 @@ impl AppView {
             FormKind::Identity(Some(_)) => "Edit Identity",
             FormKind::Identity(None) => "Add Identity",
             FormKind::Group(_) => "Add Group",
+            FormKind::RenameTabGroup(_) => "Rename Tab Group",
+            FormKind::RenameWorkspace(_) => "Rename Workspace",
             FormKind::Settings => "Settings",
             FormKind::Rename(_) => "Rename Tab",
             FormKind::Existing(_) => "Add Existing Hosts",
@@ -976,15 +1480,15 @@ impl AppView {
             .absolute()
             .inset_0()
             .flex()
-            .justify_end()
+            .items_center()
+            .justify_center()
             .child(
                 div()
-                    .id("drawer-shade")
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
+                    .id("form-backdrop")
+                    .absolute()
+                    .inset_0()
                     .occlude()
-                    .bg(rgba(0x00000055))
+                    .bg(rgba(0x00000066))
                     .on_click(cx.listener(|s, _, w, cx| s.close_form(w, cx))),
             )
             .child(
@@ -993,11 +1497,13 @@ impl AppView {
                     .relative()
                     .flex_shrink_0()
                     .occlude()
-                    .w(px(if monitor_form { 392. } else { 420. }))
+                    .w(px(560.))
                     .max_w_full()
-                    .h_full()
+                    .h(relative(0.84))
+                    .max_h(px(720.))
+                    .rounded_lg()
+                    .border_1()
                     .bg(self.c(self.col().bg))
-                    .border_l_1()
                     .border_color(self.c(self.col().line))
                     .flex()
                     .flex_col()
@@ -1021,16 +1527,21 @@ impl AppView {
                     )
                     .child(
                         div()
-                            .id("drawer-scroll")
                             .flex_1()
                             .min_h_0()
                             .relative()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scrollers["drawer-scroll"])
-                            .vertical_scrollbar(&self.scrollers["drawer-scroll"])
-                            .px_5()
-                            .pb_5()
-                            .child(self.form_content(f, None, cx)),
+                            .child(
+                                div()
+                                    .id("drawer-scroll")
+                                    .size_full()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scrollers["drawer-scroll"])
+                                    .child(
+                                        div().px_5().pb_5().child(self.form_content(f, None, cx)),
+                                    ),
+                            )
+                            // Keep the scrollbar overlay out of the measured scroll content.
+                            .vertical_scrollbar(&self.scrollers["drawer-scroll"]),
                     )
                     .child(
                         div()
@@ -1078,6 +1589,19 @@ impl AppView {
             )
             .into_any_element()
     }
+    fn rename_saved_workspace(&mut self, id: &str, name: &str) -> anyhow::Result<()> {
+        self.workspaces.rename_saved(id, name)?;
+        for tab in self
+            .tabs
+            .iter_mut()
+            .filter(|t| t.saved.as_deref() == Some(id))
+        {
+            tab.name = name.trim().to_owned();
+            tab.custom_name = true;
+        }
+        Ok(())
+    }
+
     pub(super) fn save_form(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let Some(f) = self.drawer.clone() else { return };
         let errors = self.validate_form_fields(&f, cx);
@@ -1133,13 +1657,20 @@ impl AppView {
                     } else {
                         None
                     };
+                    let group_text = self.input(&f, "group", cx);
+                    let selected =
+                        !f.group.is_empty() && self.store.group_path(&f.group) == group_text;
                     let result = self.change_store(|s| {
-                        ensure!(
-                            f.group.is_empty() || s.groups.iter().any(|g| g.id == f.group),
-                            "Group changed or deleted; choose it again"
-                        );
-                        let path = s.group_path(&f.group);
-                        s.assign_host_group(&mut h, &path, original.as_ref())?;
+                        if selected {
+                            ensure!(
+                                s.group(&f.group).is_some(),
+                                "Group changed or deleted; choose it again"
+                            );
+                            h.group_id = f.group.clone();
+                            h.group = s.group_path(&f.group);
+                        } else {
+                            s.assign_host_group(&mut h, &group_text, original.as_ref())?;
+                        }
                         if let Some(original) = original {
                             let i = s
                                 .hosts
@@ -1217,6 +1748,37 @@ impl AppView {
                     let name = self.input(&f, "label", cx);
                     self.change_store(|s| s.add_group(&name, parent).map(|_| ()))?;
                 }
+                FormKind::RenameWorkspace(entry) => {
+                    let name = self.input(&f, "label", cx);
+                    self.rename_saved_workspace(&entry.id, &name)?;
+                }
+                FormKind::RenameTabGroup(id) => {
+                    let name = self.input(&f, "label", cx);
+                    let name = name.trim();
+                    ensure!(name.chars().count() <= 24, "Use at most 24 characters");
+                    ensure!(
+                        !self
+                            .tab_groups
+                            .iter()
+                            .enumerate()
+                            .any(|(other, group)| { other != *id && group.name == name }),
+                        "A tab group with this name already exists"
+                    );
+                    let group = &mut self.tab_groups[*id];
+                    if let Some(saved_id) = &group.saved_id {
+                        if self
+                            .workspaces
+                            .tab_groups
+                            .iter()
+                            .any(|saved| &saved.id == saved_id)
+                        {
+                            self.workspaces.rename_tab_group(saved_id, name)?;
+                        } else {
+                            group.saved_id = None;
+                        }
+                    }
+                    group.name = name.to_owned();
+                }
                 FormKind::Existing(group) => {
                     ensure!(
                         !group.is_empty(),
@@ -1239,8 +1801,18 @@ impl AppView {
                     s.theme = f.theme;
                     s.confirm_close_tabs = Some(f.confirm);
                     s.audible_bell = Some(f.bell);
+                    s.npu_monitor_enabled = f.npu_monitor_enabled;
                     s.save()?;
+                    if self.settings.npu_monitor_enabled && !s.npu_monitor_enabled {
+                        self.monitor.suspend();
+                        self.monitor_detail = None;
+                        self.monitor_reason = None;
+                        self.monitor_technical = false;
+                    }
                     self.settings = s;
+                    if self.page == Page::Monitor && !self.settings.npu_monitor_enabled {
+                        self.activate_tab(Page::Hosts, w, cx);
+                    }
                     for p in self.panes.values() {
                         p.view.update(cx, |v, cx| {
                             v.appearance(self.settings.font_size(), self.theme, cx)
@@ -1255,8 +1827,18 @@ impl AppView {
                         .iter_mut()
                         .find(|t| t.id == *id)
                         .context("Tab closed")?;
-                    t.name = name.trim().to_owned();
-                    t.custom_name = true;
+                    if let Some(saved_id) = t.saved.clone().filter(|id| {
+                        self.workspaces
+                            .saved
+                            .iter()
+                            .any(|workspace| workspace.id == *id)
+                    }) {
+                        self.rename_saved_workspace(&saved_id, &name)?;
+                    } else {
+                        t.saved = None;
+                        t.name = name.trim().to_owned();
+                        t.custom_name = true;
+                    }
                 }
                 FormKind::Monitor => {
                     ensure!(!f.selected.is_empty(), "Choose at least one host");

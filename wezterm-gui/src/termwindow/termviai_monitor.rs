@@ -290,13 +290,13 @@ impl MonitorUi {
                 self.menu = if self.menu == Some(i) { None } else { Some(i) };
             }
             Command::Pause(i) => {
-                if let Some(e) = self.data.entries.get_mut(i) {
-                    e.paused = !e.paused;
+                if let Some(e) = self.data.entries.get(i) {
+                    self.data.set_paused(i, !e.paused)?;
                 }
                 self.menu = None;
             }
             Command::Retry(i) => {
-                self.data.retry(i);
+                self.data.set_paused(i, false)?;
                 if self.dialog == Some(Dialog::Reason) {
                     self.selected = self.reason_return;
                 }

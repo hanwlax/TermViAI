@@ -37,7 +37,7 @@ impl Theme {
     pub const ALL: [Self; 3] = [Self::Ink, Self::Navy, Self::Light];
     pub fn label(self) -> &'static str {
         match self {
-            Self::Ink => "墨黑 · 鸢尾紫",
+            Self::Ink => "炭黑 · 雾蓝",
             Self::Navy => "深海 · 冰蓝",
             Self::Light => "瓷白 · 鸢尾紫",
         }
@@ -45,24 +45,24 @@ impl Theme {
     pub fn colors(self) -> &'static Colors {
         match self {
             Self::Ink => &Colors {
-                bg: "#101114",
-                top: "#0c0d10",
-                side: "#15161a",
-                card: "#1b1d22",
-                field: "#111216",
-                input_selection: "#6e50b4",
-                hover: "#25282f",
+                bg: "#18191d",
+                top: "#141518",
+                side: "#1c1d22",
+                card: "#202126",
+                field: "#141518",
+                input_selection: "#455a71",
+                hover: "#292b32",
                 icon_hover: "#363a44",
-                line: "#30333b",
-                text: "#f1f2f5",
-                muted: "#a4a9b5",
-                accent: "#a78bfa",
-                soft: "#282238",
-                purple: "#b49af8",
-                green: "#74d6ad",
-                red: "#ff8996",
-                blue: "#83bbf7",
-                terminal: "#0c0d10",
+                line: "#34363d",
+                text: "#e5e7ec",
+                muted: "#aeb2bf",
+                accent: "#a6c2de",
+                soft: "#303640",
+                purple: "#b4aec8",
+                green: "#9ec7b4",
+                red: "#efadb1",
+                blue: "#9cbad8",
+                terminal: "#191a1e",
             },
             Self::Navy => &Colors {
                 bg: "#0a1420",

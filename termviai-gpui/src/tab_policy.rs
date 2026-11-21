@@ -30,6 +30,19 @@ pub fn reorder_destination(len: usize, from: usize, gap: usize) -> Option<usize>
     (to != from).then_some(to)
 }
 
+/// Keeps a positional reference attached to its item across a remove-and-insert.
+pub fn index_after_move(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < index && index <= to {
+        index - 1
+    } else if to <= index && index < from {
+        index + 1
+    } else {
+        index
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,6 +87,23 @@ mod tests {
         assert_eq!(reorder_destination(0, 0, 0), None);
         assert_eq!(reorder_destination(4, 4, 0), None);
         assert_eq!(reorder_destination(4, 0, 5), None);
+    }
+
+    #[test]
+    fn group_references_follow_the_same_items_across_every_insertion_gap() {
+        for from in 0..5 {
+            for gap in 0..=5 {
+                let Some(to) = reorder_destination(5, from, gap) else {
+                    continue;
+                };
+                let mut groups = vec![0, 1, 2, 3, 4];
+                let moved = groups.remove(from);
+                groups.insert(to, moved);
+                for old in 0..5 {
+                    assert_eq!(groups[index_after_move(old, from, to)], old);
+                }
+            }
+        }
     }
 
     #[test]

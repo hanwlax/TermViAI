@@ -477,9 +477,17 @@ impl Entry {
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Preferences {
-    hosts: Vec<Host>,
+    hosts: Vec<HostPreference>,
     interval: u64,
 }
+#[derive(Serialize, Deserialize)]
+struct HostPreference {
+    #[serde(flatten)]
+    host: Host,
+    #[serde(default)]
+    paused: bool,
+}
+
 pub struct Monitor {
     pub entries: Vec<Entry>,
     pub interval: u64,
@@ -499,16 +507,7 @@ impl Monitor {
         let mut m = Self::default();
         match std::fs::read(HostStore::path().with_file_name("monitor.json")) {
             Ok(data) => match serde_json::from_slice::<Preferences>(&data) {
-                Ok(p) => {
-                    m.interval = if [2, 5, 10].contains(&p.interval) {
-                        p.interval
-                    } else {
-                        2
-                    };
-                    for h in p.hosts {
-                        m.add(h);
-                    }
-                }
+                Ok(p) => return Self::from_preferences(p),
                 Err(e) => {
                     m.load_error = format!(
                         "Monitor preferences could not be read; original file preserved: {e}"
@@ -520,21 +519,42 @@ impl Monitor {
         }
         m
     }
-    pub fn save(&self) -> anyhow::Result<()> {
-        self.save_hosts(self.entries.iter().map(|e| e.host.clone()).collect())
+    fn from_preferences(p: Preferences) -> Self {
+        let mut monitor = Self::default();
+        if [2, 5, 10].contains(&p.interval) {
+            monitor.interval = p.interval;
+        }
+        for saved in p.hosts {
+            if !monitor.contains(&saved.host) {
+                let mut entry = Entry::new(saved.host);
+                entry.paused = saved.paused;
+                monitor.entries.push(entry);
+            }
+        }
+        monitor
     }
-    fn save_hosts(&self, hosts: Vec<Host>) -> anyhow::Result<()> {
+    fn preferences(&self) -> Preferences {
+        Preferences {
+            interval: self.interval,
+            hosts: self
+                .entries
+                .iter()
+                .map(|e| HostPreference {
+                    host: e.host.clone(),
+                    paused: e.paused,
+                })
+                .collect(),
+        }
+    }
+    pub fn save(&self) -> anyhow::Result<()> {
+        self.save_preferences(self.preferences())
+    }
+    fn save_preferences(&self, prefs: Preferences) -> anyhow::Result<()> {
         ensure!(self.load_error.is_empty(), "{}", self.load_error);
         let path = HostStore::path().with_file_name("monitor.json");
         std::fs::create_dir_all(path.parent().unwrap())?;
         let mut temp = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-        serde_json::to_writer_pretty(
-            &mut temp,
-            &Preferences {
-                hosts,
-                interval: self.interval,
-            },
-        )?;
+        serde_json::to_writer_pretty(&mut temp, &prefs)?;
         temp.as_file().sync_all()?;
         temp.persist(&path).map_err(|e| e.error)?;
         Ok(())
@@ -554,13 +574,13 @@ impl Monitor {
         })
     }
     pub fn replace_host(&mut self, original: &Host, host: Host) -> anyhow::Result<()> {
-        self.replace_host_with(original, host, |m, hosts| m.save_hosts(hosts))
+        self.replace_host_with(original, host, Self::save_preferences)
     }
     fn replace_host_with(
         &mut self,
         original: &Host,
         host: Host,
-        persist: impl FnOnce(&Self, Vec<Host>) -> anyhow::Result<()>,
+        persist: impl FnOnce(&Self, Preferences) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let id = self
             .entries
@@ -576,22 +596,50 @@ impl Monitor {
             !old.stopping && !old.job_stop && old.pending_stop.is_none(),
             "Wait for the process action to complete before changing hosts"
         );
-        let mut hosts: Vec<_> = self.entries.iter().map(|e| e.host.clone()).collect();
-        hosts[id] = host.clone();
+        let mut prefs = self.preferences();
+        let paused = old.paused;
+        prefs.hosts[id] = HostPreference {
+            host: host.clone(),
+            paused,
+        };
         // Persist first: a disk failure must leave the old monitor and its work intact.
-        persist(self, hosts)?;
+        persist(self, prefs)?;
         self.entries[id] = Entry::new(host);
+        self.entries[id].paused = paused;
         Ok(())
     }
-    pub fn retry(&mut self, id: usize) {
-        if let Some(e) = self.entries.get_mut(id) {
+    /// Release monitor sessions and cancel outstanding work, retaining each host's pause state.
+    pub fn suspend(&mut self) {
+        for entry in &mut self.entries {
+            let mut idle = Entry::new(entry.host.clone());
+            idle.paused = entry.paused;
+            if idle.paused {
+                idle.snapshot = entry.snapshot.take();
+                idle.updated = entry.updated;
+            }
+            *entry = idle;
+        }
+    }
+
+    pub fn set_paused(&mut self, id: usize, paused: bool) -> anyhow::Result<()> {
+        let entry = self.entries.get_mut(id).context("Monitor removed")?;
+        let previous = entry.paused;
+        if paused != previous {
+            entry.paused = paused;
+            if let Err(err) = self.save() {
+                self.entries[id].paused = previous;
+                return Err(err);
+            }
+        }
+        if !paused {
+            let e = &mut self.entries[id];
             e.error.clear();
             e.failure = None;
             e.failures = 0;
             e.retryable = false;
-            e.paused = false;
             e.next = Instant::now();
         }
+        Ok(())
     }
     pub fn tick(&mut self, store: &HostStore, config: impl Fn(&Host) -> anyhow::Result<ConfigMap>) {
         for e in &mut self.entries {
@@ -792,8 +840,9 @@ mod tests {
             .replace_host_with(&a, c.clone(), |_, _| panic!("stop must not be interrupted"))
             .is_err());
         m.entries[0].stopping = false;
-        m.replace_host_with(&a, c.clone(), |_, hosts| {
-            assert_eq!(hosts, vec![c.clone(), b.clone()]);
+        m.replace_host_with(&a, c.clone(), |_, prefs| {
+            assert_eq!(prefs.hosts[0].host, c);
+            assert_eq!(prefs.hosts[1].host, b);
             Ok(())
         })
         .unwrap();
@@ -929,6 +978,56 @@ mod tests {
         }
     }
     #[test]
+    fn restarting_or_reenabling_monitor_only_samples_collecting_hosts() {
+        // Older files contain plain hosts with no sampling preference.
+        let json = r#"{"interval":5,"hosts":[{"label":"A"},{"label":"B","paused":true}]}"#;
+        let mut monitor = Monitor::from_preferences(serde_json::from_str(json).unwrap());
+        monitor.suspend();
+        let saved = serde_json::to_vec(&monitor.preferences()).unwrap();
+        let restored = Monitor::from_preferences(serde_json::from_slice(&saved).unwrap());
+        assert_eq!(restored.interval, 5);
+        assert_eq!(restored.entries[0].host.label, "A");
+        assert!(restored.entries[0].sampling_due(Instant::now()));
+        assert_eq!(restored.entries[1].host.label, "B");
+        assert!(!restored.entries[1].sampling_due(Instant::now()));
+    }
+
+    #[test]
+    fn failed_pause_or_resume_save_leaves_the_previous_sampling_state() {
+        let mut monitor = Monitor::default();
+        monitor.load_error = "Settings unavailable".into();
+        monitor.add(Host::default());
+        assert!(monitor.set_paused(0, true).is_err());
+        assert!(!monitor.entries[0].paused);
+        monitor.entries[0].paused = true;
+        assert!(monitor.set_paused(0, false).is_err());
+        assert!(monitor.entries[0].paused);
+    }
+
+    #[test]
+    fn suspend_cancels_old_workers_and_preserves_monitor_configuration() {
+        let mut m = Monitor::default();
+        m.add(Host::default());
+        m.interval = 10;
+        let entry = &mut m.entries[0];
+        let cancel = entry.cancel.clone();
+        let (_tx, rx) = mpsc::channel();
+        entry.rx = Some(rx);
+        entry.pending_stop = Some(vec![]);
+        entry.paused = true;
+        entry.snapshot = Some(fixture());
+
+        m.suspend();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(m.interval, 10);
+        let entry = &m.entries[0];
+        assert!(entry.paused && entry.snapshot.is_some());
+        assert!(!entry.busy() && entry.pending_stop.is_none());
+        assert!(!entry.cancel.load(Ordering::Relaxed));
+        assert!(!entry.sampling_due(Instant::now()));
+    }
+
+    #[test]
     fn sampling_failures_retry_with_backoff_and_recover() {
         let mut m = Monitor::default();
         m.add(Host::default());
@@ -973,7 +1072,7 @@ mod tests {
             now,
         );
         assert!(!e.sampling_due(now + Duration::from_secs(3600)));
-        m.retry(0);
+        m.set_paused(0, false).unwrap();
         assert!(m.entries[0].sampling_due(Instant::now()));
     }
     #[test]

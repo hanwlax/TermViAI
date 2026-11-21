@@ -136,7 +136,45 @@ impl AppView {
                     .child(title),
             )
             .child(self.muted(p.host.as_ref().map(|h| h.endpoint()).unwrap_or_default()));
-        if !view.error.is_empty() {
+        if view.phase == Phase::Verify {
+            let fingerprint = view
+                .error
+                .lines()
+                .find_map(|line| line.split_once("Fingerprint: "));
+            let (label, value) = match fingerprint {
+                Some((algorithm, hash)) => (
+                    format!(
+                        "{}fingerprint",
+                        if algorithm.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!("{} ", algorithm.trim())
+                        }
+                    ),
+                    hash.strip_suffix('.').unwrap_or(hash),
+                ),
+                None => ("Host verification".to_owned(), view.error.as_str()),
+            };
+            content = content
+                .child(
+                    div()
+                        .max_w(px(540.))
+                        .p_3()
+                        .rounded_md()
+                        .bg(self.c(self.col().card))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(self.muted(label))
+                        .child(
+                            div()
+                                .font_family("JetBrains Mono")
+                                .text_color(self.c(self.col().text))
+                                .child(value.to_owned()),
+                        ),
+                )
+                .child(self.muted("Compare the fingerprint with one from a trusted source."));
+        } else if !view.error.is_empty() {
             content = content.child(
                 div()
                     .text_size(px(12.))
@@ -178,7 +216,7 @@ impl AppView {
                     .map(|l| self.muted(l.clone())),
             );
         }
-        let mut footer = div().flex().justify_end().gap_2().p_3().flex_shrink_0();
+        let mut footer = div().flex().flex_wrap().gap_2().pt_3().flex_shrink_0();
         match view.phase {
             Phase::Verify => {
                 let control = p.session.auth.clone();
@@ -186,6 +224,12 @@ impl AppView {
                     cx.listener(move |s, _, _, cx| {
                         let r = control.send(authentication::Command::Trust(true));
                         s.notify_error(r, cx);
+                    }),
+                ));
+                let reject = p.session.auth.clone();
+                footer = footer.child(self.button(("reject-host", id), "Cancel").on_click(
+                    cx.listener(move |s, _, _, cx| {
+                        s.notify_error(reject.send(authentication::Command::Trust(false)), cx);
                     }),
                 ));
             }
@@ -226,9 +270,9 @@ impl AppView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .p_4()
-                    .child(content),
+                    .child(content)
+                    .child(footer),
             )
-            .child(footer)
             .into_any_element()
     }
     pub(super) fn terminal_page(
@@ -306,6 +350,7 @@ impl AppView {
                             .unwrap_or("Local".into());
                         div()
                             .id(("broadcast-member", id))
+                            .on_mouse_down(MouseButton::Left, preserve_input_focus)
                             .h(px(30.))
                             .min_w(px(68.))
                             .max_w(px(190.))
@@ -392,6 +437,7 @@ impl AppView {
                                 .child(
                                     div()
                                         .id(("broadcast-select-all", tab_id))
+                                        .on_mouse_down(MouseButton::Left, preserve_input_focus)
                                         .flex_shrink_0()
                                         .h(px(30.))
                                         .px_2()
@@ -425,6 +471,7 @@ impl AppView {
                         .child(
                             div()
                                 .id(("broadcast-power", tab_id))
+                                .on_mouse_down(MouseButton::Left, preserve_input_focus)
                                 .size(px(27.))
                                 .flex_shrink_0()
                                 .flex()
@@ -441,6 +488,7 @@ impl AppView {
                         .child(
                             div()
                                 .id(("broadcast-expand", tab_id))
+                                .on_mouse_down(MouseButton::Left, preserve_input_focus)
                                 .min_w_0()
                                 .h(px(28.))
                                 .px(px(6.))
@@ -494,7 +542,8 @@ impl AppView {
         }
         page.child(
             div()
-                .h(px(34.))
+                .min_h(px(34.))
+                .when(online < count, |d| d.py(px(8.)))
                 .flex_shrink_0()
                 .flex()
                 .items_center()
@@ -577,15 +626,36 @@ impl AppView {
                     .child(
                         div()
                             .id(SharedString::from(format!("divider-{tab}-{path:?}")))
+                            .group("split-divider")
                             .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .when(horizontal, |d| {
-                                d.w(px(4.)).h_full().cursor(CursorStyle::ResizeLeftRight)
+                                d.w(px(7.))
+                                    .h_full()
+                                    .py(px(4.))
+                                    .cursor(CursorStyle::ResizeLeftRight)
                             })
                             .when(!horizontal, |d| {
-                                d.h(px(4.)).w_full().cursor(CursorStyle::ResizeUpDown)
+                                d.h(px(7.))
+                                    .w_full()
+                                    .px(px(4.))
+                                    .cursor(CursorStyle::ResizeUpDown)
                             })
-                            .bg(self.c(self.col().line))
-                            .hover(|d| d.bg(self.c(self.col().accent)))
+                            .bg(self.c(self.col().top))
+                            .child(
+                                div()
+                                    .rounded_full()
+                                    .when(horizontal, |d| d.w(px(2.)).h_full())
+                                    .when(!horizontal, |d| d.h(px(2.)).w_full())
+                                    .group_hover("split-divider", |d| {
+                                        d.bg(self.c(self.col().accent))
+                                    })
+                                    .group_drag_over::<ResizeDrag>("split-divider", |d| {
+                                        d.bg(self.c(self.col().accent))
+                                    }),
+                            )
                             .on_drag(info, |drag, _, _, cx| cx.new(|_| drag.clone())),
                     )
                     .child(
@@ -628,33 +698,49 @@ impl AppView {
             .gap_2()
             .px_2()
             .bg(self.c(self.col().side))
-            .border_t_1()
-            .border_color(if self.focused == Some(id) {
-                self.c(self.col().accent)
-            } else {
-                gpui::transparent_black()
-            })
+            .rounded_t(px(11.))
+            .border_b_1()
+            .border_color(self.c(self.col().line).opacity(0.55))
             .cursor(CursorStyle::PointingHand)
-            .child(Icon::new(IconName::SquareTerminal).size(px(14.)))
+            .child(
+                div()
+                    .id(("pane-actions", id))
+                    .size(px(24.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .hover(|d| d.bg(self.c(self.col().hover)))
+                    .child(
+                        Icon::new(IconName::EllipsisVertical)
+                            .path("termviai/grip.svg")
+                            .size(px(15.)),
+                    )
+                    .on_click(cx.listener(move |s, e: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        s.menu = Some((MenuKind::Pane(tab, id), e.position()));
+                        cx.notify();
+                    })),
+            )
             .child(div().flex_1().min_w_0().truncate().child(label))
             .child(p.notices.clone())
-            .when(group, |d| {
-                d.child(
-                    div()
-                        .id(("pane-bc", id))
-                        .size(px(26.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .hover(|d| d.bg(self.c(self.col().icon_hover)))
-                        .child(self.radio(on))
-                        .on_click(cx.listener(move |s, _, _, cx| {
-                            cx.stop_propagation();
-                            s.member(tab, id, cx);
-                        })),
-                )
-            })
+            .child(
+                div()
+                    .id(("pane-bc", id))
+                    .on_mouse_down(MouseButton::Left, preserve_input_focus)
+                    .size(px(26.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .hover(|d| d.bg(self.c(self.col().icon_hover)))
+                    .when(on, |d| d.bg(self.c(self.col().soft)))
+                    .child(self.radio(on))
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        cx.stop_propagation();
+                        s.member(tab, id, cx);
+                    })),
+            )
             .when(group, |d| {
                 d.child(
                     self.icon(
@@ -665,10 +751,19 @@ impl AppView {
                             IconName::Maximize
                         },
                     )
-                    .on_click(cx.listener(move |s, _, _, cx| {
+                    .on_mouse_down(MouseButton::Left, preserve_input_focus)
+                    .on_click(cx.listener(move |s, _, w, cx| {
                         cx.stop_propagation();
                         if let Some(t) = s.tabs.iter_mut().find(|t| t.id == tab) {
                             t.zoom = if t.zoom.is_some() { None } else { Some(id) };
+                            // Zooming a different pane hides the old input target.
+                            // Focus the remaining visible terminal in that case.
+                            if t.zoom.is_some() && s.focused != Some(id) {
+                                s.focused = Some(id);
+                                if let Some(pane) = s.panes.get(&id) {
+                                    pane.view.focus_handle(cx).focus(w);
+                                }
+                            }
                         }
                         cx.notify();
                     })),
@@ -676,13 +771,13 @@ impl AppView {
             })
             .child(
                 self.close(("close-pane", id))
-                    .on_click(cx.listener(move |s, _, _, cx| {
+                    .on_click(cx.listener(move |s, _, w, cx| {
                         cx.stop_propagation();
                         if s.settings.confirm_close() {
                             s.confirm = Some(Confirm::Pane(id));
                             cx.notify();
                         } else {
-                            s.close_pane(id, cx);
+                            s.close_pane(id, w, cx);
                         }
                     })),
             )
@@ -714,9 +809,15 @@ impl AppView {
             .flex()
             .flex_col()
             .border_1()
-            .border_color(self.c(self.col().line))
+            .rounded(px(12.))
+            .bg(self.c(self.col().terminal))
+            .border_color(if self.focused == Some(id) {
+                self.c(self.col().blue)
+            } else {
+                self.c(self.col().line).opacity(0.66)
+            })
             .child(header)
-            .child(div().flex_1().min_h_0().min_w_0().p_1().child(content))
+            .child(div().flex_1().min_h_0().min_w_0().p(px(6.)).child(content))
             .on_drag_move::<Drag>(cx.listener(move |s, e: &DragMoveEvent<Drag>, _, cx| {
                 let d = e.drag(cx);
                 let source = s.dock_source(d);
@@ -727,6 +828,7 @@ impl AppView {
                     }
                     return;
                 }
+                s.tab_join_target = None;
                 s.tab_drop_target = None;
                 let u = (e.event.position.x - e.bounds.left()) / e.bounds.size.width;
                 let v = (e.event.position.y - e.bounds.top()) / e.bounds.size.height;
@@ -742,11 +844,12 @@ impl AppView {
                     cx.notify();
                 }
             }))
-            .on_drop(cx.listener(move |s, d: &Drag, _, cx| {
+            .on_drop(cx.listener(move |s, d: &Drag, w, cx| {
                 if let Some((target_tab, target, side)) = s.drop_target {
                     if target_tab == tab && target == id {
                         cx.stop_propagation();
                         s.dock(d, target_tab, target, side, cx);
+                        s.focus_active_tab(w, cx);
                     }
                 }
             }))

@@ -1,4 +1,3 @@
-use crate::hosts::Host;
 use crate::workspaces::{SavedLayout, SplitAxis};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +18,24 @@ pub enum Layout {
     },
 }
 impl Layout {
+    /// Build equal-area splits for a selection of hosts. Alternate axes at each level.
+    pub fn balanced(panes: &[usize], axis: SplitAxis) -> Self {
+        if let [id] = panes {
+            return Self::Pane(*id);
+        }
+        assert!(!panes.is_empty());
+        let mid = panes.len().div_ceil(2);
+        let next = match axis {
+            SplitAxis::Horizontal => SplitAxis::Vertical,
+            SplitAxis::Vertical => SplitAxis::Horizontal,
+        };
+        Self::Split {
+            axis,
+            ratio: mid as f32 / panes.len() as f32,
+            first: Box::new(Self::balanced(&panes[..mid], next)),
+            second: Box::new(Self::balanced(&panes[mid..], next)),
+        }
+    }
     pub fn panes(&self) -> Vec<usize> {
         let mut v = vec![];
         self.collect(&mut v);
@@ -119,7 +136,7 @@ impl Layout {
             _ => {}
         }
     }
-    pub fn save(&self, host: &impl Fn(usize) -> Option<Host>) -> Option<SavedLayout> {
+    pub fn save<T>(&self, host: &impl Fn(usize) -> Option<T>) -> Option<SavedLayout<T>> {
         Some(match self {
             Self::Pane(id) => SavedLayout::Pane { host: host(*id)? },
             Self::Split {
@@ -135,7 +152,7 @@ impl Layout {
             },
         })
     }
-    pub fn restore(layout: &SavedLayout, spawn: &mut impl FnMut(&Host) -> usize) -> Self {
+    pub fn restore<T>(layout: &SavedLayout<T>, spawn: &mut impl FnMut(&T) -> usize) -> Self {
         match layout {
             SavedLayout::Pane { host } => Self::Pane(spawn(host)),
             SavedLayout::Split {
@@ -174,6 +191,17 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn batch_layout_keeps_all_sessions_and_four_hosts_in_reading_order() {
+        for size in 1..=17 {
+            let ids = (0..size).collect::<Vec<_>>();
+            let layout = Layout::balanced(&ids, SplitAxis::Vertical);
+            assert_eq!(layout.panes(), ids);
+            if size == 4 {
+                assert_eq!(layout.visual_panes(), ids);
+            }
+        }
+    }
     #[test]
     fn visual_order_reads_rows_across_column_splits_and_after_docking() {
         let mut layout = Layout::Pane(209);

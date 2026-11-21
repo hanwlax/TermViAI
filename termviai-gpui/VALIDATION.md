@@ -1,5 +1,12 @@
 # Native GPUI trial validation · 2026-11-09
 
+## Preserve terminal input focus for instant controls · 2026-11-14
+
+- GPUI's tracked root focus is transferred automatically during mouse-down. Instant terminal controls now prevent that default transfer at the control, without stopping click/drag propagation or refocusing after click. This avoids blurring the terminal and clearing IME composition during a broadcast toggle.
+- Covers tab/pane broadcast buttons, individual members, select-all/clear, power, expand/collapse, tab scroll arrows and sidebar toggle. Search, rename, menus and selectable notice bodies retain their existing focus behavior.
+- Pane zoom preserves focus when the input target stays visible; zooming a different pane explicitly focuses that visible terminal rather than leaving keyboard input directed to a hidden pane.
+- Windows Release build, native rustfmt and git diff --check passed. This change is confined to native UI event handlers; no library tests were added or rerun. No computer-use, visible UI launch or live SSH interaction was performed, so actual pointer/IME behavior remains to be confirmed in the trial.
+
 ## Block input cursor · 2026-11-10
 
 - Replaced the fixed 2px caret with a cell-sized block painted behind terminal text. Cursor foreground/background come from each theme's terminal palette; wide glyphs use their full cell span, and empty cells still show the block.

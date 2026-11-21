@@ -87,6 +87,9 @@ impl AppView {
                 );
             }
             "settings" => self.open_form(FormKind::Settings, w, cx),
+            "monitor" | "monitor-add" if !self.settings.npu_monitor_enabled => {
+                self.page = Page::Hosts
+            }
             "monitor" => self.page = Page::Monitor,
             "monitor-add" => {
                 self.page = Page::Monitor;

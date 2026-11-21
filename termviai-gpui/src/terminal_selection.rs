@@ -18,7 +18,7 @@ impl Selection {
     pub fn extend(&mut self, end: Cell) {
         if self.dragging {
             if let Some((anchor, _)) = self.range {
-                self.extended |= anchor != end;
+                self.extended = true;
                 self.range = Some((anchor, end));
             }
         }
@@ -62,16 +62,50 @@ pub fn cell_at(
     height: f32,
     fractional: f32,
 ) -> Cell {
-    let cols = ((width - 10.) / cell).floor().max(2.);
-    let rows = (height / line).floor().max(2.);
+    let cols = grid_columns(width, cell);
+    let rows = (height / line).round().max(2.);
     // The first painted row can be partly clipped during smooth scrolling.
     let row = (y.clamp(0., (height - 0.01).max(0.)) / line + fractional)
         .floor()
         .clamp(0., (rows + fractional).ceil() - 1.);
     (
         top + row as isize,
-        (x / cell).floor().clamp(0., cols - 1.) as usize,
+        ((x / cell).floor().max(0.) as usize).min(cols - 1),
     )
+}
+
+/// Fit whole terminal rows to the drawable height; fractional space is shared
+/// by all rows so the live screen and the scrollback end at the same edge.
+pub fn fit_rows(height: f32, preferred_line: f32) -> (usize, f32) {
+    let rows = (height / preferred_line).round().max(2.) as usize;
+    let line = if height >= preferred_line * 1.5 {
+        height / rows as f32
+    } else {
+        preferred_line
+    };
+    (rows, line)
+}
+
+pub fn grid_columns(width: f32, cell: f32) -> usize {
+    ((width - 10.) / cell).floor().max(2.) as usize
+}
+
+/// The pressed cell stays included in either direction. The moving
+/// endpoint follows the nearest cell edge, converted to an inclusive cell.
+pub fn drag_end(anchor: Cell, hit: Cell, column: f32, cols: usize) -> Cell {
+    let edge = (column.round() as usize).min(cols);
+    let backward = hit < anchor;
+    let end = if backward {
+        edge.min(cols - 1)
+    } else {
+        edge.saturating_sub(1)
+    };
+    let end = (hit.0, end);
+    if backward {
+        end.min(anchor)
+    } else {
+        end.max(anchor)
+    }
 }
 
 /// Columns highlighted on a physical display row, including selected blank cells.
@@ -217,6 +251,19 @@ mod tests {
         )
     }
     #[test]
+    fn partial_row_space_is_shared_in_normal_and_fullscreen_panes() {
+        for height in [315.5, 316., 317., 609., 610., 611., 614.5] {
+            let (rows, line) = fit_rows(height, 20.);
+            assert!((rows as f32 * line - height).abs() < 0.001);
+            assert_eq!(
+                cell_at(100, 0., height - 0.01, 8., line, 800., height, 0.).0,
+                100 + rows as isize - 1
+            );
+        }
+        assert_eq!(fit_rows(0., 20.), (2, 20.));
+    }
+
+    #[test]
     fn release_copies_once_but_click_and_cancel_do_not() {
         let mut s = Selection::default();
         s.begin((10, 2));
@@ -241,6 +288,17 @@ mod tests {
         s.extend(cell_at(14, 32., 999., 8., 20., 170., 100., 0.));
         assert_eq!(s.range, Some(((10, 2), (18, 4))));
         assert!(s.finish());
+    }
+    #[test]
+    fn drag_selection_keeps_the_pressed_cell_and_rounds_the_moving_edge() {
+        let anchor = (4, 3);
+        assert_eq!(drag_end(anchor, (4, 3), 3.12, 8), anchor);
+        assert_eq!(drag_end(anchor, (4, 4), 4.35, 8), anchor);
+        assert_eq!(drag_end(anchor, (4, 4), 4.55, 8), (4, 4));
+        assert_eq!(drag_end(anchor, (4, 2), 2.75, 8), anchor);
+        assert_eq!(drag_end(anchor, (4, 2), 2.25, 8), (4, 2));
+        assert_eq!(drag_end(anchor, (3, 7), 20., 8), (3, 7));
+        assert_eq!(drag_end(anchor, (5, 0), -1., 8), (5, 0));
     }
     #[test]
     fn edge_speed_is_directional_bounded_and_zero_in_center() {

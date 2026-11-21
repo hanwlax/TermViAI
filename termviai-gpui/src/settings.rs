@@ -11,6 +11,7 @@ pub struct Settings {
     pub theme: Theme,
     pub confirm_close_tabs: Option<bool>,
     pub audible_bell: Option<bool>,
+    pub npu_monitor_enabled: bool,
     #[serde(flatten)]
     other: serde_json::Map<String, serde_json::Value>,
 }
@@ -22,6 +23,7 @@ impl Default for Settings {
             theme: Theme::Ink,
             confirm_close_tabs: None,
             audible_bell: None,
+            npu_monitor_enabled: true,
             other: Default::default(),
         }
     }
@@ -65,6 +67,7 @@ impl Settings {
         current.theme = self.theme;
         current.confirm_close_tabs = self.confirm_close_tabs;
         current.audible_bell = self.audible_bell;
+        current.npu_monitor_enabled = self.npu_monitor_enabled;
         let path = HostStore::path().with_file_name("settings.json");
         let dir = path.parent().context("Missing settings directory")?;
         std::fs::create_dir_all(dir)?;
@@ -74,5 +77,24 @@ impl Settings {
         file.as_file().sync_all()?;
         file.persist(path).map_err(|e| e.error)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn npu_monitor_defaults_on_for_new_and_existing_profiles_and_remembers_opt_out() {
+        assert!(Settings::default().npu_monitor_enabled);
+        let mut settings: Settings = serde_json::from_str(r#"{"audible_bell":true}"#).unwrap();
+        assert!(settings.npu_monitor_enabled);
+        for enabled in [false, true] {
+            settings.npu_monitor_enabled = enabled;
+            let restored: Settings =
+                serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+            assert_eq!(restored.npu_monitor_enabled, enabled);
+            assert!(restored.bell());
+        }
     }
 }

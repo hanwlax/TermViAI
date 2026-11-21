@@ -918,6 +918,33 @@ mod tests {
     }
 
     #[test]
+    fn editing_a_host_group_accepts_free_text_and_empty_input() {
+        let mut store = HostStore::default();
+        let original_group = store.add_group("Dev machines", "").unwrap();
+        let mut h = Host::quick_connect("example.test").unwrap();
+        store
+            .assign_host_group(&mut h, "Dev machines", None)
+            .unwrap();
+        let original = h.clone();
+        store
+            .assign_host_group(&mut h, " Dev ", Some(&original))
+            .unwrap();
+        assert_ne!(h.group_id, original_group);
+        assert_eq!(h.group, "Dev");
+        assert_eq!(store.groups.len(), 2);
+        store
+            .assign_host_group(&mut h, "dev MACHINES", Some(&original))
+            .unwrap();
+        assert_eq!(h.group_id, original_group);
+        assert_eq!(store.groups.len(), 2);
+        store
+            .assign_host_group(&mut h, "  ", Some(&original))
+            .unwrap();
+        assert!(h.group_id.is_empty() && h.group.is_empty());
+        assert_eq!(store.groups.len(), 2);
+    }
+
+    #[test]
     fn empty_groups_and_legacy_labels_survive_reload_without_changing_hosts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hosts.json");

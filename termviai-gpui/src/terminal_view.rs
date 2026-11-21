@@ -8,8 +8,8 @@ use termviai_gpui::{
     session::{Input, Session},
     terminal_ime::{ImeEpoch, Preedit},
     terminal_selection::{
-        Selection, cell_at, double_click_range, edge_velocity, line_text_range, selected_columns,
-        selected_text,
+        Selection, cell_at, double_click_range, drag_end, edge_velocity, fit_rows, grid_columns,
+        line_text_range, selected_columns, selected_text,
     },
     theme::{Colors, Theme},
 };
@@ -22,6 +22,7 @@ pub enum TerminalEvent {
 pub struct TerminalView {
     pub session: Arc<Session>,
     focus: FocusHandle,
+    broadcast_cursor: bool,
     bounds: Bounds<Pixels>,
     cell: Pixels,
     line: Pixels,
@@ -35,6 +36,7 @@ pub struct TerminalView {
     edge: bool,
     thumb_drag: Option<f32>,
     selection: Selection,
+    selection_press: Point<Pixels>,
     selection_pointer: Option<Point<Pixels>>,
     selection_tick: Instant,
     top: isize,
@@ -146,6 +148,7 @@ impl TerminalView {
         Self {
             session,
             focus,
+            broadcast_cursor: false,
             bounds: Bounds::default(),
             cell: px(8.),
             line: px(24.),
@@ -159,6 +162,7 @@ impl TerminalView {
             edge: false,
             thumb_drag: None,
             selection: Selection::default(),
+            selection_press: Point::default(),
             selection_pointer: None,
             selection_tick: Instant::now(),
             top: 0,
@@ -172,6 +176,12 @@ impl TerminalView {
         self.theme = theme;
         self.session.theme(theme);
         cx.notify();
+    }
+    pub(crate) fn set_broadcast_cursor(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.broadcast_cursor != visible {
+            self.broadcast_cursor = visible;
+            cx.notify();
+        }
     }
     fn emit(&mut self, input: Input, cx: &mut Context<Self>) {
         if !matches!(input, Input::KeyUp(_, _)) {
@@ -202,7 +212,19 @@ impl TerminalView {
     }
     fn extend_selection(&mut self, p: Point<Pixels>) {
         self.selection_pointer = Some(p);
-        self.selection.extend(self.coord(p));
+        let Some((anchor, _)) = self.selection.range else {
+            return;
+        };
+        let delta = p - self.selection_press;
+        let dx = f32::from(delta.x);
+        let dy = f32::from(delta.y);
+        if !self.selection.has_extended() && dx.hypot(dy) < f32::from(self.cell) / 4. {
+            return;
+        }
+        let column = (p.x - self.bounds.left()) / self.cell;
+        let cols = grid_columns(f32::from(self.bounds.size.width), f32::from(self.cell));
+        self.selection
+            .extend(drag_end(anchor, self.coord(p), column, cols));
     }
     fn finish_selection(&mut self, p: Point<Pixels>, cx: &mut App) {
         if self.selection.dragging {
@@ -263,7 +285,7 @@ impl TerminalView {
         cx.emit(TerminalEvent::Focused(self.session.id));
         if e.position.x > self.bounds.right() - px(10.) && self.history() > 0 {
             let h = self.history() as f32;
-            let rows = (self.bounds.size.height / self.line).floor();
+            let rows = (self.bounds.size.height / self.line).round().max(2.);
             let thumb = (self.bounds.size.height * rows / (h + rows)).max(px(28.));
             let top =
                 self.bounds.top() + (self.bounds.size.height - thumb) * (1. - self.scroll / h);
@@ -342,6 +364,7 @@ impl TerminalView {
             return;
         }
         self.selection.begin((row, col));
+        self.selection_press = e.position;
         self.selection_pointer = Some(e.position);
         self.selection_tick = Instant::now();
         cx.notify();
@@ -374,7 +397,7 @@ impl TerminalView {
     }
     fn drag_scroll(&mut self, pos: Point<Pixels>) {
         let h = self.history() as f32;
-        let rows = (self.bounds.size.height / self.line).floor();
+        let rows = (self.bounds.size.height / self.line).round().max(2.);
         let thumb = (self.bounds.size.height * rows / (h + rows)).max(px(28.));
         let y = ((pos.y - self.bounds.top() - px(self.thumb_drag.unwrap_or(0.)))
             / (self.bounds.size.height - thumb).max(px(1.)))
@@ -433,22 +456,38 @@ impl TerminalView {
                 });
             }
         });
-        let mut font = font("JetBrainsMono Nerd Font Mono");
+        // Use the bundled text face for both shaping and the terminal grid.
+        let mut font = font("JetBrains Mono");
         font.fallbacks = Some(FontFallbacks::from_fonts(vec![
-            "JetBrains Mono".into(),
             "Symbols Nerd Font Mono".into(),
             "Microsoft YaHei UI".into(),
         ]));
-        let id = w.text_system().resolve_font(&font);
-        self.cell = w
+        let sample = "00000000";
+        let run = TextRun {
+            len: sample.len(),
+            font: font.clone(),
+            color: transparent_black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let width = w
             .text_system()
-            .advance(id, px(self.font_size), 'M')
-            .map(|s| s.width)
-            .unwrap_or(px(self.font_size * 0.6));
-        self.line = px((self.font_size * 1.38).ceil());
+            .shape_line(sample.into(), px(self.font_size), &[run], None)
+            .width
+            / sample.len() as f32;
+        self.cell = if f32::from(width).is_finite() && width > px(0.) {
+            width
+        } else {
+            px(self.font_size * 0.6)
+        };
+        let (rows, line) = fit_rows(
+            f32::from(bounds.size.height),
+            (self.font_size * 1.38).ceil(),
+        );
+        self.line = px(line);
         self.bounds = bounds;
-        let cols = ((bounds.size.width - px(10.)) / self.cell).floor().max(2.) as usize;
-        let rows = (bounds.size.height / self.line).floor().max(2.) as usize;
+        let cols = grid_columns(f32::from(bounds.size.width), f32::from(self.cell));
         self.session.resize(
             rows,
             cols,
@@ -456,7 +495,7 @@ impl TerminalView {
             f32::from(bounds.size.height) as usize,
             (96. * w.scale_factor()) as u32,
         );
-        let (lines, palette, cursor, top, history, alt) = {
+        let (lines, palette, cursor, top, history, alt, connected) = {
             let st = self.session.state.lock().unwrap();
             let term = &st.term;
             let sc = term.screen();
@@ -472,18 +511,19 @@ impl TerminalView {
             self.scroll = self.scroll.clamp(0., history as f32);
             let start = history.saturating_sub(self.scroll.ceil() as usize);
             (
-                sc.lines_in_phys_range(start..start + rows + 1),
+                sc.lines_in_phys_range(start..start + rows + usize::from(self.scroll.fract() > 0.)),
                 term.palette(),
                 term.cursor_pos(),
                 sc.phys_to_stable_row_index(start),
                 history,
                 term.is_alt_screen_active(),
+                st.connected,
             )
         };
         self.top = top;
         if self.selection.dragging {
             if let Some(p) = self.selection_pointer {
-                self.selection.extend(self.coord(p));
+                self.extend_selection(p);
             }
         }
         let fractional = if self.scroll.fract() > 0. {
@@ -491,9 +531,15 @@ impl TerminalView {
         } else {
             0.
         };
+        let focused = self.focus.is_focused(w);
         let show_cursor = self.scroll < 0.01
             && cursor.visibility == termwiz::surface::CursorVisibility::Visible
-            && self.focus.is_focused(w);
+            && (focused || (self.broadcast_cursor && connected));
+        let selection = if self.selection.dragging && !self.selection.has_extended() {
+            None
+        } else {
+            self.selection.range
+        };
         w.with_content_mask(Some(ContentMask { bounds }), |w| {
             for (r, line) in lines.iter().enumerate() {
                 let y = bounds.top() + self.line * (r as f32 - fractional);
@@ -512,7 +558,7 @@ impl TerminalView {
                             })
                             .unwrap_or(cursor.x..cursor.x + 1)
                     });
-                let selected = selected_columns(self.selection.range, top + r as isize, cols);
+                let selected = selected_columns(selection, top + r as isize, cols);
                 // TextRun backgrounds require a separate GPUI paint pass. Draw in
                 // terminal cell coordinates so short lines and wide glyphs stay exact.
                 if let Some(range) = &selected {
@@ -550,9 +596,10 @@ impl TerminalView {
                         bg = palette.selection_bg;
                         fg = palette.selection_fg;
                     }
-                    if cursor_columns
-                        .as_ref()
-                        .is_some_and(|range| range.contains(&col))
+                    if focused
+                        && cursor_columns
+                            .as_ref()
+                            .is_some_and(|range| range.contains(&col))
                     {
                         fg = palette.cursor_fg;
                     }
@@ -608,16 +655,16 @@ impl TerminalView {
                         rgba_color(bg),
                     ));
                 }
-                if let Some(range) = cursor_columns {
+                let cursor_bounds = cursor_columns.map(|range| {
+                    Bounds::new(
+                        point(bounds.left() + self.cell * range.start as f32, y),
+                        size(self.cell * range.len() as f32, self.line),
+                    )
+                });
+                if focused && let Some(bounds) = cursor_bounds {
                     // Paint behind the glyph, with contrasting cursor foreground,
                     // so the block does not hide text when moving within a line.
-                    w.paint_quad(fill(
-                        Bounds::new(
-                            point(bounds.left() + self.cell * range.start as f32, y),
-                            size(self.cell * range.len() as f32, self.line),
-                        ),
-                        rgba_color(palette.cursor_bg),
-                    ));
+                    w.paint_quad(fill(bounds, rgba_color(palette.cursor_bg)));
                 }
                 let mut shaped =
                     w.text_system()
@@ -645,34 +692,39 @@ impl TerminalView {
                 }
                 *shaped = Arc::new(layout);
                 let _ = shaped.paint(point(bounds.left(), y), self.line, w, cx);
+                if !focused && let Some(bounds) = cursor_bounds {
+                    w.paint_quad(outline(
+                        bounds,
+                        rgba_color(palette.cursor_bg),
+                        BorderStyle::Solid,
+                    ));
+                }
             }
-            if show_cursor {
+            if focused && show_cursor && !self.preedit.text.is_empty() {
                 let origin = point(
                     bounds.left() + self.cell * cursor.x as f32,
                     bounds.top() + self.line * cursor.y as f32,
                 );
-                if !self.preedit.text.is_empty() {
-                    let run = TextRun {
-                        len: self.preedit.text.len(),
-                        font: font.clone(),
-                        color: Colors::color(self.theme.colors().text),
-                        background_color: Some(Colors::color(self.theme.colors().soft)),
-                        underline: Some(UnderlineStyle {
-                            color: None,
-                            thickness: px(1.),
-                            wavy: false,
-                        }),
-                        strikethrough: None,
-                    };
-                    let text = w.text_system().shape_line(
-                        self.preedit.text.clone().into(),
-                        px(self.font_size),
-                        &[run],
-                        None,
-                    );
-                    let _ = text.paint_background(origin, self.line, w, cx);
-                    let _ = text.paint(origin, self.line, w, cx);
-                }
+                let run = TextRun {
+                    len: self.preedit.text.len(),
+                    font: font.clone(),
+                    color: Colors::color(self.theme.colors().text),
+                    background_color: Some(Colors::color(self.theme.colors().soft)),
+                    underline: Some(UnderlineStyle {
+                        color: None,
+                        thickness: px(1.),
+                        wavy: false,
+                    }),
+                    strikethrough: None,
+                };
+                let text = w.text_system().shape_line(
+                    self.preedit.text.clone().into(),
+                    px(self.font_size),
+                    &[run],
+                    None,
+                );
+                let _ = text.paint_background(origin, self.line, w, cx);
+                let _ = text.paint(origin, self.line, w, cx);
             }
             let elapsed = self.last_scroll.elapsed().as_secs_f32();
             let opacity = if self.edge || self.thumb_drag.is_some() {
