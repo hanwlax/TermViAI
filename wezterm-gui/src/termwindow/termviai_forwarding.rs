@@ -1206,10 +1206,12 @@ fn drawer(
                     ),
                     (
                         "Automatic retry",
-                        if v.rule.retry {
-                            format!("Enabled · {} / 6", v.attempt)
-                        } else {
+                        if !v.rule.retry {
                             "Off".into()
+                        } else if v.attempt > 0 {
+                            format!("Enabled · retry {}", v.attempt)
+                        } else {
+                            "Enabled".into()
                         },
                     ),
                     (
@@ -1735,6 +1737,9 @@ mod tests {
                 state: State::Stopped,
                 error: String::new(),
                 attempt: 0,
+                retry_at: None,
+                last_attempt: None,
+                last_failure: String::new(),
                 service: None,
                 inspection: None,
                 busy: false,

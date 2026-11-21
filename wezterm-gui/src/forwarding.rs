@@ -1,4 +1,6 @@
 //! Application-owned reverse tunnels. Only opaque Host credential references are persisted.
+#[path = "forward_paths.rs"]
+mod forward_paths;
 use crate::hosts::{new_credential_id, Host, HostStore};
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
@@ -7,6 +9,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use wezterm_ssh::forward_network::Path as NetworkPath;
 use wezterm_ssh::{ConfigMap, Session, SessionEvent};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,6 +99,9 @@ fn same_server(a: &Host, b: &Host) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Stopped,
+    CheckingNetwork,
+    WaitingForNetwork,
+    Queued,
     Starting,
     Running,
     Retrying,
@@ -106,6 +112,9 @@ pub enum State {
 impl State {
     pub fn label(self) -> &'static str {
         match self {
+            Self::CheckingNetwork => "Checking network…",
+            Self::WaitingForNetwork => "Waiting for network",
+            Self::Queued => "Queued for connection",
             Self::Stopped => "Stopped",
             Self::Starting => "Connecting…",
             Self::Running => "Tunnel established",
@@ -118,7 +127,13 @@ impl State {
     pub fn active(self) -> bool {
         matches!(
             self,
-            Self::Starting | Self::Running | Self::Retrying | Self::Stopping
+            Self::CheckingNetwork
+                | Self::WaitingForNetwork
+                | Self::Queued
+                | Self::Starting
+                | Self::Running
+                | Self::Retrying
+                | Self::Stopping
         )
     }
 }
@@ -127,17 +142,37 @@ pub struct View {
     pub rule: Rule,
     pub state: State,
     pub error: String,
+    pub last_failure: String,
     pub attempt: usize,
+    pub last_attempt: Option<std::time::SystemTime>,
+    pub retry_at: Option<Instant>,
     pub service: Option<bool>,
     pub inspection: Option<Inspection>,
     pub busy: bool,
+}
+impl View {
+    pub fn status(&self) -> String {
+        if self.state == State::Retrying {
+            if let Some(deadline) = self.retry_at {
+                return format!(
+                    "Retrying in {}s",
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_secs_f64()
+                        .ceil() as u64
+                );
+            }
+        }
+        self.state.label().to_string()
+    }
 }
 struct Worker {
     cancel: Arc<AtomicBool>,
     events: mpsc::Receiver<Event>,
 }
 enum Event {
-    Status(State, String, usize),
+    Attempted(std::time::SystemTime),
+    Status(State, String),
     Done,
 }
 struct Entry {
@@ -146,6 +181,8 @@ struct Entry {
     pending: Option<ConfigMap>,
     control: Option<ControlJob>,
     probe: Option<mpsc::Receiver<bool>>,
+    cancelled_for_network: bool,
+    stable_since: Option<Instant>,
     ownership_file: std::path::PathBuf,
 }
 impl Drop for Entry {
@@ -160,6 +197,8 @@ pub struct Manager {
     pub load_error: String,
     loaded: bool,
     resumed: bool,
+    routes: forward_paths::Routes,
+    next: usize,
     data_path: std::path::PathBuf,
     storage_lock: Option<std::fs::File>,
 }
@@ -170,6 +209,8 @@ impl Default for Manager {
             load_error: String::new(),
             loaded: false,
             resumed: false,
+            routes: Default::default(),
+            next: 0,
             data_path: path(),
             storage_lock: None,
         }
@@ -280,6 +321,33 @@ impl Manager {
             .find(|r| r.id == rule.id)
             .is_some_and(|r| r.desired);
         rule.validate(&rules)?;
+        let current = self.entries.iter().find(|e| e.view.rule.id == rule.id);
+        let connection_changed = current.is_some_and(|e| {
+            let old = &e.view.rule;
+            old.host != rule.host
+                || old.remote_port != rule.remote_port
+                || old.local_port != rule.local_port
+                || old.network != rule.network
+        });
+        let cancel_retry = current.is_some_and(|e| {
+            e.view.rule.retry
+                && !rule.retry
+                && matches!(
+                    e.view.state,
+                    State::Retrying
+                        | State::WaitingForNetwork
+                        | State::Queued
+                        | State::CheckingNetwork
+                )
+        });
+        if cancel_retry {
+            rule.desired = false;
+        }
+        let new_config = if rule.desired && connection_changed {
+            Some(connection_config(&rule.host, &HostStore::load()?)?)
+        } else {
+            None
+        };
         if let Some(r) = rules.iter_mut().find(|r| r.id == rule.id) {
             *r = rule.clone()
         } else {
@@ -289,14 +357,30 @@ impl Manager {
         self.persist(&rules)?;
         let id = rule.id.clone();
         if let Some(e) = self.entries.iter_mut().find(|e| e.view.rule.id == id) {
-            if let Some(w) = &e.worker {
-                w.cancel.store(true, Ordering::Relaxed);
+            if connection_changed || cancel_retry {
+                if let Some(w) = &e.worker {
+                    w.cancel.store(true, Ordering::Relaxed);
+                }
+                e.cancelled_for_network = false;
+                e.pending = new_config;
+                e.control = None;
+                e.probe = None;
+                e.stable_since = None;
+                e.view.last_failure.clear();
+                e.view.last_attempt = None;
+                e.view.service = None;
+                e.view.busy = false;
+                e.view.inspection = None;
+                e.view.retry_at = None;
+                e.view.attempt = 0;
+                e.view.error.clear();
+                e.view.state = if e.pending.is_some() {
+                    State::CheckingNetwork
+                } else {
+                    State::Stopped
+                };
+                self.routes.forget(&rule.host.address);
             }
-            e.pending = None;
-            e.control = None;
-            e.view.busy = false;
-            e.view.inspection = None;
-            e.probe = None;
             e.view.rule = rule
         } else {
             self.entries.push(entry_at(rule, &self.data_path))
@@ -343,10 +427,24 @@ impl Manager {
         let cfg = connection_config(&e.view.rule.host, store)?;
         if let Some(w) = &e.worker {
             w.cancel.store(true, Ordering::Relaxed);
-            e.pending = Some(cfg);
-            e.view.state = State::Stopping;
-        } else {
-            launch(e, cfg)
+        }
+        self.routes.forget(&e.view.rule.host.address);
+        e.cancelled_for_network = false;
+        e.pending = Some(cfg);
+        e.view.state = State::CheckingNetwork;
+        e.view.attempt = 0;
+        e.view.retry_at = None;
+        e.view.error.clear();
+        e.stable_since = None;
+        Ok(())
+    }
+    pub fn retry_waiting(&mut self, id: &str, store: &HostStore) -> anyhow::Result<()> {
+        if self.entries.iter().any(|e| {
+            e.view.rule.id == id
+                && e.view.rule.desired
+                && matches!(e.view.state, State::WaitingForNetwork | State::Retrying)
+        }) {
+            self.start(id, store)?;
         }
         Ok(())
     }
@@ -357,7 +455,10 @@ impl Manager {
     }
     fn stop_runtime(&mut self, id: &str) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.view.rule.id == id) {
+            e.cancelled_for_network = false;
             e.pending = None;
+            e.view.retry_at = None;
+            e.stable_since = None;
             e.control = None;
             e.view.busy = false;
             if let Some(w) = &e.worker {
@@ -370,6 +471,19 @@ impl Manager {
         }
     }
     pub fn tick(&mut self) {
+        let now = Instant::now();
+        self.routes.tick(now);
+        self.drain(now);
+        let routes = &mut self.routes;
+        schedule(
+            &mut self.entries,
+            &mut self.next,
+            now,
+            |host| routes.get(host, now),
+            launch,
+        );
+    }
+    fn drain(&mut self, now: Instant) {
         for e in &mut self.entries {
             if let Some(rx) = &e.probe {
                 if let Ok(value) = rx.try_recv() {
@@ -388,7 +502,9 @@ impl Manager {
                                 let restart = info.released.then(|| job.restart.clone()).flatten();
                                 e.view.inspection = Some(info);
                                 if let Some(cfg) = restart {
-                                    launch(e, cfg)
+                                    e.pending = Some(cfg);
+                                    e.view.state = State::CheckingNetwork;
+                                    e.view.retry_at = None;
                                 }
                             }
                             Err(err) => {
@@ -405,16 +521,42 @@ impl Manager {
                     Err(mpsc::TryRecvError::Empty) => (),
                 }
             }
+            if e.stable_since.is_some_and(|since| {
+                now.saturating_duration_since(since) >= Duration::from_secs(30)
+            }) {
+                e.view.attempt = 0;
+                e.stable_since = None;
+            }
             let mut done = false;
             if let Some(w) = &e.worker {
                 loop {
                     match w.events.try_recv() {
-                        Ok(Event::Status(s, msg, n)) if !w.cancel.load(Ordering::Relaxed) => {
-                            e.view.state = s;
-                            e.view.error = msg;
-                            e.view.attempt = n;
+                        Ok(Event::Attempted(at)) if !w.cancel.load(Ordering::Relaxed) => {
+                            e.view.last_attempt = Some(at);
                         }
-                        Ok(Event::Status(..)) => (),
+                        Ok(Event::Status(s, msg))
+                            if !w.cancel.load(Ordering::Relaxed)
+                                || (s == State::Attention && e.cancelled_for_network) =>
+                        {
+                            if s == State::WaitingForNetwork {
+                                self.routes.forget(&e.view.rule.host.address);
+                                e.view.retry_at = None;
+                            }
+                            e.view.state = s;
+                            if matches!(s, State::Attention | State::Failed) {
+                                e.view.last_failure.clone_from(&msg);
+                            }
+                            if !msg.is_empty() || s == State::Running {
+                                e.view.error = msg;
+                            }
+                            if s == State::Running {
+                                e.stable_since = Some(now);
+                            }
+                            if s == State::Attention {
+                                e.pending = None;
+                            }
+                        }
+                        Ok(Event::Status(..) | Event::Attempted(_)) => (),
                         Ok(Event::Done) | Err(mpsc::TryRecvError::Disconnected) => {
                             done = true;
                             break;
@@ -428,10 +570,31 @@ impl Manager {
                     .worker
                     .take()
                     .is_some_and(|w| w.cancel.load(Ordering::Relaxed));
-                if let Some(cfg) = e.pending.take() {
-                    launch(e, cfg)
-                } else if cancelled {
-                    e.view.state = State::Stopped;
+                e.stable_since = None;
+                if cancelled {
+                    if e.pending.is_none() && e.view.state == State::Stopping {
+                        e.view.state = State::Stopped;
+                    }
+                } else if e.pending.is_some() && e.view.state != State::WaitingForNetwork {
+                    if e.view.rule.retry {
+                        let delay = retry_delay(e.view.attempt);
+                        let jitter = e
+                            .view
+                            .rule
+                            .id
+                            .bytes()
+                            .fold(0u64, |h, b| h.wrapping_mul(31) + b as u64)
+                            % 251;
+                        e.view.retry_at = Some(now + delay - Duration::from_millis(jitter));
+                        e.view.attempt = e.view.attempt.saturating_add(1);
+                        e.view.state = State::Retrying;
+                    } else {
+                        e.pending = None;
+                        e.view.state = State::Failed;
+                    }
+                } else if e.view.state == State::WaitingForNetwork && !e.view.rule.retry {
+                    e.pending = None;
+                    e.view.state = State::Failed;
                 }
             }
         }
@@ -465,11 +628,16 @@ fn entry_at(rule: Rule, data_path: &std::path::Path) -> Entry {
         .join(format!("{}.json", rule.id));
     Entry {
         ownership_file,
+        cancelled_for_network: false,
+        stable_since: None,
         view: View {
             rule,
             state: State::Stopped,
             error: String::new(),
+            last_failure: String::new(),
             attempt: 0,
+            last_attempt: None,
+            retry_at: None,
             service: None,
             inspection: None,
             busy: false,
@@ -522,31 +690,56 @@ pub fn connection_config(host: &Host, store: &HostStore) -> anyhow::Result<Confi
 #[derive(Debug, thiserror::Error)]
 #[error("Authentication or host verification requires attention")]
 struct Attention;
-fn connect(cfg: ConfigMap, cancel: &AtomicBool) -> anyhow::Result<Session> {
+#[derive(Debug, thiserror::Error)]
+#[error("No network path to the SSH host")]
+struct NoNetworkPath;
+fn connect(
+    cfg: ConfigMap,
+    cancel: &AtomicBool,
+    events: Option<&mpsc::Sender<Event>>,
+) -> anyhow::Result<Session> {
+    ensure!(!cancel.load(Ordering::Relaxed), "Cancelled");
+    if let Some(host) = cfg.get("hostname") {
+        if wezterm_ssh::forward_network::path_to(host) == NetworkPath::Offline {
+            return Err(NoNetworkPath.into());
+        }
+    }
+    ensure!(!cancel.load(Ordering::Relaxed), "Cancelled");
+    if let Some(tx) = events {
+        let _ = tx.send(Event::Attempted(std::time::SystemTime::now()));
+    }
     let (session, events) = Session::connect(cfg)?;
     let until = Instant::now() + Duration::from_secs(25);
     loop {
         ensure!(!cancel.load(Ordering::Relaxed), "Cancelled");
         ensure!(Instant::now() < until, "SSH authentication timed out");
-        match events.try_recv(){
-        Ok(SessionEvent::Authenticated)=>return Ok(session),Ok(SessionEvent::Banner(_))=>(),
-        Ok(SessionEvent::HostVerify(e))=>{e.try_answer(false).ok();return Err(anyhow::anyhow!("Verify this host in its terminal before starting forwarding.").context(Attention));},
-        Ok(SessionEvent::Authenticate(_))=>return Err(anyhow::anyhow!("Authentication is required. Save this host's password / Identity, or unlock its key in the SSH agent, then retry.").context(Attention)),
-        Ok(SessionEvent::HostVerificationFailed(e))=>return Err(anyhow::anyhow!("{e}").context(Attention)),
-        Ok(SessionEvent::Error(e) | SessionEvent::AuthenticationFailed(e)) =>anyhow::bail!("{e}"),Err(smol::channel::TryRecvError::Closed)=>anyhow::bail!("SSH connection closed"),Err(smol::channel::TryRecvError::Empty)=>std::thread::sleep(Duration::from_millis(25)),
-    }
+        match events.try_recv() {
+            Ok(SessionEvent::Authenticated) => return Ok(session),
+            Ok(SessionEvent::Banner(_)) => (),
+            Ok(SessionEvent::HostVerify(request)) => {
+                request.try_answer(false).ok();
+                return Err(anyhow::anyhow!("Verify this host in its terminal before starting forwarding.").context(Attention));
+            }
+            Ok(SessionEvent::Authenticate(_)) => return Err(anyhow::anyhow!("Authentication is required. Save this host's password / Identity, or unlock its key in the SSH agent, then retry.").context(Attention)),
+            Ok(SessionEvent::HostVerificationFailed(error)) => return Err(anyhow::anyhow!("{error}").context(Attention)),
+            Ok(SessionEvent::AuthenticationFailed(error)) => return Err(anyhow::anyhow!("{error}").context(Attention)),
+            Ok(SessionEvent::Error(error)) => anyhow::bail!("{error}"),
+            Err(smol::channel::TryRecvError::Closed) => anyhow::bail!("SSH connection closed"),
+            Err(smol::channel::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(25)),
+        }
     }
 }
-fn retry_delay(attempt: usize) -> Option<Duration> {
-    [1, 2, 4, 8, 16, 30]
-        .get(attempt)
-        .map(|s| Duration::from_secs(*s))
+fn retry_delay(attempt: usize) -> Duration {
+    const SECONDS: [u64; 6] = [1, 2, 4, 8, 16, 30];
+    Duration::from_secs(SECONDS[attempt.min(SECONDS.len() - 1)])
 }
 fn needs_attention(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     error.downcast_ref::<Attention>().is_some()
+        || error
+            .downcast_ref::<wezterm_ssh::RemoteListenerRefused>()
+            .is_some()
         || [
-            "Remote listener refused",
             "The selected SSH key was not accepted",
             "unhandled auth case",
             "No authentication methods",
@@ -645,6 +838,70 @@ fn ownership_setup(
         }),
     })
 }
+fn schedule(
+    entries: &mut [Entry],
+    next: &mut usize,
+    now: Instant,
+    mut path: impl FnMut(&str) -> Option<NetworkPath>,
+    mut start: impl FnMut(&mut Entry, ConfigMap),
+) {
+    let mut endpoints = std::collections::HashSet::new();
+    let mut connecting = 0;
+    let endpoint = |r: &Rule| {
+        (
+            r.host.address.trim_end_matches('.').to_ascii_lowercase(),
+            r.host.port,
+        )
+    };
+    for e in entries.iter() {
+        if e.worker.is_some() && e.view.state != State::Running {
+            connecting += 1;
+            endpoints.insert(endpoint(&e.view.rule));
+        }
+    }
+    let count = entries.len();
+    let first = *next;
+    for offset in 0..count {
+        let index = (first + offset) % count;
+        let e = &mut entries[index];
+        if !e.view.rule.desired || e.pending.is_none() || e.view.state == State::Running {
+            continue;
+        }
+        let route = path(&e.view.rule.host.address);
+        if route == Some(NetworkPath::Offline) {
+            if let Some(w) = &e.worker {
+                if !w.cancel.load(Ordering::Relaxed) {
+                    e.cancelled_for_network = true;
+                }
+                w.cancel.store(true, Ordering::Relaxed);
+            }
+            e.view.retry_at = None;
+            if e.view.rule.retry {
+                e.view.state = State::WaitingForNetwork;
+            } else {
+                e.view.state = State::Failed;
+                e.view.error = "No network path to the SSH host".into();
+                e.pending = None;
+            }
+            continue;
+        }
+        if e.worker.is_some()
+            || route.is_none()
+            || e.view.retry_at.is_some_and(|deadline| now < deadline)
+        {
+            continue;
+        }
+        e.view.state = State::Queued;
+        if connecting >= 4 || !endpoints.insert(endpoint(&e.view.rule)) {
+            continue;
+        }
+        connecting += 1;
+        e.view.retry_at = None;
+        *next = (index + 1) % count;
+        start(e, e.pending.as_ref().unwrap().clone());
+    }
+}
+
 fn launch(e: &mut Entry, cfg: ConfigMap) {
     let cancel = Arc::new(AtomicBool::new(false));
     let stop = cancel.clone();
@@ -652,17 +909,11 @@ fn launch(e: &mut Entry, cfg: ConfigMap) {
     let rule = e.view.rule.clone();
     let ownership_file = e.ownership_file.clone();
     e.view.state = State::Starting;
-    e.view.error.clear();
-    e.view.attempt = 0;
     e.view.service = None;
+    e.cancelled_for_network = false;
     e.worker = Some(Worker { cancel, events: rx });
     std::thread::spawn(move || {
-        for attempt in 0..=6 {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            tx.send(Event::Status(State::Starting, String::new(), attempt))
-                .ok();
+        if !stop.load(Ordering::Relaxed) {
             let result = (|| -> anyhow::Result<()> {
                 if let Some(owner) =
                     read_ownership(&ownership_file, &rule).map_err(|e| e.context(Attention))?
@@ -670,13 +921,19 @@ fn launch(e: &mut Entry, cfg: ConfigMap) {
                     tx.send(Event::Status(
                         State::Starting,
                         "Checking the previous TermViAI SSH session…".into(),
-                        attempt,
                     ))
                     .ok();
-                    inspect(cfg.clone(), rule.clone(), Some(owner), true, &stop)?;
+                    inspect(
+                        cfg.clone(),
+                        rule.clone(),
+                        Some(owner),
+                        true,
+                        &stop,
+                        Some(&tx),
+                    )?;
                 }
                 ensure!(!stop.load(Ordering::Relaxed), "Cancelled");
-                let session = connect(cfg.clone(), &stop)?;
+                let session = connect(cfg.clone(), &stop, Some(&tx))?;
                 let warning = Arc::new(Mutex::new(String::new()));
                 let setup = ownership_setup(rule.clone(), ownership_file.clone(), warning.clone())?;
                 let (ready, rx) = mpsc::channel();
@@ -689,7 +946,7 @@ fn launch(e: &mut Entry, cfg: ConfigMap) {
                     ready,
                     setup: Some(setup),
                 };
-                smol::block_on(async {
+                let outcome = smol::block_on(async {
                     let run = async {
                         let result = session.run_remote_forward(request).await;
                         if result.as_ref().err().is_some_and(|e| {
@@ -700,7 +957,7 @@ fn launch(e: &mut Entry, cfg: ConfigMap) {
                             // A rejected exec request can leave a sticky libssh
                             // error. Keep ordinary forwarding on exec-restricted
                             // or non-Python hosts working on a fresh transport.
-                            let fresh = connect(cfg.clone(), &stop)?;
+                            let fresh = connect(cfg.clone(), &stop, Some(&tx))?;
                             fresh
                                 .run_remote_forward(wezterm_ssh::RemoteForward {
                                     bind: rule.bind().into(),
@@ -721,7 +978,6 @@ fn launch(e: &mut Entry, cfg: ConfigMap) {
                                 tx.send(Event::Status(
                                     State::Running,
                                     warning.lock().unwrap().clone(),
-                                    attempt,
                                 ))
                                 .ok();
                                 smol::future::pending::<()>().await;
@@ -734,38 +990,21 @@ fn launch(e: &mut Entry, cfg: ConfigMap) {
                         Ok(())
                     })
                     .await
-                })
+                });
+                outcome
             })();
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let error = result
-                .err()
-                .unwrap_or_else(|| anyhow::anyhow!("SSH forwarding ended"));
-            let message = format!("{error:#}");
-            if needs_attention(&error) {
-                tx.send(Event::Status(State::Attention, message, attempt))
-                    .ok();
-                break;
-            }
-            if let Some(delay) = retry_delay(attempt).filter(|_| rule.retry) {
-                tx.send(Event::Status(
-                    State::Retrying,
-                    format!(
-                        "{message}\nRetry {} / 6 in {}s",
-                        attempt + 1,
-                        delay.as_secs()
-                    ),
-                    attempt + 1,
-                ))
-                .ok();
-                let until = Instant::now() + delay;
-                while Instant::now() < until && !stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-            } else {
-                tx.send(Event::Status(State::Failed, message, attempt)).ok();
-                break;
+            if !stop.load(Ordering::Relaxed) || result.as_ref().err().is_some_and(needs_attention) {
+                let error = result
+                    .err()
+                    .unwrap_or_else(|| anyhow::anyhow!("SSH forwarding ended"));
+                let state = if error.downcast_ref::<NoNetworkPath>().is_some() {
+                    State::WaitingForNetwork
+                } else if needs_attention(&error) {
+                    State::Attention
+                } else {
+                    State::Failed
+                };
+                tx.send(Event::Status(state, format!("{error:#}"))).ok();
             }
         }
         tx.send(Event::Done).ok();
@@ -802,14 +1041,261 @@ mod tests {
         assert!(!cfg.contains_key("proxycommand"));
     }
     #[test]
-    fn retry_is_bounded_and_persistence_excludes_runtime() {
+    fn network_retries_continue_at_the_capped_delay() {
         assert_eq!(
-            (0..7)
-                .filter_map(retry_delay)
+            (0..9)
+                .map(retry_delay)
                 .map(|d| d.as_secs())
                 .collect::<Vec<_>>(),
-            [1, 2, 4, 8, 16, 30]
+            [1, 2, 4, 8, 16, 30, 30, 30, 30]
         );
+        assert_eq!(retry_delay(usize::MAX), Duration::from_secs(30));
+    }
+    #[test]
+    fn worker_retries_eight_dropped_connections_and_can_stop_during_backoff() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut rule = rule();
+        rule.host.address = "127.0.0.1".into();
+        rule.host.port = listener.local_addr().unwrap().port();
+        let cfg = connection_config(&rule.host, &HostStore::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        rule.desired = true;
+        let id = rule.id.clone();
+        let mut entry = entry_at(rule, &dir.path().join("forwarding.json"));
+        entry.pending = Some(cfg);
+        let mut m = Manager {
+            entries: vec![entry],
+            ..Default::default()
+        };
+        let mut dropped = 0;
+        let until = Instant::now() + Duration::from_secs(20);
+        let mut now = Instant::now();
+        while m.entries[0].view.attempt < 8 {
+            assert!(Instant::now() < until, "timed out after {dropped} sockets");
+            m.drain(now);
+            if m.entries[0].view.attempt == 8 {
+                break;
+            }
+            schedule(
+                &mut m.entries,
+                &mut m.next,
+                now,
+                |_| Some(NetworkPath::Available),
+                launch,
+            );
+            if let Ok((socket, _)) = listener.accept() {
+                drop(socket);
+                dropped += 1;
+            }
+            now += Duration::from_secs(30);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(dropped, 8);
+        assert_eq!(m.entries[0].view.state, State::Retrying);
+        m.stop_runtime(&id);
+        schedule(
+            &mut m.entries,
+            &mut m.next,
+            now + Duration::from_secs(60),
+            |_| Some(NetworkPath::Available),
+            |_, _| panic!("stopped service retried"),
+        );
+    }
+    fn pending_entry(address: &str) -> Entry {
+        let mut r = rule();
+        r.host.address = address.into();
+        r.desired = true;
+        let mut entry = entry_at(r, &path());
+        entry.pending = Some(ConfigMap::new());
+        entry
+    }
+    fn simulated_worker(e: &mut Entry) -> mpsc::Sender<Event> {
+        let (tx, events) = mpsc::channel();
+        e.worker = Some(Worker {
+            cancel: Arc::new(false.into()),
+            events,
+        });
+        e.view.state = State::Starting;
+        tx
+    }
+    #[test]
+    fn offline_ten_minutes_then_recovery_respects_stop_and_single_attempt() {
+        let mut m = Manager {
+            entries: vec![pending_entry("a"), pending_entry("b")],
+            ..Default::default()
+        };
+        let now = Instant::now();
+        for t in 0..=600 {
+            schedule(
+                &mut m.entries,
+                &mut m.next,
+                now + Duration::from_secs(t),
+                |_| Some(NetworkPath::Offline),
+                |_, _| panic!("attempt while offline"),
+            );
+        }
+        assert!(m
+            .entries
+            .iter()
+            .all(|e| e.view.state == State::WaitingForNetwork));
+        let stopped = m.entries[1].view.rule.id.clone();
+        m.stop_runtime(&stopped);
+        let mut attempts = 0;
+        let mut workers = vec![];
+        for _ in 0..10 {
+            schedule(
+                &mut m.entries,
+                &mut m.next,
+                now + Duration::from_secs(601),
+                |_| Some(NetworkPath::Available),
+                |e, _| {
+                    assert_ne!(e.view.rule.id, stopped);
+                    attempts += 1;
+                    let tx = simulated_worker(e);
+                    tx.send(Event::Status(State::Running, String::new()))
+                        .unwrap();
+                    workers.push(tx);
+                },
+            );
+            m.drain(now + Duration::from_secs(601));
+        }
+        assert_eq!(attempts, 1);
+        assert_eq!(m.entries[0].view.state, State::Running);
+        assert_eq!(m.entries[1].view.state, State::Stopped);
+    }
+    #[test]
+    fn recovery_limits_connections_and_isolates_unreachable_targets() {
+        let hosts = ["vpn", "lan", "lan", "a", "b", "c", "d"];
+        let mut m = Manager {
+            entries: hosts.iter().map(|h| pending_entry(h)).collect(),
+            ..Default::default()
+        };
+        let mut launched = vec![];
+        let now = Instant::now();
+        for _ in 0..3 {
+            schedule(
+                &mut m.entries,
+                &mut m.next,
+                now,
+                |h| {
+                    Some(if h == "vpn" {
+                        NetworkPath::Offline
+                    } else {
+                        NetworkPath::Available
+                    })
+                },
+                |e, _| launched.push((e.view.rule.host.address.clone(), simulated_worker(e))),
+            );
+        }
+        assert_eq!(launched.len(), 4);
+        assert_eq!(launched.iter().filter(|(name, _)| name == "lan").count(), 1);
+        launched[0]
+            .1
+            .send(Event::Status(State::Running, String::new()))
+            .unwrap();
+        m.drain(now);
+        schedule(
+            &mut m.entries,
+            &mut m.next,
+            now,
+            |_| Some(NetworkPath::Available),
+            |e, _| launched.push((e.view.rule.host.address.clone(), simulated_worker(e))),
+        );
+        assert_eq!(launched.len(), 5);
+    }
+    #[test]
+    fn offline_does_not_wake_manual_only_or_attention_rules() {
+        let mut entries = vec![pending_entry("manual"), pending_entry("rejected")];
+        entries[0].view.rule.retry = false;
+        entries[1].view.state = State::Attention;
+        entries[1].pending = None;
+        let mut next = 0;
+        for path in [NetworkPath::Offline, NetworkPath::Available] {
+            schedule(
+                &mut entries,
+                &mut next,
+                Instant::now(),
+                |_| Some(path),
+                |_, _| panic!("unexpected automatic retry"),
+            );
+        }
+        assert_eq!(entries[0].view.state, State::Failed);
+        assert_eq!(entries[1].view.state, State::Attention);
+    }
+    #[test]
+    fn disabling_reconnect_cancels_waiting_but_keeps_established_tunnel() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = Manager {
+            data_path: dir.path().join("forwarding.json"),
+            ..Default::default()
+        };
+        m.load();
+        let mut e = pending_entry("lan");
+        let tx = simulated_worker(&mut e);
+        e.view.state = State::Running;
+        m.entries.push(e);
+        let mut edit = m.entries[0].view.rule.clone();
+        edit.retry = false;
+        m.save(edit).unwrap();
+        assert!(!m.entries[0]
+            .worker
+            .as_ref()
+            .unwrap()
+            .cancel
+            .load(Ordering::Relaxed));
+        tx.send(Event::Status(State::Failed, "connection lost".into()))
+            .unwrap();
+        tx.send(Event::Done).unwrap();
+        m.drain(Instant::now());
+        assert_eq!(m.entries[0].view.state, State::Failed);
+        assert!(m.entries[0].pending.is_none());
+        let mut waiting = pending_entry("vpn");
+        waiting.view.state = State::WaitingForNetwork;
+        let mut edit = waiting.view.rule.clone();
+        edit.retry = false;
+        m.entries.push(waiting);
+        m.save(edit).unwrap();
+        assert!(!m.entries[1].view.rule.desired);
+        assert!(m.entries[1].pending.is_none());
+    }
+    #[test]
+    fn network_cancellation_preserves_confirmed_auth_failure() {
+        let mut m = Manager::default();
+        let mut e = pending_entry("vpn");
+        let tx = simulated_worker(&mut e);
+        m.entries.push(e);
+        schedule(
+            &mut m.entries,
+            &mut m.next,
+            Instant::now(),
+            |_| Some(NetworkPath::Offline),
+            |_, _| unreachable!(),
+        );
+        tx.send(Event::Status(
+            State::Attention,
+            "Authentication rejected".into(),
+        ))
+        .unwrap();
+        tx.send(Event::Done).unwrap();
+        m.drain(Instant::now());
+        assert_eq!(m.entries[0].view.state, State::Attention);
+        assert!(m.entries[0].pending.is_none());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_observer_preserves_ipv4_and_ipv6_loopback() {
+        wezterm_ssh::forward_network::revision();
+        for addr in ["127.0.0.1", "[::1]"] {
+            assert_eq!(
+                wezterm_ssh::forward_network::path_to(addr),
+                NetworkPath::Available
+            );
+        }
+    }
+
+    #[test]
+    fn persistence_excludes_runtime() {
         let json = serde_json::to_string(&rule()).unwrap();
         assert!(!json.contains("password"));
         assert!(json.contains("\"desired\":false"));
@@ -831,7 +1317,7 @@ mod tests {
             ..Manager::default()
         };
         m.stop_runtime(&id);
-        tx.send(Event::Status(State::Running, String::new(), 0))
+        tx.send(Event::Status(State::Running, String::new()))
             .unwrap();
         tx.send(Event::Done).unwrap();
         m.tick();
@@ -965,9 +1451,7 @@ mod tests {
         m.entries[0].view.error = "already attempted".into();
         assert_eq!(m.views()[0].error, "already attempted");
     }
-    #[test]
-    #[ignore = "requires disposable loopback SSH fixture; never use production hosts"]
-    fn owned_stale_listener_recovers_without_user_interaction() {
+    fn fixture_config() -> (u16, ConfigMap) {
         let port: u16 = std::env::var("TERMVIAI_TEST_SSH_PORT")
             .unwrap()
             .parse()
@@ -992,6 +1476,134 @@ mod tests {
         ] {
             cfg.insert(k.into(), v);
         }
+        (port, cfg)
+    }
+
+    #[test]
+    #[ignore = "requires disposable loopback SSH fixture"]
+    fn recovered_route_establishes_real_listener_and_manual_stop_survives_recovery() {
+        let (port, cfg) = fixture_config();
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = Manager {
+            data_path: dir.path().join("forwarding.json"),
+            ..Default::default()
+        };
+        m.load();
+        let mut r = rule();
+        r.host.address = "127.0.0.1".into();
+        r.host.port = port;
+        r.remote_port = std::env::var("TERMVIAI_TEST_REMOTE_PORT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let service = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        r.local_port = service.local_addr().unwrap().port();
+        let remote = SocketAddr::from(([127, 0, 0, 1], r.remote_port));
+        let id = m.save(r).unwrap();
+        m.set_desired(&id, true).unwrap();
+        m.entries[0].pending = Some(cfg);
+        let mut now = Instant::now();
+        for _ in 0..20 {
+            schedule(
+                &mut m.entries,
+                &mut m.next,
+                now,
+                |_| Some(NetworkPath::Offline),
+                |_, _| panic!("SSH attempted while offline"),
+            );
+            now += Duration::from_secs(30);
+        }
+        assert!(m.entries[0].view.last_attempt.is_none());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut attempts = 0;
+        while m.entries[0].view.state != State::Running {
+            m.drain(now);
+            schedule(
+                &mut m.entries,
+                &mut m.next,
+                now,
+                |_| Some(NetworkPath::Available),
+                |e, cfg| {
+                    attempts += 1;
+                    launch(e, cfg);
+                },
+            );
+            assert!(
+                Instant::now() < deadline
+                    && !matches!(
+                        m.entries[0].view.state,
+                        State::Attention | State::Failed | State::Retrying
+                    ),
+                "{:?} {}",
+                m.entries[0].view.state,
+                m.entries[0].view.error
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(attempts, 1);
+        // The SSH fixture and the native client share loopback reachability.
+        // Exercise both directions through the acknowledged remote listener.
+        use std::io::Read;
+        let timeout = Duration::from_secs(8);
+        let until = Instant::now() + timeout;
+        let client = std::thread::spawn(move || {
+            let mut socket = loop {
+                if let Ok(s) = TcpStream::connect_timeout(&remote, Duration::from_millis(250)) {
+                    break s;
+                }
+                assert!(Instant::now() < until, "remote listener not reachable");
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            socket.set_read_timeout(Some(timeout)).unwrap();
+            socket.write_all(b"ping").unwrap();
+            let mut reply = [0; 4];
+            socket.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"pong");
+        });
+        service.set_nonblocking(true).unwrap();
+        let mut incoming = loop {
+            match service.accept() {
+                Ok((socket, _)) => break socket,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(e) => panic!("local listener failed: {e}"),
+            }
+            assert!(
+                Instant::now() < until,
+                "no forwarded connection reached the local service"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        incoming.set_nonblocking(false).unwrap();
+        incoming.set_read_timeout(Some(timeout)).unwrap();
+        let mut payload = [0; 4];
+        incoming.read_exact(&mut payload).unwrap();
+        assert_eq!(&payload, b"ping");
+        incoming.write_all(b"pong").unwrap();
+        client.join().unwrap();
+        m.stop(&id).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while m.entries[0].worker.is_some() {
+            assert!(Instant::now() < until);
+            m.drain(now);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for path in [NetworkPath::Offline, NetworkPath::Available] {
+            schedule(
+                &mut m.entries,
+                &mut m.next,
+                now,
+                |_| Some(path),
+                |_, _| panic!("manual stop lost"),
+            );
+        }
+        assert_eq!(m.entries[0].view.state, State::Stopped);
+        assert!(!m.entries[0].view.rule.desired);
+    }
+
+    #[test]
+    #[ignore = "requires disposable loopback SSH fixture; never use production hosts"]
+    fn owned_stale_listener_recovers_without_user_interaction() {
+        let (port, mut cfg) = fixture_config();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("forwarding.json");
         let mut r = rule();
@@ -1013,7 +1625,7 @@ mod tests {
             }
         }
         let _cleanup = Cancel(old_cancel.clone());
-        let old = connect(cfg.clone(), &old_cancel).unwrap();
+        let old = connect(cfg.clone(), &old_cancel, None).unwrap();
         let warning = Arc::new(Mutex::new(String::new()));
         let setup = ownership_setup(r.clone(), owner_file.clone(), warning.clone()).unwrap();
         let (ready, rx) = mpsc::channel();
@@ -1044,10 +1656,19 @@ mod tests {
             r.clone(),
             Some(wrong),
             true,
-            &AtomicBool::new(false)
+            &AtomicBool::new(false),
+            None
         )
         .is_err());
-        let before = inspect(cfg.clone(), r.clone(), None, false, &AtomicBool::new(false)).unwrap();
+        let before = inspect(
+            cfg.clone(),
+            r.clone(),
+            None,
+            false,
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
         assert_eq!(before.owner.unwrap().pid, original.pid);
         // Model a new process restoring persisted data while the old remote listener lingers.
         let mut replacement = entry_at(r.clone(), &file);
@@ -1061,11 +1682,11 @@ mod tests {
                 .events
                 .recv_timeout(Duration::from_secs(1))
             {
-                Ok(Event::Status(State::Running, warning, _)) => {
+                Ok(Event::Status(State::Running, warning)) => {
                     assert!(warning.is_empty(), "{}", warning);
                     break;
                 }
-                Ok(Event::Status(State::Attention | State::Failed, error, _)) => {
+                Ok(Event::Status(State::Attention | State::Failed, error)) => {
                     panic!("recovery: {}", error)
                 }
                 Ok(Event::Done) => panic!("recovery worker ended before running"),
@@ -1076,7 +1697,15 @@ mod tests {
         assert!(old_thread.join().unwrap().is_err());
         let current = read_ownership(&owner_file, &r).unwrap().unwrap();
         assert!(current.pid != original.pid || current.token != original.token);
-        let live = inspect(cfg.clone(), r.clone(), None, false, &AtomicBool::new(false)).unwrap();
+        let live = inspect(
+            cfg.clone(),
+            r.clone(),
+            None,
+            false,
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
         assert_eq!(live.owner.unwrap().pid, current.pid);
         replacement
             .worker
@@ -1099,9 +1728,16 @@ mod tests {
             }
         }
         assert!(
-            !inspect(cfg.clone(), r.clone(), None, false, &AtomicBool::new(false))
-                .unwrap()
-                .occupied
+            !inspect(
+                cfg.clone(),
+                r.clone(),
+                None,
+                false,
+                &AtomicBool::new(false),
+                None
+            )
+            .unwrap()
+            .occupied
         );
         if let Ok(port) = std::env::var("TERMVIAI_TEST_NO_EXEC_PORT") {
             // A second disposable sshd rejects exec but permits TCP forwarding.
@@ -1121,11 +1757,11 @@ mod tests {
                     .events
                     .recv_timeout(Duration::from_secs(1))
                 {
-                    Ok(Event::Status(State::Running, warning, _)) => {
+                    Ok(Event::Status(State::Running, warning)) => {
                         assert!(warning.contains("recovery unavailable"));
                         break;
                     }
-                    Ok(Event::Status(State::Attention | State::Failed, error, _)) => {
+                    Ok(Event::Status(State::Attention | State::Failed, error)) => {
                         panic!("fallback: {}", error)
                     }
                     Ok(Event::Done) => panic!("fallback ended before running"),
@@ -1238,10 +1874,11 @@ fn inspect(
     target: Option<Owner>,
     automatic: bool,
     cancel: &AtomicBool,
+    events: Option<&mpsc::Sender<Event>>,
 ) -> anyhow::Result<Inspection> {
     use portable_pty::{Child, ChildKiller};
     use std::io::Read;
-    let session = connect(cfg, cancel)?;
+    let session = connect(cfg, cancel, events)?;
     ensure!(!cancel.load(Ordering::Relaxed), "Cancelled");
     let command = control_command(rule.remote_port, target, automatic)?;
     let mut exec = smol::block_on(smol::future::or(session.exec(&command, None), async {
@@ -1342,7 +1979,7 @@ impl Manager {
             restart,
         });
         std::thread::spawn(move || {
-            let result = inspect(cfg, rule, target, false, &stop);
+            let result = inspect(cfg, rule, target, false, &stop, None);
             tx.send(result).ok();
         });
         Ok(())

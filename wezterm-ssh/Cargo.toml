@@ -57,4 +57,4 @@ termwiz.workspace = true
 whoami.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Security_Credentials", "Win32_Foundation"] }
+windows-sys = { workspace = true, features = ["Win32_Security_Credentials", "Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_Power", "Win32_UI_WindowsAndMessaging"] }

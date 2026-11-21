@@ -1,7 +1,7 @@
 //! Dedicated reverse TCP transport. No PTY, shell command, REST or config discovery.
 use crate::channelwrap::ChannelWrap;
 use crate::sessionwrap::SessionWrap;
-use anyhow::{ensure, Context};
+use anyhow::ensure;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +27,9 @@ pub struct RemoteForwardSetup {
 #[derive(Debug, thiserror::Error)]
 #[error("Remote SSH session registration is unavailable")]
 pub struct RemoteForwardSetupUnavailable;
+#[derive(Debug, thiserror::Error)]
+#[error("Remote listener refused (port occupied or forwarding prohibited)")]
+pub struct RemoteListenerRefused;
 impl std::fmt::Debug for RemoteForwardSetup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteForwardSetup").finish_non_exhaustive()
@@ -208,14 +211,30 @@ pub(crate) fn run(sess: &mut SessionWrap, mut request: RemoteForward) -> anyhow:
         SessionWrap::LibSsh(s) => {
             s.sess
                 .listen_forward(Some(&request.bind), request.remote_port)
-                .context("Remote listener refused (port occupied or forwarding prohibited)")?;
+                .map_err(|error| {
+                    let refused = matches!(error, libssh_rs::Error::RequestDenied(_));
+                    let error = anyhow::Error::from(error);
+                    if refused {
+                        error.context(RemoteListenerRefused)
+                    } else {
+                        error
+                    }
+                })?;
         }
         #[cfg(feature = "ssh2")]
         SessionWrap::Ssh2(s) => {
             listener = Some(
                 s.sess
                     .channel_forward_listen(request.remote_port, Some(&request.bind), Some(64))
-                    .context("Remote listener refused (port occupied or forwarding prohibited)")?
+                    .map_err(|error| {
+                        let refused = error.code() == ssh2::ErrorCode::Session(-32);
+                        let error = anyhow::Error::from(error);
+                        if refused {
+                            error.context(RemoteListenerRefused)
+                        } else {
+                            error
+                        }
+                    })?
                     .0,
             );
             s.sess.set_keepalive(true, 15);
@@ -229,14 +248,69 @@ pub(crate) fn run(sess: &mut SessionWrap, mut request: RemoteForward) -> anyhow:
     let mut pipes: Vec<Pipe> = vec![];
     let mut pending: Vec<(ChannelWrap, mpsc::Receiver<io::Result<TcpStream>>)> = vec![];
     let mut last_alive = Instant::now();
+    let mut revision = crate::forward_network::revision();
+    let mut previous = Instant::now();
+    let mut next_probe = previous + Duration::from_secs(60);
+    let mut deadline = None;
+    #[cfg(feature = "libssh-rs")]
+    let mut probe_channel: Option<libssh_rs::Channel> = None;
     while !request.cancel.load(Ordering::Relaxed) {
+        // A channel-open success or a server rejection both prove a round trip.
+        // Do not open a shell or disturb any forwarded channels during the probe.
+        let now = Instant::now();
+        let current = crate::forward_network::revision();
+        if now.duration_since(previous) > Duration::from_secs(5) {
+            if deadline.is_some() {
+                deadline = Some(now + Duration::from_secs(10));
+            }
+            next_probe = now + Duration::from_secs(1);
+        } else if revision != current {
+            next_probe = next_probe.min(now + Duration::from_secs(1));
+        }
+        previous = now;
+        revision = current;
+        if now >= next_probe || deadline.is_some() {
+            let until = *deadline.get_or_insert(now + Duration::from_secs(10));
+            ensure!(
+                now < until,
+                "SSH peer did not reply to the tunnel health check"
+            );
+            let replied = match sess {
+                #[cfg(feature = "libssh-rs")]
+                SessionWrap::LibSsh(s) => {
+                    if probe_channel.is_none() {
+                        probe_channel = Some(s.sess.new_channel()?);
+                    }
+                    match probe_channel.as_ref().unwrap().open_session() {
+                        Ok(()) | Err(libssh_rs::Error::RequestDenied(_)) => {
+                            probe_channel.take();
+                            true
+                        }
+                        Err(libssh_rs::Error::TryAgain) => false,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                #[cfg(feature = "ssh2")]
+                SessionWrap::Ssh2(s) => match s.sess.channel_session() {
+                    Ok(_) => true,
+                    Err(e) if e.code() == ssh2::ErrorCode::Session(-21) => true,
+                    Err(e) if e.code() == ssh2::ErrorCode::Session(-37) => false,
+                    Err(e) => return Err(e.into()),
+                },
+            };
+            if replied {
+                deadline = None;
+                next_probe = now + Duration::from_secs(60);
+            }
+        }
         let accepted = match sess {
             #[cfg(feature = "libssh-rs")]
             SessionWrap::LibSsh(s) => {
                 ensure!(s.sess.is_connected(), "SSH transport disconnected");
                 match s.sess.accept_forward(Duration::ZERO) {
                     Ok((_, c)) => Some(ChannelWrap::LibSsh(c)),
-                    Err(libssh_rs::Error::TryAgain) => None,
+                    // libssh retains the most recent request rejection even on an idle poll.
+                    Err(libssh_rs::Error::TryAgain | libssh_rs::Error::RequestDenied(_)) => None,
                     Err(e) => return Err(e.into()),
                 }
             }
