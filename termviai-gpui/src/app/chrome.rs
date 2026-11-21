@@ -1638,6 +1638,34 @@ impl Render for AppView {
             .key_context("TermViAI")
             .capture_key_down(cx.listener(|s, e: &KeyDownEvent, w, cx| {
                 let k = &e.keystroke;
+                if s.shortcut_editor_key(e, w, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if k.modifiers.modified() || !s.shortcut_keys_down.is_empty() {
+                    let mapped = KeybindingKeystroke::new_with_mapper(
+                        k.clone(),
+                        false,
+                        cx.keyboard_mapper().as_ref(),
+                    );
+                    if !e.is_held {
+                        s.shortcut_keys_down.remove(mapped.key());
+                    }
+                    let terminal_focused = s
+                        .focused
+                        .and_then(|id| s.panes.get(&id))
+                        .is_some_and(|p| p.view.focus_handle(cx).is_focused(w));
+                    if let Some(action) = s
+                        .settings
+                        .keyboard_shortcuts
+                        .resolve(&mapped.unparse(), terminal_focused)
+                        && s.handle_shortcut(action, e.is_held, w, cx)
+                    {
+                        s.shortcut_keys_down.insert(mapped.key().to_owned());
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
                 if s.confirm.is_none()
                     && s.menu.is_none()
                     && !k.modifiers.modified()
@@ -1720,13 +1748,26 @@ impl Render for AppView {
                     }
                     s.clear_drag();
                     cx.notify();
-                } else if k.modifiers.control && k.key == "t" {
+                } else if k.modifiers == Modifiers::control() && k.key == "t" {
                     s.open_new_tab(w, cx);
                     cx.stop_propagation();
-                } else if k.modifiers.control && k.key == "s" && s.drawer.is_none() {
+                } else if k.modifiers == Modifiers::control() && k.key == "s" && s.drawer.is_none()
+                {
                     if let Page::Terminal(id) = s.page {
                         let r = s.save_workspace(id);
                         s.notify_error(r, cx);
+                        cx.stop_propagation();
+                    }
+                }
+            }))
+            .capture_key_up(cx.listener(|s, e: &KeyUpEvent, _, cx| {
+                if !s.shortcut_keys_down.is_empty() {
+                    let mapped = KeybindingKeystroke::new_with_mapper(
+                        e.keystroke.clone(),
+                        false,
+                        cx.keyboard_mapper().as_ref(),
+                    );
+                    if s.shortcut_keys_down.remove(mapped.key()) {
                         cx.stop_propagation();
                     }
                 }

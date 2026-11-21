@@ -565,6 +565,39 @@ impl AppView {
         .into_any_element()
     }
 
+    fn split_handle(&self, horizontal: bool, drag: ResizeDrag) -> Stateful<Div> {
+        div()
+            .id(SharedString::from(format!(
+                "divider-{}-{:?}-{:?}",
+                drag.tab,
+                drag.path,
+                drag.quad.map(|(_, grip)| grip)
+            )))
+            .group("split-divider")
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(horizontal, |d| {
+                d.py(px(4.)).cursor(CursorStyle::ResizeLeftRight)
+            })
+            .when(!horizontal, |d| {
+                d.px(px(4.)).cursor(CursorStyle::ResizeUpDown)
+            })
+            .bg(self.c(self.col().top))
+            .child(
+                div()
+                    .rounded_full()
+                    .when(horizontal, |d| d.w(px(2.)).h_full())
+                    .when(!horizontal, |d| d.h(px(2.)).w_full())
+                    .group_hover("split-divider", |d| d.bg(self.c(self.col().accent)))
+                    .group_drag_over::<ResizeDrag>("split-divider", |d| {
+                        d.bg(self.c(self.col().accent))
+                    }),
+            )
+            .on_drag(drag, |value, _, _, cx| cx.new(|_| value.clone()))
+    }
+
     fn layout_view(
         &self,
         layout: &Layout,
@@ -585,31 +618,73 @@ impl AppView {
                 a.push(false);
                 let mut b = path.clone();
                 b.push(true);
-                let info = ResizeDrag {
+                const GUTTER: f32 = 7.;
+                const SNAP: f32 = 5.;
+                let quad = layout.quad_split();
+                let drag = |quad| ResizeDrag {
                     tab,
                     path: path.clone(),
+                    quad,
                 };
+                let mut gutter = div()
+                    .flex_shrink_0()
+                    .flex()
+                    .when(horizontal, |d| d.w(px(GUTTER)).h_full().flex_col())
+                    .when(!horizontal, |d| d.h(px(GUTTER)).w_full());
+                if let Some(q) = quad.filter(|q| q.aligned()) {
+                    let ratio = q.branches[0];
+                    gutter = gutter
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .when(horizontal, |d| d.h(relative(ratio)).w_full())
+                                .when(!horizontal, |d| d.w(relative(ratio)).h_full())
+                                .child(self.split_handle(
+                                    horizontal,
+                                    drag(Some((q, QuadGrip::Segment(0)))),
+                                )),
+                        )
+                        .child(div().flex_1().min_h_0().min_w_0().child(
+                            self.split_handle(horizontal, drag(Some((q, QuadGrip::Segment(1))))),
+                        ));
+                } else {
+                    gutter = gutter.child(self.split_handle(horizontal, drag(None)));
+                }
                 let p = path.clone();
-                div()
+                let mut split = div()
                     .id(SharedString::from(format!("split-{tab}-{path:?}")))
                     .size_full()
                     .min_w_0()
                     .min_h_0()
+                    .relative()
                     .flex()
                     .when(!horizontal, |d| d.flex_col())
                     .on_drag_move::<ResizeDrag>(cx.listener(
                         move |s, e: &DragMoveEvent<ResizeDrag>, _, cx| {
-                            let drag = e.drag(cx).clone();
+                            let drag = e.drag(cx);
                             if drag.tab != tab || drag.path != p {
                                 return;
                             }
-                            let ratio = if horizontal {
-                                (e.event.position.x - e.bounds.left()) / e.bounds.size.width
-                            } else {
-                                (e.event.position.y - e.bounds.top()) / e.bounds.size.height
+                            let Some(t) = s.tabs.iter_mut().find(|t| t.id == tab) else {
+                                return;
                             };
-                            if let Some(t) = s.tabs.iter_mut().find(|t| t.id == tab) {
-                                t.layout.set_ratio(&p, ratio);
+                            let size = e.bounds.size;
+                            if size.width <= px(GUTTER) || size.height <= px(GUTTER) {
+                                return;
+                            }
+                            let point = e.event.position - e.bounds.origin;
+                            let position = [
+                                (point.x - px(GUTTER / 2.)) / size.width,
+                                (point.y - px(GUTTER / 2.)) / size.height,
+                            ];
+                            let snap = [px(SNAP) / size.width, px(SNAP) / size.height];
+                            if let Some((start, grip)) = drag.quad {
+                                if let Some(node) = t.layout.at_mut(&p) {
+                                    start.resize(node, grip, position, snap);
+                                }
+                            } else {
+                                let axis = usize::from(!horizontal);
+                                t.layout.resize_divider(&p, position[axis], snap[axis]);
                             }
                             cx.notify();
                         },
@@ -623,49 +698,60 @@ impl AppView {
                             .when(!horizontal, |d| d.h(relative(*ratio)).w_full())
                             .child(self.layout_view(first, tab, a, cx)),
                     )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("divider-{tab}-{path:?}")))
-                            .group("split-divider")
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(horizontal, |d| {
-                                d.w(px(7.))
-                                    .h_full()
-                                    .py(px(4.))
-                                    .cursor(CursorStyle::ResizeLeftRight)
-                            })
-                            .when(!horizontal, |d| {
-                                d.h(px(7.))
-                                    .w_full()
-                                    .px(px(4.))
-                                    .cursor(CursorStyle::ResizeUpDown)
-                            })
-                            .bg(self.c(self.col().top))
-                            .child(
-                                div()
-                                    .rounded_full()
-                                    .when(horizontal, |d| d.w(px(2.)).h_full())
-                                    .when(!horizontal, |d| d.h(px(2.)).w_full())
-                                    .group_hover("split-divider", |d| {
-                                        d.bg(self.c(self.col().accent))
-                                    })
-                                    .group_drag_over::<ResizeDrag>("split-divider", |d| {
-                                        d.bg(self.c(self.col().accent))
-                                    }),
-                            )
-                            .on_drag(info, |drag, _, _, cx| cx.new(|_| drag.clone())),
-                    )
+                    .child(gutter)
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
                             .child(self.layout_view(second, tab, b, cx)),
-                    )
-                    .into_any_element()
+                    );
+                if let Some(q) = quad {
+                    // Paint the intersection last so all four quadrants share its hit target.
+                    for (i, &branch) in q.branches.iter().enumerate() {
+                        if i == 1 && q.aligned() {
+                            break;
+                        }
+                        let (x, y) = if horizontal {
+                            (q.spine, branch)
+                        } else {
+                            (branch, q.spine)
+                        };
+                        let grip = if q.aligned() {
+                            QuadGrip::Center
+                        } else {
+                            QuadGrip::Junction(i)
+                        };
+                        split = split.child(
+                            div()
+                                .id(("resize-junction", i))
+                                .absolute()
+                                .left(relative(x))
+                                .top(relative(y))
+                                .ml(px(-3.))
+                                .mt(px(-3.))
+                                .size(px(GUTTER + 6.))
+                                .occlude()
+                                .cursor(CursorStyle::Crosshair)
+                                .group("resize-junction")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .size(px(6.))
+                                        .rounded_full()
+                                        .group_hover("resize-junction", |d| {
+                                            d.bg(self.c(self.col().accent))
+                                        }),
+                                )
+                                .on_drag(drag(Some((q, grip))), |value, _, _, cx| {
+                                    cx.new(|_| value.clone())
+                                }),
+                        );
+                    }
+                }
+                split.into_any_element()
             }
         }
     }

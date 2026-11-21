@@ -280,6 +280,7 @@ impl AppView {
 
     pub(super) fn make_form(&self, kind: FormKind, w: &mut Window, cx: &mut Context<Self>) -> Form {
         let mut f = Form {
+            shortcut_editor: None,
             kind: kind.clone(),
             fields: BTreeMap::new(),
             mode: Authentication::Password,
@@ -1005,6 +1006,33 @@ impl AppView {
                     ));
                 body = body
                     .child(self.settings_section("Appearance").child(themes))
+                    .child(
+                        div()
+                            .id("open-shortcuts")
+                            .focusable()
+                            .tab_stop(true)
+                            .w_full()
+                            .min_h(px(48.))
+                            .px_4()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .rounded_lg()
+                            .bg(self.c(self.col().card))
+                            .border_1()
+                            .border_color(self.c(self.col().line))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(self.c(self.col().hover)))
+                            .focus(|d| d.border_color(self.c(self.col().accent)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Keyboard shortcuts"),
+                            )
+                            .child(Icon::new(IconName::ChevronRight).size(px(16.)))
+                            .on_click(cx.listener(|s, _, w, cx| s.open_shortcuts(w, cx))),
+                    )
                     .child(terminal)
                     .child(
                         self.settings_section("Connection")
@@ -1404,8 +1432,14 @@ impl AppView {
             return div().into_any_element();
         }
         if matches!(f.kind, FormKind::Settings) {
+            if let Some(editor) = &f.shortcut_editor {
+                return self.shortcut_page(editor, window, cx);
+            }
             let body = self
                 .tool_content(window)
+                // The actions are the last visible content. Spare space below
+                // them must not extend the scroll range when they already fit.
+                .pb_0()
                 .max_w(px(720. + 2. * Self::tool_gutter(window)))
                 .child(self.title("Settings"))
                 .child(self.form_content(f, None, cx))

@@ -237,12 +237,21 @@ impl TerminalView {
         self.selection_pointer = None;
         self.thumb_drag = None;
     }
-    fn copy(&self, cx: &mut App) {
+    pub(crate) fn copy(&self, cx: &mut App) {
         if let Some(range) = self.selection.range {
             let st = self.session.state.lock().unwrap();
             if let Some(text) = selected_text(st.term.screen(), range) {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
+        }
+    }
+    pub(crate) fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx
+            .read_from_clipboard()
+            .and_then(|c| c.text())
+            .filter(|t| !t.is_empty())
+        {
+            self.emit(Input::Paste(text), cx);
         }
     }
     fn key(&mut self, e: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -253,24 +262,8 @@ impl TerminalView {
             return;
         }
         let k = &e.keystroke;
-        if k.modifiers.control && k.modifiers.shift && k.key.eq_ignore_ascii_case("c") {
-            self.copy(cx);
-            cx.stop_propagation();
-            return;
-        }
-        if k.modifiers.control && k.modifiers.shift && k.key.eq_ignore_ascii_case("v") {
-            if let Some(t) = cx.read_from_clipboard().and_then(|c| c.text()) {
-                self.emit(Input::Paste(t), cx);
-            }
-            cx.stop_propagation();
-            return;
-        }
-        if k.modifiers.control && ["+", "=", "-", "0"].contains(&k.key.as_str()) {
-            self.font_size = if k.key == "0" {
-                16.
-            } else {
-                (self.font_size + if k.key == "-" { -1. } else { 1. }).clamp(8., 64.)
-            };
+        if k.modifiers.control && ["+", "=", "-"].contains(&k.key.as_str()) {
+            self.font_size = (self.font_size + if k.key == "-" { -1. } else { 1. }).clamp(8., 64.);
             cx.notify();
             cx.stop_propagation();
             return;
@@ -838,6 +831,15 @@ impl Render for TerminalView {
                 }
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|s, _, w, cx| {
+                    s.focus.focus(w);
+                    s.paste(cx);
+                    w.prevent_default();
+                    cx.stop_propagation();
+                }),
+            )
             .on_mouse_move(cx.listener(|s, e: &MouseMoveEvent, _, cx| {
                 let edge = e.position.x > s.bounds.right() - px(12.);
                 if s.edge != edge {

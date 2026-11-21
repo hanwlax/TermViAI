@@ -3,6 +3,7 @@ mod chrome;
 mod forms;
 mod monitor_view;
 mod pages;
+mod shortcut_settings;
 mod states;
 mod tabs;
 mod validation;
@@ -15,7 +16,7 @@ use gpui_component::{
     scroll::ScrollableElement,
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -24,7 +25,7 @@ use termviai_gpui::{
     authentication::{self, Phase},
     forwarding,
     hosts::*,
-    layout::{Layout, Side},
+    layout::{Layout, QuadGrip, QuadSplit, Side},
     monitor,
     session::{self, Session},
     settings::Settings,
@@ -144,6 +145,7 @@ pub enum FormKind {
 }
 #[derive(Clone)]
 pub struct Form {
+    shortcut_editor: Option<shortcut_settings::Editor>,
     kind: FormKind,
     fields: BTreeMap<&'static str, Entity<InputState>>,
     mode: Authentication,
@@ -217,6 +219,7 @@ impl Render for Drag {
 pub struct ResizeDrag {
     tab: usize,
     path: Vec<bool>,
+    quad: Option<(QuadSplit, QuadGrip)>,
 }
 impl Render for ResizeDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -256,6 +259,7 @@ pub struct AppView {
     tab_drop_target: Option<(usize, bool)>,
     tab_rail: tabs::TabRail,
     tab_search: Entity<InputState>,
+    shortcut_keys_down: HashSet<String>,
     tab_picker: bool,
     tab_picker_index: usize,
     monitor: monitor::Monitor,
@@ -427,6 +431,7 @@ impl AppView {
             tab_drop_target: None,
             tab_rail: tabs::TabRail::default(),
             tab_search,
+            shortcut_keys_down: HashSet::new(),
             tab_picker: false,
             tab_picker_index: 0,
             monitor: monitor::Monitor::load(),
@@ -441,6 +446,7 @@ impl AppView {
             last_tick: Instant::now(),
             quit_allowed: false,
             scrollers: [
+                "shortcut-settings",
                 "tab-picker",
                 "hosts-page",
                 "keychain-page",

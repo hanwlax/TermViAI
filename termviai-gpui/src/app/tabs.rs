@@ -578,6 +578,95 @@ impl AppView {
         self.set_new_tab_open(true);
         self.activate_tab(Page::NewTab, w, cx);
     }
+    pub(super) fn handle_shortcut(
+        &mut self,
+        action: termviai_gpui::terminal_keys::Shortcut,
+        held: bool,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use termviai_gpui::terminal_keys::Shortcut::*;
+        if self.tab_picker
+            || self.drawer.is_some()
+            || self.confirm.is_some()
+            || self.menu.is_some()
+            || self.drag_source.is_some()
+            || (self.page == Page::Monitor
+                && (self.monitor_reason.is_some()
+                    || self.monitor_detail.is_some_and(|(_, n, _)| n.is_some())))
+        {
+            return false;
+        }
+        match action {
+            Tab(index) => {
+                if let Some(entry) = self.tab_entries().get(index)
+                    && entry.page != self.page
+                {
+                    self.activate_tab(entry.page, w, cx);
+                }
+            }
+            Group(index) => {
+                if index < self.tab_groups.len() {
+                    self.switch_tab_group(index, w, cx);
+                }
+            }
+            CycleTab { reverse } => self.cycle_tab(reverse, w, cx),
+            CycleGroup { reverse } => {
+                if let Some(index) = tab_strip::next_index(
+                    self.tab_groups.len(),
+                    Some(self.active_tab_group),
+                    reverse,
+                ) {
+                    self.switch_tab_group(index, w, cx);
+                }
+            }
+            _ => {
+                let Page::Terminal(id) = self.page else {
+                    return false;
+                };
+                let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+                    return false;
+                };
+                let Some(pane) = tab
+                    .zoom
+                    .or(self.focused)
+                    .or(tab.last_focused)
+                    .filter(|p| tab.layout.panes().contains(p))
+                else {
+                    return false;
+                };
+                match action {
+                    FocusPane(side) => {
+                        if let Some(next) = tab.layout.neighbor(pane, side) {
+                            tab.last_focused = Some(next);
+                            tab.zoom = tab.zoom.map(|_| next);
+                            self.focus_active_tab(w, cx);
+                            cx.notify();
+                        }
+                    }
+                    ToggleMember if !held => self.member(id, pane, cx),
+                    ToggleBroadcast if !held => self.broadcast_all(id, cx),
+                    Copy | Paste => {
+                        let Some(p) = self.panes.get(&pane) else {
+                            return false;
+                        };
+                        if !p.view.focus_handle(cx).is_focused(w) {
+                            return false;
+                        }
+                        if !held {
+                            p.view.update(cx, |v, cx| match action {
+                                Copy => v.copy(cx),
+                                _ => v.paste(cx),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        true
+    }
+
     pub(super) fn cycle_tab(&mut self, reverse: bool, w: &mut Window, cx: &mut Context<Self>) {
         let entries = self.tab_entries();
         let active = entries.iter().position(|t| t.page == self.page);

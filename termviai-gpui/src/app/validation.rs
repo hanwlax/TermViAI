@@ -152,3 +152,79 @@ impl AppView {
         cx.notify();
     }
 }
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::{AppView, FormKind};
+    use gpui::{
+        AppContext, Application, Context, Entity, IntoElement, ParentElement, Pixels, Render,
+        ScrollHandle, Size, Styled, Window, WindowOptions, div, px, size,
+    };
+
+    // A hidden Win32 window defers its placement until shown. Size the app
+    // surface explicitly so the native layout pass uses the requested viewport.
+    struct Surface(Size<Pixels>, Entity<AppView>);
+    impl Render for Surface {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(self.0.width).h(self.0.height).child(self.1.clone())
+        }
+    }
+
+    #[test]
+    fn settings_scroll_range_tracks_visible_controls() {
+        // Keep the native event loop and application data out of the test runner's process.
+        const CHILD: &str = "TERMVIAI_SETTINGS_LAYOUT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::validation::tests::settings_scroll_range_tracks_visible_controls",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("TERMVIAI_DATA_DIR", dir.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        Application::new().with_assets(crate::Assets).run(|cx| {
+            gpui_component::init(cx);
+            for (width, height, overflows) in [
+                (1280., 820., false),
+                (1280., 600., true),
+                (920., 960., false),
+            ] {
+                let mut scroll = ScrollHandle::new();
+                cx.open_window(
+                    WindowOptions {
+                        show: false,
+                        focus: false,
+                        ..Default::default()
+                    },
+                    |w, cx| {
+                        let view = cx.new(|cx| AppView::new(w, cx));
+                        view.update(cx, |s, cx| {
+                            s.initialize(false, w, cx);
+                            s.open_form(FormKind::Settings, w, cx);
+                            scroll = s.scrollers["drawer-scroll"].clone();
+                        });
+                        let surface = cx.new(|_| Surface(size(px(width), px(height)), view));
+                        cx.new(|cx| gpui_component::Root::new(surface, w, cx))
+                    },
+                )
+                .unwrap();
+                let viewport = scroll.bounds().size;
+                let range = scroll.max_offset().height;
+                eprintln!(
+                    "Settings {width}x{height}: viewport {viewport:?}, vertical range {range:?}"
+                );
+                assert!((height - f32::from(viewport.height) - 46.).abs() <= 2.);
+                assert_eq!(range > px(0.), overflows, "{width}x{height}");
+            }
+            cx.quit();
+        });
+    }
+}

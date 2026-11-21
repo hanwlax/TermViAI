@@ -17,6 +17,109 @@ pub enum Layout {
         second: Box<Self>,
     },
 }
+/// Four rectangular panes around one continuous divider. The other two
+/// dividers may meet it at different positions after a single-side resize.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuadSplit {
+    pub axis: SplitAxis,
+    pub spine: f32,
+    pub branches: [f32; 2],
+    panes: [[usize; 2]; 2],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum QuadGrip {
+    Segment(usize),
+    Center,
+    Junction(usize),
+}
+
+impl QuadSplit {
+    pub fn aligned(self) -> bool {
+        self.branches[0] == self.branches[1]
+    }
+
+    fn tree(self) -> Layout {
+        let branch = |i: usize| Layout::Split {
+            axis: perpendicular(self.axis),
+            ratio: self.branches[i],
+            first: Box::new(Layout::Pane(self.panes[i][0])),
+            second: Box::new(Layout::Pane(self.panes[i][1])),
+        };
+        Layout::Split {
+            axis: self.axis,
+            ratio: self.spine,
+            first: Box::new(branch(0)),
+            second: Box::new(branch(1)),
+        }
+    }
+
+    fn transposed(self) -> Self {
+        Self {
+            axis: perpendicular(self.axis),
+            spine: self.branches[0],
+            branches: [self.spine; 2],
+            panes: [
+                [self.panes[0][0], self.panes[1][0]],
+                [self.panes[0][1], self.panes[1][1]],
+            ],
+        }
+    }
+
+    /// Derive every move from the layout at mouse-down, even after the
+    /// segment becomes part of a differently oriented split tree.
+    pub fn resize(self, node: &mut Layout, grip: QuadGrip, position: [f32; 2], snap: [f32; 2]) {
+        let Some(current) = node.quad_split() else {
+            return;
+        };
+        let panes = if self.axis == current.axis {
+            self.panes
+        } else {
+            self.transposed().panes
+        };
+        if panes != current.panes {
+            return;
+        }
+        let axis = usize::from(self.axis == SplitAxis::Vertical);
+        let along = position[axis].clamp(0.1, 0.9);
+        let across = position[1 - axis].clamp(0.1, 0.9);
+        let mut next = self;
+        match grip {
+            QuadGrip::Segment(i) if self.aligned() => {
+                next = self.transposed();
+                next.branches[i] = snap_ratio(along, self.spine, snap[axis]);
+            }
+            QuadGrip::Center => {
+                next.spine = along;
+                next.branches = [across; 2];
+            }
+            QuadGrip::Junction(i) => {
+                next.spine = along;
+                next.branches[i] = snap_ratio(across, self.branches[1 - i], snap[1 - axis]);
+            }
+            _ => return,
+        }
+        if next != current {
+            *node = next.tree();
+        }
+    }
+}
+
+fn perpendicular(axis: SplitAxis) -> SplitAxis {
+    match axis {
+        SplitAxis::Horizontal => SplitAxis::Vertical,
+        SplitAxis::Vertical => SplitAxis::Horizontal,
+    }
+}
+
+fn snap_ratio(value: f32, other: f32, tolerance: f32) -> f32 {
+    if (value - other).abs() <= tolerance {
+        other
+    } else {
+        value
+    }
+}
+
 impl Layout {
     /// Build equal-area splits for a selection of hosts. Alternate axes at each level.
     pub fn balanced(panes: &[usize], axis: SplitAxis) -> Self {
@@ -43,9 +146,53 @@ impl Layout {
     }
     /// Screen reading order, independent of the split-tree traversal order.
     pub fn visual_panes(&self) -> Vec<usize> {
-        fn visit(tree: &Layout, x: f64, y: f64, w: f64, h: f64, out: &mut Vec<(usize, f64, f64)>) {
+        self.rectangles().into_iter().map(|rect| rect.0).collect()
+    }
+
+    /// Choose the adjacent pane sharing the longest edge, breaking ties in reading order.
+    pub fn neighbor(&self, pane: usize, side: Side) -> Option<usize> {
+        let rectangles = self.rectangles();
+        let &(_, x, y, w, h) = rectangles.iter().find(|r| r.0 == pane)?;
+        let mut best = None;
+        let mut longest = 0.;
+        for (id, nx, ny, nw, nh) in rectangles {
+            let (gap, overlap) = match side {
+                Side::Left | Side::Right => (
+                    if side == Side::Left {
+                        x - (nx + nw)
+                    } else {
+                        nx - (x + w)
+                    },
+                    (y + h).min(ny + nh) - y.max(ny),
+                ),
+                Side::Top | Side::Bottom => (
+                    if side == Side::Top {
+                        y - (ny + nh)
+                    } else {
+                        ny - (y + h)
+                    },
+                    (x + w).min(nx + nw) - x.max(nx),
+                ),
+            };
+            if id != pane && gap.abs() < 1e-9 && overlap > longest + 1e-9 {
+                best = Some(id);
+                longest = overlap;
+            }
+        }
+        best
+    }
+
+    fn rectangles(&self) -> Vec<(usize, f64, f64, f64, f64)> {
+        fn visit(
+            tree: &Layout,
+            x: f64,
+            y: f64,
+            w: f64,
+            h: f64,
+            out: &mut Vec<(usize, f64, f64, f64, f64)>,
+        ) {
             match tree {
-                Layout::Pane(id) => out.push((*id, x, y)),
+                Layout::Pane(id) => out.push((*id, x, y, w, h)),
                 Layout::Split {
                     axis,
                     ratio,
@@ -69,7 +216,7 @@ impl Layout {
         let mut positions = Vec::new();
         visit(self, 0., 0., 1., 1., &mut positions);
         positions.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.1.total_cmp(&b.1)));
-        positions.into_iter().map(|p| p.0).collect()
+        positions
     }
     fn collect(&self, v: &mut Vec<usize>) {
         match self {
@@ -168,29 +315,153 @@ impl Layout {
             },
         }
     }
-    pub fn set_ratio(&mut self, path: &[bool], ratio: f32) {
-        if let Self::Split {
-            ratio: r,
+    pub fn quad_split(&self) -> Option<QuadSplit> {
+        let Self::Split {
+            axis,
+            ratio,
             first,
             second,
-            ..
         } = self
+        else {
+            return None;
+        };
+        let pair = |branch: &Self| {
+            let Self::Split {
+                axis: inner,
+                ratio,
+                first,
+                second,
+            } = branch
+            else {
+                return None;
+            };
+            let (Self::Pane(a), Self::Pane(b)) = (&**first, &**second) else {
+                return None;
+            };
+            (*inner != *axis).then_some((*ratio, [*a, *b]))
+        };
+        let (a, first_pair) = pair(first)?;
+        let (b, second_pair) = pair(second)?;
+        Some(QuadSplit {
+            axis: *axis,
+            spine: *ratio,
+            branches: [a, b],
+            panes: [first_pair, second_pair],
+        })
+    }
+
+    pub fn at_mut(&mut self, path: &[bool]) -> Option<&mut Self> {
+        let mut node = self;
+        for &right in path {
+            let Self::Split { first, second, .. } = node else {
+                return None;
+            };
+            node = if right { second } else { first };
+        }
+        Some(node)
+    }
+
+    pub fn resize_divider(&mut self, path: &[bool], value: f32, snap: f32) {
+        let mut value = value.clamp(0.1, 0.9);
+        if let Some((&branch, parent)) = path.split_last()
+            && let Some(quad) = self.at_mut(parent).and_then(|node| node.quad_split())
         {
-            if let Some((branch, tail)) = path.split_first() {
-                if *branch {
-                    second.set_ratio(tail, ratio)
-                } else {
-                    first.set_ratio(tail, ratio)
-                }
-            } else {
-                *r = ratio.clamp(0.1, 0.9)
-            }
+            value = snap_ratio(value, quad.branches[usize::from(!branch)], snap);
+        }
+        self.set_ratio(path, value);
+    }
+
+    pub fn set_ratio(&mut self, path: &[bool], value: f32) {
+        if let Some(Self::Split { ratio, .. }) = self.at_mut(path) {
+            *ratio = value.clamp(0.1, 0.9);
         }
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quad_segment_drag_preserves_opposite_pair_and_saved_geometry() {
+        for axis in [SplitAxis::Horizontal, SplitAxis::Vertical] {
+            for i in 0..2 {
+                let mut layout = Layout::balanced(&[11, 12, 13, 14], axis);
+                layout.set_ratio(&[], 0.36);
+                layout.set_ratio(&[false], 0.60);
+                layout.set_ratio(&[true], 0.60);
+                let start = layout.quad_split().unwrap();
+                for value in [0.40, 0.74] {
+                    start.resize(&mut layout, QuadGrip::Segment(i), [value; 2], [0.005; 2]);
+                    let actual = layout.quad_split().unwrap();
+                    assert_eq!(actual.axis, perpendicular(axis));
+                    assert_eq!(actual.spine, 0.60);
+                    assert_eq!(actual.branches[i], value);
+                    assert_eq!(actual.branches[1 - i], 0.36);
+                    assert_eq!(actual.panes, [[11, 13], [12, 14]]);
+                }
+                let saved = layout.save(&Some).unwrap();
+                assert_eq!(Layout::restore(&saved, &mut |id| *id), layout);
+                layout.resize_divider(&[i == 1], 0.363, 0.005);
+                assert!(layout.quad_split().unwrap().aligned());
+            }
+        }
+    }
+
+    #[test]
+    fn quad_center_moves_both_axes_and_staggered_junction_keeps_other_branch() {
+        for axis in [SplitAxis::Horizontal, SplitAxis::Vertical] {
+            let mut layout = Layout::balanced(&[1, 2, 3, 4], axis);
+            let start = layout.quad_split().unwrap();
+            start.resize(&mut layout, QuadGrip::Center, [0.8, 0.3], [0.005; 2]);
+            let (spine, branch) = if axis == SplitAxis::Horizontal {
+                (0.8, 0.3)
+            } else {
+                (0.3, 0.8)
+            };
+            let cross = layout.quad_split().unwrap();
+            assert_eq!((cross.spine, cross.branches), (spine, [branch; 2]));
+            layout.resize_divider(&[true], 0.6, 0.005);
+            let staggered = layout.quad_split().unwrap();
+            staggered.resize(&mut layout, QuadGrip::Junction(1), [-1., 2.], [0.005; 2]);
+            let limited = layout.quad_split().unwrap();
+            let (s, b) = if axis == SplitAxis::Horizontal {
+                (0.1, 0.9)
+            } else {
+                (0.9, 0.1)
+            };
+            assert_eq!((limited.spine, limited.branches), (s, [branch, b]));
+            assert_eq!(limited.panes, start.panes);
+        }
+    }
+
+    #[test]
+    fn stale_quad_drag_cannot_restore_a_closed_or_replaced_pane() {
+        let original = Layout::balanced(&[1, 2, 3, 4], SplitAxis::Horizontal);
+        let start = original.quad_split().unwrap();
+        for mut layout in [
+            original.remove(2).unwrap(),
+            Layout::balanced(&[1, 2, 3, 5], SplitAxis::Horizontal),
+        ] {
+            let before = layout.clone();
+            start.resize(&mut layout, QuadGrip::Center, [0.8; 2], [0.005; 2]);
+            assert_eq!(layout, before);
+        }
+    }
+
+    #[test]
+    fn directional_focus_follows_shared_edges_after_resizing() {
+        let mut layout = Layout::Pane(1);
+        layout.dock(2, 1, Side::Right);
+        layout.dock(3, 2, Side::Bottom);
+        assert_eq!(layout.neighbor(1, Side::Right), Some(2));
+        layout.set_ratio(&[true], 0.25);
+        assert_eq!(layout.neighbor(1, Side::Right), Some(3));
+        assert_eq!(layout.neighbor(3, Side::Top), Some(2));
+        assert_eq!(layout.neighbor(2, Side::Bottom), Some(3));
+        assert_eq!(layout.neighbor(2, Side::Left), Some(1));
+        assert_eq!(layout.neighbor(2, Side::Right), None);
+        assert_eq!(layout.neighbor(99, Side::Left), None);
+    }
+
     #[test]
     fn batch_layout_keeps_all_sessions_and_four_hosts_in_reading_order() {
         for size in 1..=17 {

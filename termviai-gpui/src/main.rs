@@ -9,6 +9,8 @@ struct Assets;
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
         let asset: Option<&'static [u8]> = match path {
+            "termviai/pencil.svg" => Some(include_bytes!("../assets/lucide/pencil.svg")),
+            "termviai/clipboard.svg" => Some(include_bytes!("../assets/lucide/clipboard.svg")),
             "termviai/grip.svg" => Some(include_bytes!("../assets/lucide/grip-vertical.svg")),
             "termviai/clock.svg" => Some(include_bytes!("../assets/lucide/clock.svg")),
             "termviai/reconnect.svg" => Some(include_bytes!("../assets/lucide/refresh-cw.svg")),
