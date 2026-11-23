@@ -4,7 +4,7 @@
 
 TermViAI combines WezTerm's terminal, SSH and PTY foundations with a native Rust GPUI interface, a focused host library, multi-host tab groups and selective input broadcasting. Settings offers Ink, Navy and Light themes across the interface and terminal; the default font is JetBrainsMono Nerd Font Mono.
 
-> Current version: **v0.1.0-beta.9**. This beta targets Windows 10/11 x86_64.
+> Current version: **v0.1.0-beta.10**. This beta targets Windows 10/11 x86_64.
 
 ## Features
 
@@ -22,6 +22,7 @@ TermViAI combines WezTerm's terminal, SSH and PTY foundations with a native Rust
 - Save and restore tab groups from New Tab, reorder groups in the sidebar, and remove individual recent connections.
 - NPU Monitor for existing Linux hosts: card/Die metrics, process details and guarded process termination.
 - Port Forwarding waits for a network path and automatically reconnects eligible tunnels. Manually stopped services stay stopped.
+- Known Hosts stores trusted SSH fingerprints per host and port. Confirming a key resumes eligible Port Forwarding and Monitor connections.
 - Inline SSH authentication recovery with Keychain → Identity → manual fallback.
 - Configurable tab-close confirmation, enabled by default.
 - In-place SSH reconnect with scrollback preserved, including whole-group reconnect.
@@ -32,7 +33,7 @@ TermViAI combines WezTerm's terminal, SSH and PTY foundations with a native Rust
 
 ## Download
 
-Download **TermViAI-v0.1.0-beta.9-windows-x86_64.zip** from the [v0.1.0-beta.9 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.9), extract it, and run `TermViAI.exe`.
+Download **TermViAI-v0.1.0-beta.10-windows-x86_64.zip** from the [v0.1.0-beta.10 release](https://github.com/hanwlax/TermViAI/releases/tag/v0.1.0-beta.10), extract it, and run `TermViAI.exe`.
 
 This portable package contains `TermViAI.exe`, `README.txt` and `LICENSES.txt`. Extract into a new folder; no WebView or separate Chromium runtime is required. Existing Hosts, Keychain references and workspaces are reused.
 
@@ -74,7 +75,7 @@ The Cargo output is `termviai-gpui/target/release/TermViAI.exe`, with TermViAI W
 
 CI builds the Windows x86_64 GUI and runs broadcast policy, SSH, terminal core, window, mux, and GUI tests on relevant pushes and pull requests to `main`. Rust formatting and the Linux remote collector tests are checked separately. Windows CI can also be started manually; scheduled upstream builds and publishing workflows are archived under [`ci/upstream-workflows`](ci/upstream-workflows).
 
-Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.9.md](docs/termviai/RELEASE_V0.1.0_BETA.9.md).
+Development notes and validation records are under [`docs/termviai`](docs/termviai). The latest behavior is summarized in [the handover document](docs/termviai/HANDOVER.md), and the beta release notes are in [RELEASE_V0.1.0_BETA.10.md](docs/termviai/RELEASE_V0.1.0_BETA.10.md).
 
 ## Project origin and license
 
