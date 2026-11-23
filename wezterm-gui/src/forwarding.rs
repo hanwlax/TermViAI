@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use wezterm_ssh::forward_network::Path as NetworkPath;
+use wezterm_ssh::known_hosts::{PendingHostKey, TrustSnapshot};
 use wezterm_ssh::{ConfigMap, Session, SessionEvent};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,12 +174,14 @@ struct Worker {
 enum Event {
     Attempted(std::time::SystemTime),
     Status(State, String),
+    AwaitingTrust(PendingHostKey),
     Done,
 }
 struct Entry {
     view: View,
     worker: Option<Worker>,
     pending: Option<ConfigMap>,
+    waiting_for_trust: Option<PendingHostKey>,
     control: Option<ControlJob>,
     probe: Option<mpsc::Receiver<bool>>,
     cancelled_for_network: bool,
@@ -332,13 +335,14 @@ impl Manager {
         let cancel_retry = current.is_some_and(|e| {
             e.view.rule.retry
                 && !rule.retry
-                && matches!(
-                    e.view.state,
-                    State::Retrying
-                        | State::WaitingForNetwork
-                        | State::Queued
-                        | State::CheckingNetwork
-                )
+                && (e.waiting_for_trust.is_some()
+                    || matches!(
+                        e.view.state,
+                        State::Retrying
+                            | State::WaitingForNetwork
+                            | State::Queued
+                            | State::CheckingNetwork
+                    ))
         });
         if cancel_retry {
             rule.desired = false;
@@ -362,6 +366,7 @@ impl Manager {
                     w.cancel.store(true, Ordering::Relaxed);
                 }
                 e.cancelled_for_network = false;
+                e.waiting_for_trust = None;
                 e.pending = new_config;
                 e.control = None;
                 e.probe = None;
@@ -430,6 +435,7 @@ impl Manager {
         }
         self.routes.forget(&e.view.rule.host.address);
         e.cancelled_for_network = false;
+        e.waiting_for_trust = None;
         e.pending = Some(cfg);
         e.view.state = State::CheckingNetwork;
         e.view.attempt = 0;
@@ -456,6 +462,7 @@ impl Manager {
     fn stop_runtime(&mut self, id: &str) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.view.rule.id == id) {
             e.cancelled_for_network = false;
+            e.waiting_for_trust = None;
             e.pending = None;
             e.view.retry_at = None;
             e.stable_since = None;
@@ -534,6 +541,19 @@ impl Manager {
                         Ok(Event::Attempted(at)) if !w.cancel.load(Ordering::Relaxed) => {
                             e.view.last_attempt = Some(at);
                         }
+                        Ok(Event::AwaitingTrust(key))
+                            if !w.cancel.load(Ordering::Relaxed) || e.cancelled_for_network =>
+                        {
+                            e.view.state = State::Attention;
+                            e.view.error = key.to_string();
+                            e.view.last_failure.clone_from(&e.view.error);
+                            e.view.retry_at = None;
+                            if e.view.rule.desired && e.view.rule.retry {
+                                e.waiting_for_trust = Some(key);
+                            } else {
+                                e.pending = None;
+                            }
+                        }
                         Ok(Event::Status(s, msg))
                             if !w.cancel.load(Ordering::Relaxed)
                                 || (s == State::Attention && e.cancelled_for_network) =>
@@ -556,7 +576,7 @@ impl Manager {
                                 e.pending = None;
                             }
                         }
-                        Ok(Event::Status(..) | Event::Attempted(_)) => (),
+                        Ok(Event::Status(..) | Event::Attempted(_) | Event::AwaitingTrust(_)) => (),
                         Ok(Event::Done) | Err(mpsc::TryRecvError::Disconnected) => {
                             done = true;
                             break;
@@ -575,7 +595,10 @@ impl Manager {
                     if e.pending.is_none() && e.view.state == State::Stopping {
                         e.view.state = State::Stopped;
                     }
-                } else if e.pending.is_some() && e.view.state != State::WaitingForNetwork {
+                } else if e.pending.is_some()
+                    && e.waiting_for_trust.is_none()
+                    && e.view.state != State::WaitingForNetwork
+                {
                     if e.view.rule.retry {
                         let delay = retry_delay(e.view.attempt);
                         let jitter = e
@@ -644,6 +667,7 @@ fn entry_at(rule: Rule, data_path: &std::path::Path) -> Entry {
         },
         worker: None,
         pending: None,
+        waiting_for_trust: None,
         control: None,
         probe: None,
     }
@@ -653,6 +677,10 @@ pub fn connection_config(host: &Host, store: &HostStore) -> anyhow::Result<Confi
     h.resolve_identity(store)?;
     // Config::new supplies defaults, but intentionally never loads config files.
     let mut cfg = wezterm_ssh::Config::new().for_host(&h.address);
+    cfg.insert(
+        wezterm_ssh::known_hosts::CONFIG_KEY.into(),
+        HostStore::known_hosts_path().to_string_lossy().into_owned(),
+    );
     cfg.insert("termviai_no_ssh_config".into(), "yes".into());
     cfg.insert("hostname".into(), h.address.clone());
     cfg.insert("port".into(), h.port.to_string());
@@ -717,8 +745,7 @@ fn connect(
             Ok(SessionEvent::Authenticated) => return Ok(session),
             Ok(SessionEvent::Banner(_)) => (),
             Ok(SessionEvent::HostVerify(request)) => {
-                request.try_answer(false).ok();
-                return Err(anyhow::anyhow!("Verify this host in its terminal before starting forwarding.").context(Attention));
+                return Err(request.reject_in_background().context(Attention));
             }
             Ok(SessionEvent::Authenticate(_)) => return Err(anyhow::anyhow!("Authentication is required. Save this host's password / Identity, or unlock its key in the SSH agent, then retry.").context(Attention)),
             Ok(SessionEvent::HostVerificationFailed(error)) => return Err(anyhow::anyhow!("{error}").context(Attention)),
@@ -861,11 +888,21 @@ fn schedule(
     }
     let count = entries.len();
     let first = *next;
+    let mut trust = TrustSnapshot::default();
     for offset in 0..count {
         let index = (first + offset) % count;
         let e = &mut entries[index];
         if !e.view.rule.desired || e.pending.is_none() || e.view.state == State::Running {
             continue;
+        }
+        if let Some(key) = &e.waiting_for_trust {
+            if e.worker.is_some() || !e.view.rule.retry || !trust.trusts(key) {
+                continue;
+            }
+            e.waiting_for_trust = None;
+            e.view.state = State::CheckingNetwork;
+            e.view.error.clear();
+            e.view.attempt = 0;
         }
         let route = path(&e.view.rule.host.address);
         if route == Some(NetworkPath::Offline) {
@@ -1004,7 +1041,11 @@ fn launch(e: &mut Entry, cfg: ConfigMap) {
                 } else {
                     State::Failed
                 };
-                tx.send(Event::Status(state, format!("{error:#}"))).ok();
+                let event = match error.downcast_ref::<PendingHostKey>() {
+                    Some(key) => Event::AwaitingTrust(key.clone()),
+                    None => Event::Status(state, format!("{error:#}")),
+                };
+                tx.send(event).ok();
             }
         }
         tx.send(Event::Done).ok();
@@ -1204,6 +1245,68 @@ mod tests {
         );
         assert_eq!(launched.len(), 5);
     }
+    #[test]
+    fn confirmed_host_key_reenters_route_queue_once_and_respects_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("known_hosts.json");
+        let key = PendingHostKey {
+            path: file.clone(),
+            endpoint: "vpn:22".into(),
+            fingerprint: "new".into(),
+        };
+        let mut m = Manager {
+            entries: (0..3).map(|_| pending_entry("vpn")).collect(),
+            ..Default::default()
+        };
+        m.entries[2].view.rule.retry = false;
+        for e in &mut m.entries {
+            let tx = simulated_worker(e);
+            tx.send(Event::AwaitingTrust(key.clone())).unwrap();
+            tx.send(Event::Done).unwrap();
+        }
+        let now = Instant::now();
+        m.drain(now);
+        assert!(m.entries.iter().all(|e| e.view.state == State::Attention));
+        let stopped = m.entries[1].view.rule.id.clone();
+        m.stop_runtime(&stopped);
+        for pins in [
+            r#"{}"#,
+            r#"{"vpn:22":"old","vpn:2222":"new","other:22":"new"}"#,
+        ] {
+            std::fs::write(&file, pins).unwrap();
+            schedule(
+                &mut m.entries,
+                &mut m.next,
+                now,
+                |_| Some(NetworkPath::Available),
+                |_, _| panic!("unconfirmed key scheduled"),
+            );
+        }
+        std::fs::write(&file, r#"{"vpn:22":"new"}"#).unwrap();
+        schedule(
+            &mut m.entries,
+            &mut m.next,
+            now,
+            |_| Some(NetworkPath::Offline),
+            |_, _| panic!("offline service scheduled"),
+        );
+        assert_eq!(m.entries[0].view.state, State::WaitingForNetwork);
+        let mut started = vec![];
+        for _ in 0..2 {
+            schedule(
+                &mut m.entries,
+                &mut m.next,
+                now,
+                |_| Some(NetworkPath::Available),
+                |e, _| started.push((e.view.rule.id.clone(), simulated_worker(e))),
+            );
+        }
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].0, m.entries[0].view.rule.id);
+        assert_eq!(m.entries[1].view.state, State::Stopped);
+        assert_eq!(m.entries[2].view.state, State::Attention);
+    }
+
     #[test]
     fn offline_does_not_wake_manual_only_or_attention_rules() {
         let mut entries = vec![pending_entry("manual"), pending_entry("rejected")];

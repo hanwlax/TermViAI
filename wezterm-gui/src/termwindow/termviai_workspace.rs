@@ -63,6 +63,12 @@ pub(super) fn ssh_domain(host: &Host, ssh_keepalive_interval: u64) -> SshDomain 
         ..Default::default()
     };
     domain.ssh_option.insert(
+        wezterm_ssh::known_hosts::CONFIG_KEY.into(),
+        crate::hosts::HostStore::known_hosts_path()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    domain.ssh_option.insert(
         "serveraliveinterval".into(),
         ssh_keepalive_interval.to_string(),
     );

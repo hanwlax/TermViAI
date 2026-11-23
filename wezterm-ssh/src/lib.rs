@@ -5,11 +5,14 @@ mod auth;
 mod channelwrap;
 mod config;
 pub mod credentials;
+mod diagnostics;
+pub use diagnostics::ConnectionDiagnostics;
 mod dirwrap;
 mod filewrap;
 mod forward;
 pub mod forward_network;
 mod host;
+pub mod known_hosts;
 pub use forward::{
     RemoteForward, RemoteForwardSetup, RemoteForwardSetupUnavailable, RemoteListenerRefused,
 };

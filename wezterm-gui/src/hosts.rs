@@ -719,6 +719,10 @@ impl HostStore {
         Ok(copy)
     }
 
+    pub fn known_hosts_path() -> PathBuf {
+        Self::path().with_file_name("known_hosts.json")
+    }
+
     pub fn path() -> PathBuf {
         std::env::var_os("TERMVIAI_DATA_DIR")
             .map(PathBuf::from)

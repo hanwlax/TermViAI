@@ -13,10 +13,23 @@ pub struct HostVerificationFailed {
 #[derive(Debug)]
 pub struct HostVerificationEvent {
     pub message: String,
+    pub key_changed: bool,
+    pending_key: Option<crate::known_hosts::PendingHostKey>,
     pub(crate) reply: Sender<bool>,
 }
 
 impl HostVerificationEvent {
+    /// Background jobs cannot approve a key. Return the condition that can wake them.
+    pub fn reject_in_background(mut self) -> anyhow::Error {
+        let error = self
+            .pending_key
+            .take()
+            .map(anyhow::Error::new)
+            .unwrap_or_else(|| anyhow::anyhow!("{}", self.message));
+        let _ = self.try_answer(false);
+        error
+    }
+
     pub async fn answer(self, trust_host: bool) -> anyhow::Result<()> {
         Ok(self.reply.send(trust_host).await?)
     }
@@ -26,6 +39,32 @@ impl HostVerificationEvent {
 }
 
 impl crate::sessioninner::SessionInner {
+    fn verify_private_pin(
+        &self,
+        path: &str,
+        host: &str,
+        port: u16,
+        digest: &[u8],
+    ) -> anyhow::Result<()> {
+        crate::known_hosts::verify(
+            std::path::Path::new(path),
+            host,
+            port,
+            digest,
+            |message, key_changed, pending_key| {
+                let (reply, confirm) = bounded(1);
+                self.tx_event
+                    .try_send(SessionEvent::HostVerify(HostVerificationEvent {
+                        message,
+                        key_changed,
+                        pending_key: Some(pending_key),
+                        reply,
+                    }))
+                    .context("requesting host verification")?;
+                smol::block_on(confirm.recv()).context("waiting for host verification")
+            },
+        )
+    }
     #[cfg(feature = "libssh-rs")]
     pub fn host_verification_libssh(
         &mut self,
@@ -33,6 +72,12 @@ impl crate::sessioninner::SessionInner {
         hostname: &str,
         port: u16,
     ) -> anyhow::Result<()> {
+        if let Some(path) = self.config.get(crate::known_hosts::CONFIG_KEY) {
+            let digest = sess
+                .get_server_public_key()?
+                .get_public_key_hash(libssh_rs::PublicKeyHashType::Sha256)?;
+            return self.verify_private_pin(path, hostname, port, &digest);
+        }
         let key = sess
             .get_server_public_key()?
             .get_public_key_hash_hexa(libssh_rs::PublicKeyHashType::Sha256)?;
@@ -43,6 +88,8 @@ impl crate::sessioninner::SessionInner {
                 let (reply, confirm) = bounded(1);
                 self.tx_event
                     .try_send(SessionEvent::HostVerify(HostVerificationEvent {
+                        key_changed: false,
+                        pending_key: None,
                         message: format!(
                             "SSH host {}:{} is not yet trusted.\n\
                                     Fingerprint: {}.\n\
@@ -104,6 +151,12 @@ impl crate::sessioninner::SessionInner {
         use std::io::Write;
         use std::path::Path;
 
+        if let Some(path) = self.config.get(crate::known_hosts::CONFIG_KEY) {
+            let digest = sess
+                .host_key_hash(ssh2::HashType::Sha256)
+                .context("missing SHA256 host fingerprint")?;
+            return self.verify_private_pin(path, remote_host_name, port, digest);
+        }
         let mut known_hosts = sess.known_hosts().context("preparing known hosts")?;
 
         let known_hosts_files = self
@@ -158,6 +211,8 @@ impl crate::sessioninner::SessionInner {
                     let (reply, confirm) = bounded(1);
                     self.tx_event
                         .try_send(SessionEvent::HostVerify(HostVerificationEvent {
+                            key_changed: false,
+                            pending_key: None,
                             message: format!(
                                 "SSH host {} is not yet trusted.\n\
                                 {:?} Fingerprint: {}.\n\

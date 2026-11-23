@@ -29,6 +29,7 @@ class Server(paramiko.ServerInterface):
     while True:
      data=c.recv(4096)
      if not data: break
+     if b'fixture-drop' in data: c.get_transport().close(); break
      if b'fixture-exit' in data: c.send_exit_status(0); break
      c.send(data.replace(b'\r', b'\r\n'))
    finally:c.close()

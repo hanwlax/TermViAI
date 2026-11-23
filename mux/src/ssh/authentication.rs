@@ -26,6 +26,7 @@ pub enum Phase {
 #[derive(Clone, Debug)]
 pub struct View {
     pub phase: Phase,
+    pub host_key_changed: bool,
     pub label: String,
     pub error: String,
     pub logs: Vec<String>,
@@ -53,6 +54,7 @@ impl Control {
         Arc::new(Self {
             view: Mutex::new(View {
                 phase: Phase::Trying,
+                host_key_changed: false,
                 label: String::new(),
                 error: String::new(),
                 logs: vec![],
@@ -77,6 +79,15 @@ impl Control {
             .try_send(command)
             .map_err(|_| anyhow::anyhow!("An authentication request is already in progress"))
     }
+    pub fn answer_host(&self, revision: u64, trust: bool) -> anyhow::Result<()> {
+        let mut v = self.view.lock().unwrap();
+        if v.phase == Phase::Verify && v.revision == revision {
+            self.send(Command::Trust(trust))?;
+            v.phase = Phase::Trying;
+            v.revision += 1;
+        }
+        Ok(())
+    }
     pub fn cancel(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::Release);
@@ -92,6 +103,7 @@ impl Control {
     pub fn update(&self, phase: Phase, error: String) {
         let mut v = self.view.lock().unwrap();
         v.phase = phase;
+        v.host_key_changed = false;
         v.error = error;
         v.prompts.clear();
         v.revision += 1;
@@ -173,7 +185,14 @@ fn connect_with<S>(
             match control.event(&events)? {
                 SessionEvent::Banner(_) => {}
                 SessionEvent::HostVerify(verify) => {
-                    control.update(Phase::Verify, verify.message.clone());
+                    {
+                        let mut view = control.view.lock().unwrap();
+                        view.phase = Phase::Verify;
+                        view.host_key_changed = verify.key_changed;
+                        view.error = verify.message.clone();
+                        view.prompts.clear();
+                        view.revision += 1;
+                    }
                     let trust = matches!(control.wait()?, Command::Trust(true));
                     smol::block_on(verify.answer(trust))?;
                     anyhow::ensure!(trust, "SSH host key was not trusted");

@@ -12,6 +12,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+use wezterm_ssh::known_hosts::{PendingHostKey, TrustSnapshot};
 use wezterm_ssh::{ConfigMap, Session, SessionEvent};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -182,9 +183,7 @@ fn connect(config: ConfigMap, cancel: &AtomicBool) -> anyhow::Result<Session> {
             Ok(SessionEvent::Authenticated) => return Ok(session),
             Ok(SessionEvent::Banner(_)) => (),
             Ok(SessionEvent::HostVerify(event)) => {
-                let message = event.message.clone();
-                event.try_answer(false).ok();
-                return Err(anyhow::anyhow!("{} Open this Host once from Hosts to verify its fingerprint, then retry monitoring.", message).context(FailureKind::Attention));
+                return Err(event.reject_in_background().context(FailureKind::Attention));
             }
             Ok(SessionEvent::Authenticate(_)) => return Err(anyhow::anyhow!("Interactive authentication is required. Save a password / Identity or unlock the key in your SSH agent, then retry.").context(FailureKind::Attention)),
             Ok(SessionEvent::HostVerificationFailed(e)) => return Err(anyhow::anyhow!("{}", e).context(FailureKind::Attention)),
@@ -279,6 +278,7 @@ pub struct Entry {
     pub refresh_pending: bool,
     pub action_error: String,
     failure: Option<FailureKind>,
+    waiting_for_trust: Option<PendingHostKey>,
     failures: u32,
     retryable: bool,
     settle_samples: u8,
@@ -307,6 +307,7 @@ impl Entry {
             refresh_pending: false,
             action_error: String::new(),
             failure: None,
+            waiting_for_trust: None,
             failures: 0,
             retryable: false,
             settle_samples: 0,
@@ -354,6 +355,8 @@ impl Entry {
     pub fn recovery_hint(&self) -> String {
         if self.paused {
             "Sampling is paused.".into()
+        } else if self.waiting_for_trust.is_some() {
+            "Sampling will resume after you trust this host key in its terminal.".into()
         } else if self.busy() && !self.error.is_empty() {
             if self.session.is_some() || self.sampling_failed() {
                 "Retrying sample…"
@@ -373,6 +376,7 @@ impl Entry {
         }
     }
     fn failed(&mut self, error: anyhow::Error, now: Instant) {
+        self.waiting_for_trust = error.downcast_ref::<PendingHostKey>().cloned();
         self.failure = Some(failure_kind(&error));
         self.retryable = self.failure != Some(FailureKind::Attention);
         self.failures = self.failures.saturating_add(1);
@@ -634,6 +638,7 @@ impl Monitor {
         if !paused {
             let e = &mut self.entries[id];
             e.error.clear();
+            e.waiting_for_trust = None;
             e.failure = None;
             e.failures = 0;
             e.retryable = false;
@@ -642,6 +647,7 @@ impl Monitor {
         Ok(())
     }
     pub fn tick(&mut self, store: &HostStore, config: impl Fn(&Host) -> anyhow::Result<ConfigMap>) {
+        let mut trust = TrustSnapshot::default();
         for e in &mut self.entries {
             if let Some(rx) = &e.rx {
                 let done = match rx.try_recv() {
@@ -674,6 +680,17 @@ impl Monitor {
                                 .into();
                     }
                 }
+            }
+            if !e.paused
+                && e.waiting_for_trust
+                    .as_ref()
+                    .is_some_and(|key| trust.trusts(key))
+            {
+                e.waiting_for_trust = None;
+                e.failure = None;
+                e.retryable = true;
+                e.failures = 0;
+                e.next = Instant::now();
             }
             if e.sampling_due(Instant::now()) {
                 let cfg = (|| {
@@ -1061,6 +1078,52 @@ mod tests {
         assert_eq!(e.failures, 0);
         assert!(e.live());
     }
+    #[test]
+    fn trusting_a_key_retries_only_matching_unpaused_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts.json");
+        let mut m = Monitor::default();
+        let mut store = HostStore::default();
+        for label in ["sampling", "paused", "other", "credentials"] {
+            let host = Host {
+                label: label.into(),
+                ..Default::default()
+            };
+            store.hosts.push(host.clone());
+            let mut e = Entry::new(host);
+            e.paused = label == "paused";
+            let error = if label == "credentials" {
+                anyhow::anyhow!("Password required")
+            } else {
+                PendingHostKey {
+                    path: path.clone(),
+                    endpoint: if label == "other" {
+                        "vpn:2222"
+                    } else {
+                        "vpn:22"
+                    }
+                    .into(),
+                    fingerprint: "new".into(),
+                }
+                .into()
+            };
+            e.failed(error.context(FailureKind::Attention), Instant::now());
+            m.entries.push(e);
+        }
+        std::fs::write(&path, r#"{"vpn:22":"old"}"#).unwrap();
+        m.tick(&store, |_| panic!("wrong key woke a monitor"));
+        std::fs::write(&path, r#"{"vpn:22":"new"}"#).unwrap();
+        let attempts = std::cell::Cell::new(0);
+        for _ in 0..2 {
+            m.tick(&store, |h| {
+                assert_eq!(h.label, "sampling");
+                attempts.set(attempts.get() + 1);
+                anyhow::bail!("credentials now require attention")
+            });
+        }
+        assert_eq!(attempts.get(), 1);
+    }
+
     #[test]
     fn credential_failures_wait_for_manual_retry() {
         let mut m = Monitor::default();

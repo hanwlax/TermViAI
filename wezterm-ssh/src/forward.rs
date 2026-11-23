@@ -185,7 +185,11 @@ impl Drop for Pipe {
     }
 }
 
-pub(crate) fn run(sess: &mut SessionWrap, mut request: RemoteForward) -> anyhow::Result<()> {
+pub(crate) fn run(
+    sess: &mut SessionWrap,
+    mut request: RemoteForward,
+    diagnostics: &crate::ConnectionDiagnostics,
+) -> anyhow::Result<()> {
     ensure!(
         request.remote_port > 0 && request.local_port > 0,
         "Ports must be 1–65535"
@@ -241,6 +245,15 @@ pub(crate) fn run(sess: &mut SessionWrap, mut request: RemoteForward) -> anyhow:
         }
     }
     sess.set_blocking(false);
+    diagnostics.keepalive_mode(
+        match sess {
+            #[cfg(feature = "libssh-rs")]
+            SessionWrap::LibSsh(_) => "ssh_ignore_no_reply",
+            #[cfg(feature = "ssh2")]
+            SessionWrap::Ssh2(_) => "ssh2_keepalive_request",
+        },
+        15,
+    );
     if request.cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -299,6 +312,7 @@ pub(crate) fn run(sess: &mut SessionWrap, mut request: RemoteForward) -> anyhow:
                 },
             };
             if replied {
+                diagnostics.event("forward_probe_reply", serde_json::json!({}));
                 deadline = None;
                 next_probe = now + Duration::from_secs(60);
             }
@@ -373,14 +387,16 @@ pub(crate) fn run(sess: &mut SessionWrap, mut request: RemoteForward) -> anyhow:
             }
         });
         if last_alive.elapsed() >= Duration::from_secs(15) {
-            match sess {
+            let result: anyhow::Result<()> = match sess {
                 #[cfg(feature = "libssh-rs")]
-                SessionWrap::LibSsh(s) => s.sess.send_ignore(b"termviai-forward")?,
-                #[cfg(feature = "ssh2")]
-                SessionWrap::Ssh2(s) => {
-                    s.sess.keepalive_send()?;
+                SessionWrap::LibSsh(s) => {
+                    s.sess.send_ignore(b"termviai-forward").map_err(Into::into)
                 }
-            }
+                #[cfg(feature = "ssh2")]
+                SessionWrap::Ssh2(s) => s.sess.keepalive_send().map(|_| ()).map_err(Into::into),
+            };
+            diagnostics.keepalive(result.as_ref().err().map(|e| format!("{e:#}")));
+            result?;
             last_alive = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(if pipes.is_empty() { 20 } else { 2 }));

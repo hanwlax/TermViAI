@@ -393,7 +393,7 @@ impl TermWindow {
                 Command::Reveal => a.reveal = !a.reveal,
                 Command::Logs => a.logs = !a.logs,
                 Command::Trust => {
-                    a.control.send(Request::Trust(true))?;
+                    a.control.answer_host(a.view.revision, true)?;
                 }
                 Command::Close => {
                     a.control.cancel();
@@ -787,6 +787,7 @@ pub(super) fn draw(
             match a.view.phase {
                 Phase::Waiting => "Authentication required",
                 Phase::Challenge => "Additional authentication",
+                Phase::Verify if a.view.host_key_changed => "SSH host key changed",
                 Phase::Verify => "Verify SSH host",
                 Phase::Failed => "Connection unavailable",
                 Phase::Opening => "Opening terminal…",
@@ -1135,7 +1136,9 @@ pub(super) fn draw(
                 x + cw - 160_f32.min(cw - 78.),
                 footer,
                 160_f32.min(cw - 78.),
-                if a.view.phase == Phase::Verify {
+                if a.view.phase == Phase::Verify && a.view.host_key_changed {
+                    "Replace key & Continue"
+                } else if a.view.phase == Phase::Verify {
                     "Trust & Continue"
                 } else if a.view.phase == Phase::Challenge {
                     "Continue"

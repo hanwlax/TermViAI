@@ -119,6 +119,7 @@ pub(crate) struct SessionInner {
     pub shown_accept_env_error: bool,
     pub last_keep_alive: Instant,
     pub keep_alive: Option<Duration>,
+    pub diagnostics: crate::ConnectionDiagnostics,
 }
 
 impl Drop for SessionInner {
@@ -130,6 +131,16 @@ impl Drop for SessionInner {
 impl SessionInner {
     pub fn run(&mut self) {
         if let Err(err) = self.run_impl() {
+            let mut error = format!("{err:#}");
+            // ProxyCommand can contain credentials; its full command is included
+            // in some spawning errors. Do not persist it in diagnostics.
+            if let Some(command) = self.config.get("proxycommand") {
+                if !command.is_empty() {
+                    error = error.replace(command, "[ProxyCommand]");
+                }
+            }
+            self.diagnostics
+                .event("transport_error", serde_json::json!({"error": error}));
             // Authentication's event receiver is gone after the PTY opens.
             // Preserve transport errors in the application log as well.
             log::warn!(
@@ -153,6 +164,13 @@ impl SessionInner {
                 )
                 .ok();
         }
+        self.diagnostics.event(
+            "transport_stopped",
+            serde_json::json!({
+                "session_handle_dropped": self.session_was_dropped,
+                "remaining_channels": self.channels.len(),
+            }),
+        );
     }
 
     fn run_impl(&mut self) -> anyhow::Result<()> {
@@ -294,7 +312,13 @@ impl SessionInner {
                 sess.set_option(libssh_rs::SshOption::AddIdentity(file.to_string()))?;
             }
         }
-        if let Some(kh) = self.config.get("userknownhostsfile") {
+        if self.config.contains_key(crate::known_hosts::CONFIG_KEY) {
+            // Do not let system pins influence host-key algorithm negotiation.
+            // The negotiated key is verified by verify_private_pin before authentication.
+            let empty = if cfg!(windows) { "NUL" } else { "/dev/null" };
+            sess.set_option(libssh_rs::SshOption::KnownHosts(Some(empty.into())))?;
+            sess.set_option(libssh_rs::SshOption::GlobalKnownHosts(Some(empty.into())))?;
+        } else if let Some(kh) = self.config.get("userknownhostsfile") {
             for file in kh.split_whitespace() {
                 sess.set_option(libssh_rs::SshOption::KnownHosts(Some(file.to_string())))?;
                 break;
@@ -313,6 +337,7 @@ impl SessionInner {
         }
 
         let (sock, _child) = self.connect_to_host(&hostname, port, verbose)?;
+        self.diagnostics.socket_connected(&sock);
         let raw = {
             #[cfg(unix)]
             {
@@ -395,6 +420,7 @@ impl SessionInner {
             .context("notifying user of banner")?;
 
         let (sock, _child) = self.connect_to_host(&hostname, port, verbose)?;
+        self.diagnostics.socket_connected(&sock);
 
         let mut sess = ssh2::Session::new()?;
         if verbose {
@@ -554,7 +580,10 @@ impl SessionInner {
                         log::trace!("sending keep alive");
                         self.last_keep_alive = Instant::now();
                         let ignore_me = [0x42; 128];
-                        if let Err(err) = sess.sess.send_ignore(&ignore_me) {
+                        let result = sess.sess.send_ignore(&ignore_me);
+                        self.diagnostics
+                            .keepalive(result.as_ref().err().map(|e| format!("{e:#}")));
+                        if let Err(err) = result {
                             log::warn!(
                                 "Error sending SSH keepalive to {}:{}: {err:#}",
                                 self.config
@@ -581,6 +610,16 @@ impl SessionInner {
             #[cfg(feature = "libssh-rs")]
             SessionWrap::LibSsh(_) => self.keep_alive,
         };
+        self.diagnostics.keepalive_mode(
+            if scheduled_keepalive.is_some() {
+                "ssh_ignore_no_reply"
+            } else {
+                "disabled"
+            },
+            scheduled_keepalive.map(|d| d.as_secs()).unwrap_or(0),
+        );
+        self.diagnostics
+            .event("authenticated", serde_json::json!({}));
 
         loop {
             self.do_keepalive(sess)?;
@@ -656,6 +695,7 @@ impl SessionInner {
                         match read_into_buf(fd, &mut state.buf) {
                             Ok(_) => {}
                             Err(err) => {
+                                self.diagnostics.event("local_pipe_read_closed", serde_json::json!({"channel_id": channel_id, "stream": fd_num, "error": err.to_string(), "os_error": err.raw_os_error()}));
                                 log::debug!(
                                     "error reading from channel {channel_id} stdin pipe: {:#}",
                                     err
@@ -673,6 +713,7 @@ impl SessionInner {
                             match write_from_buf(fd, &mut state.buf) {
                                 Ok(_) => {}
                                 Err(err) => {
+                                    self.diagnostics.event("local_pipe_write_error", serde_json::json!({"channel_id": channel_id, "stream": fd_num, "error": err.to_string(), "os_error": err.raw_os_error()}));
                                     log::debug!(
                                         "error while writing to channel {} fd {}: {:#}",
                                         channel_id,
@@ -698,6 +739,10 @@ impl SessionInner {
         for (id, chan) in self.channels.iter_mut() {
             if chan.exit.is_some() {
                 if let Some(status) = chan.channel.exit_status() {
+                    self.diagnostics.event(
+                        "channel_exit",
+                        serde_json::json!({"channel_id": id, "status": format!("{status:?}")}),
+                    );
                     log::trace!("channel {id} has exit status {status:?}");
                     chan.exited = true;
                     let exit = chan.exit.take().unwrap();
@@ -707,15 +752,23 @@ impl SessionInner {
 
             let stdin = &mut chan.descriptors[0];
             if stdin.fd.is_some() && !stdin.buf.is_empty() {
+                let before = stdin.buf.len();
                 if let Err(err) = write_from_buf(&mut chan.channel.writer(), &mut stdin.buf)
                     .context("writing to channel")
                 {
+                    self.diagnostics.event(
+                        "channel_write_error",
+                        serde_json::json!({"channel_id": id, "error": format!("{err:#}")}),
+                    );
                     log::trace!(
                         "Failed to write data to channel {} stdin: {:#}, closing pipe",
                         id,
                         err
                     );
                     stdin.fd.take();
+                }
+                if stdin.buf.len() < before {
+                    self.diagnostics.activity(false);
                 }
             }
 
@@ -735,8 +788,25 @@ impl SessionInner {
                     continue;
                 }
                 match read_into_buf(&mut chan.channel.reader(idx), &mut out.buf) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if out.buf.len() > current_len {
+                            self.diagnostics.activity(true);
+                        }
+                    }
                     Err(err) => {
+                        self.diagnostics.event(
+                            if out.buf.is_empty() {
+                                "channel_read_closed"
+                            } else {
+                                "channel_read_error"
+                            },
+                            serde_json::json!({
+                                "channel_id": id, "stream": idx,
+                                "error": err.to_string(), "error_kind": format!("{:?}", err.kind()),
+                                "os_error": err.raw_os_error(), "channel_exited": chan.exited,
+                                "buffered_bytes": out.buf.len(),
+                            }),
+                        );
                         if out.buf.is_empty() {
                             if !chan.exited {
                                 log::info!(
@@ -815,7 +885,10 @@ impl SessionInner {
                             sess.set_blocking(false);
                             return Ok(true);
                         }
-                        let result = crate::forward::run(sess, request);
+                        self.diagnostics
+                            .event("forward_started", serde_json::json!({}));
+                        let result = crate::forward::run(sess, request, &self.diagnostics);
+                        self.diagnostics.event("forward_stopped", serde_json::json!({"error": result.as_ref().err().map(|e| format!("{e:#}"))}));
                         match sess {
                             #[cfg(feature = "libssh-rs")]
                             SessionWrap::LibSsh(s) => s.sess.disconnect(),

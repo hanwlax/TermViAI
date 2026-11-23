@@ -78,6 +78,7 @@ pub(crate) struct Exec {
 #[derive(Clone)]
 pub struct Session {
     tx: SessionSender,
+    diagnostics: crate::ConnectionDiagnostics,
     // PTYs retain their own senders; only Session handles own this lifetime.
     // Replacing a domain's cached handle must not close another handle that
     // is still authenticating or about to request its first PTY.
@@ -100,7 +101,12 @@ impl Session {
         Self {
             _lifetime: Arc::new(SessionLifetime { tx: tx.clone() }),
             tx,
+            diagnostics: crate::ConnectionDiagnostics::default(),
         }
+    }
+
+    pub fn diagnostics(&self) -> crate::ConnectionDiagnostics {
+        self.diagnostics.clone()
     }
 
     pub fn connect(config: ConfigMap) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
@@ -125,6 +131,7 @@ impl Session {
         });
 
         let now = Instant::now();
+        let diagnostics = crate::ConnectionDiagnostics::new(&config);
 
         let mut inner = SessionInner {
             config,
@@ -140,9 +147,12 @@ impl Session {
             shown_accept_env_error: false,
             last_keep_alive: now,
             keep_alive,
+            diagnostics: diagnostics.clone(),
         };
         std::thread::spawn(move || inner.run());
-        Ok((Self::from_sender(session_sender), rx_event))
+        let mut session = Self::from_sender(session_sender);
+        session.diagnostics = diagnostics;
+        Ok((session, rx_event))
     }
 
     pub async fn request_pty(

@@ -194,10 +194,13 @@ impl Session {
         let control = s.auth.clone();
         let cancelled = s.cancel.clone();
         thread::spawn(move || {
+            let mut diagnostics = wezterm_ssh::ConnectionDiagnostics::default();
+            let mut end_reason = "worker_finished";
             let result = (|| -> anyhow::Result<()> {
                 let (pty, mut child): (Box<dyn MasterPty + Send>, Box<dyn Child + Send + Sync>) =
                     if let Some(plan) = plan {
                         let session = authentication::connect(&control, plan)?;
+                        diagnostics = session.diagnostics();
                         ensure!(!cancelled.load(Ordering::Acquire), "Connection closed");
                         let (pty, child) = smol::block_on(session.request_pty(
                             "xterm-256color",
@@ -232,13 +235,18 @@ impl Session {
                 };
                 pty.resize(pty_size(size))?;
                 control.update(Phase::Connected, String::new());
+                diagnostics.terminal_started(id);
                 let read_weak = weak.clone();
                 let read_cancel = cancelled.clone();
+                let read_diagnostics = diagnostics.clone();
                 thread::spawn(move || {
                     let mut buf = [0; 16384];
                     loop {
                         match reader.read(&mut buf) {
-                            Ok(0) => break,
+                            Ok(0) => {
+                                read_diagnostics.terminal_ended("reader_eof", None);
+                                break;
+                            }
                             Ok(n) => {
                                 let Some(s) = read_weak.upgrade() else { break };
                                 if read_cancel.load(Ordering::Acquire) {
@@ -249,6 +257,14 @@ impl Session {
                                 s.revision.fetch_add(1, Ordering::Release);
                             }
                             Err(e) => {
+                                read_diagnostics.terminal_ended(
+                                    "reader_error",
+                                    Some(&format!(
+                                        "{e} (kind={:?}, os_error={:?})",
+                                        e.kind(),
+                                        e.raw_os_error()
+                                    )),
+                                );
                                 if let Some(s) = read_weak.upgrade() {
                                     s.state.lock().unwrap().error = e.to_string();
                                 }
@@ -266,6 +282,8 @@ impl Session {
                 });
                 loop {
                     if cancelled.load(Ordering::Acquire) {
+                        end_reason = "cancelled";
+                        diagnostics.terminal_ended("cancel_requested", None);
                         let _ = child.kill();
                         break;
                     }
@@ -275,6 +293,7 @@ impl Session {
                             writer.flush()?;
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            end_reason = "input_channel_closed";
                             let _ = child.kill();
                             break;
                         }
@@ -293,6 +312,8 @@ impl Session {
                         pty.resize(size)?;
                     }
                     if child.try_wait()?.is_some() {
+                        diagnostics.terminal_ended("child_exit", None);
+                        end_reason = "child_exit";
                         break;
                     }
                 }
@@ -300,6 +321,11 @@ impl Session {
                 drop(pty);
                 Ok(())
             })();
+            if let Err(e) = &result {
+                diagnostics.terminal_ended("worker_error", Some(&format!("{e:#}")));
+            } else if end_reason != "child_exit" {
+                diagnostics.terminal_ended(end_reason, None);
+            }
             if let Some(s) = weak.upgrade() {
                 let mut state = s.state.lock().unwrap();
                 state.connected = false;
@@ -391,6 +417,10 @@ pub fn connection_config(host: &Host, keepalive: u64) -> anyhow::Result<wezterm_
     let mut cfg = wezterm_ssh::Config::new();
     cfg.add_default_config_files();
     let mut cfg = cfg.for_host(&host.address);
+    cfg.insert(
+        wezterm_ssh::known_hosts::CONFIG_KEY.into(),
+        HostStore::known_hosts_path().to_string_lossy().into_owned(),
+    );
     cfg.insert("hostname".into(), host.address.clone());
     cfg.insert("port".into(), host.port.to_string());
     if !host.username.is_empty() {
@@ -398,6 +428,13 @@ pub fn connection_config(host: &Host, keepalive: u64) -> anyhow::Result<wezterm_
     }
     cfg.insert("wezterm_ssh_backend".into(), "libssh".into());
     cfg.insert("serveraliveinterval".into(), keepalive.to_string());
+    cfg.insert(
+        "termviai_diagnostics_dir".into(),
+        HostStore::path()
+            .with_file_name("logs")
+            .to_string_lossy()
+            .into_owned(),
+    );
     cfg.insert("connecttimeout".into(), "15".into());
     cfg.insert("termviai_auth_attempt".into(), "yes".into());
     if let Some(mode) = host.authentication {
@@ -678,9 +715,7 @@ mod tests {
             wait_for(s, || s.state.lock().unwrap().ended);
         }
     }
-    #[test]
-    #[ignore = "Requires the local synthetic SSH fixture and TERMVIAI_AUTH_FIXTURE"]
-    fn ssh_pty_adapter_key_input_resize_and_close() {
+    fn fixture_session(id: usize, logs: &std::path::Path) -> Arc<Session> {
         let dir = std::env::var("TERMVIAI_AUTH_FIXTURE").unwrap();
         let mut config = wezterm_ssh::Config::new().for_host("127.0.0.1");
         for (k, v) in [
@@ -693,11 +728,14 @@ mod tests {
             ("termviai_identity_file", format!("{dir}/good_key")),
             ("userknownhostsfile", format!("{dir}/known_hosts")),
             ("connecttimeout", "5".into()),
+            ("termviai_no_ssh_config", "yes".into()),
+            ("serveraliveinterval", "1".into()),
+            ("termviai_diagnostics_dir", logs.display().to_string()),
         ] {
             config.insert(k.into(), v);
         }
         let s = Session::start(
-            410,
+            id,
             Some(Host::default()),
             Theme::Ink,
             Some(vec![Candidate {
@@ -718,11 +756,79 @@ mod tests {
             s.online()
         });
         wait_for(&s, || screen_text(&s).contains("fixture-ready"));
+        s
+    }
+
+    fn diagnostic_records(logs: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_dir(logs)
+            .unwrap()
+            .flat_map(|entry| {
+                std::fs::read_to_string(entry.unwrap().path())
+                    .unwrap()
+                    .split_inclusive('\n')
+                    .filter(|line| line.ends_with('\n'))
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "Requires the local synthetic SSH fixture and TERMVIAI_AUTH_FIXTURE"]
+    fn ssh_pty_adapter_key_input_resize_and_close() {
+        let logs = tempfile::tempdir().unwrap();
+        let s = fixture_session(410, logs.path());
         s.resize(30, 90, 720, 600, 96);
         s.send(b"adapter-echo\r").unwrap();
         wait_for(&s, || screen_text(&s).contains("adapter-echo"));
         s.send(b"fixture-exit\r").unwrap();
         wait_for(&s, || s.state.lock().unwrap().ended);
+        wait_for(&s, || {
+            diagnostic_records(logs.path())
+                .iter()
+                .any(|r| r["event"] == "channel_exit")
+        });
+        assert!(
+            diagnostic_records(logs.path())
+                .iter()
+                .any(|r| r["event"] == "terminal_ended")
+        );
+    }
+
+    #[test]
+    #[ignore = "Requires the local synthetic SSH fixture and TERMVIAI_AUTH_FIXTURE"]
+    fn ssh_diagnostics_capture_idle_keepalive_and_abrupt_disconnect() {
+        let logs = tempfile::tempdir().unwrap();
+        let s = fixture_session(411, logs.path());
+        // Do not send input: the idle transport must send a scheduled keepalive.
+        wait_for(&s, || {
+            diagnostic_records(logs.path()).iter().any(|r| {
+                r["event"] == "keepalive_send"
+                    && r["keepalive_send_successes"].as_u64().unwrap_or(0) > 0
+            })
+        });
+        s.send(b"fixture-drop\r").unwrap();
+        wait_for(&s, || s.state.lock().unwrap().ended);
+        let records = diagnostic_records(logs.path());
+        let end = records
+            .iter()
+            .find(|r| r["event"] == "terminal_ended")
+            .unwrap();
+        assert!(end["local_port"].as_u64().unwrap() > 0);
+        assert_eq!(end["peer_port"], 22371);
+        assert_eq!(end["terminal_session_id"], 411);
+        assert_eq!(end["keepalive_mode"], "ssh_ignore_no_reply");
+        assert!(end["last_keepalive_success_at"].is_string());
+        assert!(
+            records
+                .iter()
+                .any(|r| r["event"] == "channel_read_closed" && r["detail"]["error"].is_string())
+        );
+        assert!(
+            !serde_json::to_string(&records)
+                .unwrap()
+                .contains("fixture-drop")
+        );
     }
     #[test]
     fn stored_authentication_retains_priority() {

@@ -138,9 +138,7 @@ impl Issue {
             Self::MissingHost => {
                 "The saved host was changed or removed. Choose its current entry to restore monitoring."
             }
-            Self::Attention => {
-                "Verify this host's authentication or fingerprint in a terminal, then retry monitoring."
-            }
+            Self::Attention => "Review the SSH verification or authentication details below.",
             Self::Collector => {
                 "The remote collector did not finish. Review the details below if the issue persists."
             }

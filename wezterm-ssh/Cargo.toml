@@ -21,6 +21,7 @@ anyhow.workspace = true
 base64 = {workspace = true, features=["std"]}
 bitflags.workspace = true
 camino.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs-next.workspace = true
 filedescriptor.workspace = true
 filenamegen.workspace = true
@@ -35,7 +36,9 @@ regex.workspace = true
 smol.workspace = true
 socket2.workspace = true
 sha2.workspace = true
+serde_json.workspace = true
 ssh2 = {workspace=true, features=["openssl-on-win32"], optional = true}
+tempfile.workspace = true
 thiserror.workspace = true
 wezterm-uds.workspace = true
 
