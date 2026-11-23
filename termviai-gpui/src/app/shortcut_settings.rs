@@ -182,10 +182,8 @@ impl AppView {
     ) -> AnyElement {
         let query = search_text(&editor.search.read(cx).value());
         let changed = self.settings.keyboard_shortcuts != editor.draft;
-        let mut body = self
-            .tool_content(window)
-            .pb_0()
-            .max_w(px(1010. + 2. * Self::tool_gutter(window)))
+        let header = self
+            .tool_header(window)
             .child(
                 div()
                     .flex()
@@ -204,6 +202,7 @@ impl AppView {
             .child(self.title("Keyboard shortcuts"))
             .child(
                 div()
+                    .w_full()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -227,6 +226,11 @@ impl AppView {
                             })),
                     ),
             );
+        let mut body = self
+            .tool_content(window)
+            .flex_row()
+            .flex_wrap()
+            .items_start();
         let mut found = false;
         for (section, icon) in [
             ("Navigation", "termviai/layers.svg"),
@@ -285,7 +289,11 @@ impl AppView {
                             .child(section),
                     )
                     .child(rows);
-                body=body.child(group.when(section=="Terminal clipboard",|d|d.child(self.muted("Selecting terminal text copies it automatically. Right-click a terminal to paste. In other text fields, use Ctrl+C to copy."))));
+                body = body.child(if section == "Terminal clipboard" {
+                    group.w_full().child(self.muted("Selecting terminal text copies it automatically. Right-click a terminal to paste. In other text fields, use Ctrl+C to copy."))
+                } else {
+                    group.flex_basis(px(434.)).flex_grow().min_w_0()
+                });
             }
         }
         let status = if !editor.status.is_empty() {
@@ -295,31 +303,32 @@ impl AppView {
         } else {
             ""
         };
-        body = body
-            .when(!found, |d| d.child(self.muted("No matching shortcuts.")))
+        let body = body.when(!found, |d| d.child(self.muted("No matching shortcuts.")));
+        let footer = div()
+            .border_t_1()
+            .border_color(self.c(self.col().line))
+            .px(px(Self::tool_gutter(window)))
+            .py_2()
+            .flex_shrink_0()
+            .bg(self.c(self.col().side))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().flex_1().child(self.muted(status.to_owned())))
             .child(
-                div()
-                    .border_t_1()
-                    .border_color(self.c(self.col().line))
-                    .pt_3()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().flex_1().child(self.muted(status.to_owned())))
-                    .child(
-                        Button::new("shortcuts-cancel")
-                            .label("Cancel")
-                            .on_click(cx.listener(|s, _, w, cx| s.leave_shortcuts(w, cx))),
-                    )
-                    .child(
-                        Button::new("shortcuts-save")
-                            .primary()
-                            .label("Save changes")
-                            .disabled(!changed || editor.edit.is_some())
-                            .on_click(cx.listener(|s, _, _, cx| s.save_shortcuts(cx))),
-                    ),
+                Button::new("shortcuts-cancel")
+                    .label("Cancel")
+                    .on_click(cx.listener(|s, _, w, cx| s.leave_shortcuts(w, cx))),
+            )
+            .child(
+                Button::new("shortcuts-save")
+                    .primary()
+                    .label("Save changes")
+                    .disabled(!changed || editor.edit.is_some())
+                    .on_click(cx.listener(|s, _, _, cx| s.save_shortcuts(cx))),
             );
-        self.tool_scroll("shortcut-settings", body)
+        self.tool_page("shortcut-settings", header, body)
+            .child(footer)
             .into_any_element()
     }
 

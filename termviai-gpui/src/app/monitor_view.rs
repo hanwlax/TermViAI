@@ -1,6 +1,10 @@
 use super::*;
 use gpui_component::tooltip::Tooltip;
 use termviai_gpui::monitor_presenter::{locations, metrics, process_memory};
+
+// Leaves about 200 px for the HBM bar after labels, values and padding.
+const NPU_CARD_MIN_WIDTH: f32 = 408.;
+
 fn gb(v: Option<f64>) -> String {
     v.map(|v| format!("{:.1}", v / 1024.)).unwrap_or("—".into())
 }
@@ -248,13 +252,14 @@ impl AppView {
         let width = self.tool_content_width(w);
         let inspect = selected.is_some_and(|(_, card, _)| card.is_some());
         let beside = inspect && width >= 850.;
-        let inspector_width = (width * 0.38).clamp(330., 490.);
-        let width = if beside {
+        let inspector_width = (width * 0.45).clamp(330., 490.);
+        let gutter = Self::tool_gutter(w);
+        let resource_width = if beside {
             width - inspector_width
         } else {
             width
         };
-        let card_width = Self::grid_tile_width(width, 322.);
+        let mut header = self.tool_header(w);
         let mut body = self.tool_content(w);
         if !self.monitor.load_error.is_empty() {
             body = body.child(self.notice(
@@ -269,7 +274,7 @@ impl AppView {
                 .as_ref()
                 .map(|s| s.processes(None, None))
                 .unwrap_or_default();
-            body = body
+            header = header
                 .child(
                     div()
                         .flex()
@@ -293,12 +298,14 @@ impl AppView {
                                 .size(px(13.))
                                 .text_color(self.c(self.col().muted)),
                         )
-                        .child(self.muted(e.host.label.clone())),
+                        .child(self.muted(e.host.label.clone()).truncate()),
                 )
                 .child(
                     div()
                         .flex()
                         .items_center()
+                        .w_full()
+                        .flex_wrap()
                         .justify_between()
                         .gap_3()
                         .child(
@@ -356,9 +363,6 @@ impl AppView {
                         .flex_wrap()
                         .items_center()
                         .gap_5()
-                        .border_t_1()
-                        .border_color(self.c(self.col().line))
-                        .pt_4()
                         .child(self.monitor_status(e))
                         .child(self.muted(format!(
                             "{} NPU / {} Die",
@@ -387,12 +391,13 @@ impl AppView {
                             ))
                         })
                         .child(
-                            div().flex().flex_wrap().gap_3().children(
-                                snapshot
-                                    .cards()
-                                    .into_iter()
-                                    .map(|npu| self.monitor_npu_card(id, npu, card_width, cx)),
-                            ),
+                            Self::card_grid(Self::card_columns(resource_width, NPU_CARD_MIN_WIDTH))
+                                .children(
+                                    snapshot
+                                        .cards()
+                                        .into_iter()
+                                        .map(|npu| self.monitor_npu_card(id, npu, cx)),
+                                ),
                         )
                         .child(self.muted("Hover a card to preview processes · Click to inspect"));
                 } else {
@@ -408,31 +413,25 @@ impl AppView {
                     .child(self.notice("Process action needs attention", e.action_error.clone()));
             }
         } else {
-            body = body
-                .child(
+            header =
+                header.child(self.title("Monitor")).child(
                     div()
+                        .w_full()
                         .flex()
                         .items_center()
                         .justify_between()
-                        .gap_2()
-                        .flex_wrap()
-                        .child(self.title("Monitor"))
-                        .child(div().flex_1())
+                        .gap_3()
+                        .child(self.add_button("monitor-add", "Add hosts").on_click(
+                            cx.listener(|s, _, w, cx| s.open_form(FormKind::Monitor, w, cx)),
+                        ))
                         .child(self.interval_button().on_click(cx.listener(
                             |s, e: &ClickEvent, _, cx| {
                                 s.menu = Some((MenuKind::MonitorInterval, e.position()));
                                 cx.notify();
                             },
-                        )))
-                        .child(
-                            self.action_button("monitor-add", "Add hosts", IconName::Plus)
-                                .on_click(
-                                    cx.listener(|s, _, w, cx| {
-                                        s.open_form(FormKind::Monitor, w, cx)
-                                    }),
-                                ),
-                        ),
-                )
+                        ))),
+                );
+            body = body
                 .child(
                     div()
                         .flex()
@@ -473,12 +472,12 @@ impl AppView {
                         ),
                 )
                 .child(
-                    div().flex().flex_wrap().gap_3().children(
+                    Self::card_grid(Self::card_columns(width, 396.)).children(
                         self.monitor
                             .entries
                             .iter()
                             .enumerate()
-                            .map(|(id, _)| self.monitor_host_card(id, card_width, cx)),
+                            .map(|(id, _)| self.monitor_host_card(id, cx)),
                     ),
                 );
             if self.monitor.entries.is_empty() && self.monitor.load_error.is_empty() {
@@ -500,7 +499,6 @@ impl AppView {
         div()
             .relative()
             .w_full()
-            .max_w(px(self.tool_content_width(w) + 2. * Self::tool_gutter(w)))
             .flex_1()
             .min_h_0()
             .flex()
@@ -510,25 +508,26 @@ impl AppView {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
-                    .child(self.tool_scroll(scroll, body)),
+                    .child(self.tool_page(scroll, header, body)),
             )
             .when(inspect, |d| {
                 d.child(
                     div()
                         .flex_shrink_0()
                         .when(beside, |d| d.w(px(inspector_width)).h_full())
-                        .when(!beside, |d| d.h(relative(0.52)).w_full())
+                        .when(!beside, |d| d.h(relative(0.52)).w_full().px(px(gutter)))
                         .child(self.monitor_inspector(cx)),
                 )
             })
             .into_any_element()
     }
-    fn monitor_host_card(&self, id: usize, width: f32, cx: &mut Context<Self>) -> AnyElement {
+    fn monitor_host_card(&self, id: usize, cx: &mut Context<Self>) -> AnyElement {
         let e = &self.monitor.entries[id];
         let mut card = div()
             .id(("monitor-host", id))
             .group("monitor-host")
-            .w(px(width))
+            .w_full()
+            .min_w_0()
             .h(px(148.))
             .p_4()
             .rounded_lg()
@@ -640,7 +639,8 @@ impl AppView {
             cx.notify();
         }));
         div()
-            .w(px(width))
+            .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap_2()
@@ -671,13 +671,7 @@ impl AppView {
             })
             .into_any_element()
     }
-    fn monitor_npu_card(
-        &self,
-        id: usize,
-        npu: u32,
-        width: f32,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn monitor_npu_card(&self, id: usize, npu: u32, cx: &mut Context<Self>) -> AnyElement {
         let e = &self.monitor.entries[id];
         let s = e.snapshot.as_ref().unwrap();
         let mut dies: Vec<_> = s.dies.iter().filter(|d| d.npu == npu).collect();
@@ -707,21 +701,30 @@ impl AppView {
         let colors = self.theme.colors();
         div()
             .id(("monitor-npu", npu as usize))
-            .w(px(width))
-            .p_3()
+            .w_full()
+            .min_w_0()
+            .p_4()
             .rounded_lg()
             .border_1()
             .border_color(self.c(self.col().line))
             .bg(self.c(self.col().card))
+            .when(
+                self.monitor_detail
+                    .is_some_and(|(host, card, _)| host == id && card == Some(npu)),
+                |d| d.border_color(self.c(self.col().accent)),
+            )
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_3()
             .cursor_pointer()
             .hover(|d| d.bg(self.c(self.col().hover)))
             .child(
                 div()
                     .flex()
                     .gap_3()
+                    .pb_2()
+                    .border_b_1()
+                    .border_color(self.c(self.col().line))
                     .child(
                         div()
                             .w(px(54.))
@@ -1024,7 +1027,9 @@ impl AppView {
             .flex_col()
             .child(
                 div()
-                    .p_5()
+                    .px_5()
+                    .py_3()
+                    .bg(self.c(self.col().side))
                     .flex()
                     .items_center()
                     .gap_3()
@@ -1046,7 +1051,16 @@ impl AppView {
                     ),
             )
             .when(!reason && e.snapshot.is_some(), |d| {
-                d.child(controls.px_5().pb_4().flex_shrink_0())
+                d.child(
+                    controls
+                        .px_5()
+                        .pb_3()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .bg(self.c(self.col().side))
+                        .border_b_1()
+                        .border_color(self.c(self.col().line)),
+                )
             })
             .child(
                 div()
@@ -1058,7 +1072,7 @@ impl AppView {
                     .track_scroll(&self.scrollers["monitor-process"])
                     .vertical_scrollbar(&self.scrollers["monitor-process"])
                     .px_5()
-                    .pb_5()
+                    .py_4()
                     .child(content),
             )
             .into_any_element()

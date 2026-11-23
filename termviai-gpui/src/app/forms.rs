@@ -1004,54 +1004,69 @@ impl AppView {
                         |f, on| f.bell = on,
                         cx,
                     ));
-                body = body
-                    .child(self.settings_section("Appearance").child(themes))
+                let shortcuts = div()
+                    .id("open-shortcuts")
+                    .focusable()
+                    .tab_stop(true)
+                    .w_full()
+                    .min_h(px(48.))
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .rounded_lg()
+                    .bg(self.c(self.col().card))
+                    .border_1()
+                    .border_color(self.c(self.col().line))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(self.c(self.col().hover)))
+                    .focus(|d| d.border_color(self.c(self.col().accent)))
                     .child(
                         div()
-                            .id("open-shortcuts")
-                            .focusable()
-                            .tab_stop(true)
-                            .w_full()
-                            .min_h(px(48.))
-                            .px_4()
+                            .flex_1()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Keyboard shortcuts"),
+                    )
+                    .child(Icon::new(IconName::ChevronRight).size(px(16.)))
+                    .on_click(cx.listener(|s, _, w, cx| s.open_shortcuts(w, cx)));
+                let connection = self
+                    .settings_section("Connection")
+                    .child(self.setting_number(
+                        f,
+                        "keepalive",
+                        "SSH keepalive interval (seconds)",
+                        cx,
+                    ));
+                let monitoring = self
+                    .settings_section("Monitoring")
+                    .child(self.setting_toggle(
+                        "Enable NPU Monitor",
+                        f.npu_monitor_enabled,
+                        |f, on| f.npu_monitor_enabled = on,
+                        cx,
+                    ));
+                // Flex bases allow both columns to grow, then stack at narrow widths.
+                let sections = div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .gap_4()
+                    .child(terminal.flex_basis(px(406.)).flex_grow().min_w_0())
+                    .child(
+                        div()
                             .flex()
-                            .items_center()
-                            .gap_3()
-                            .rounded_lg()
-                            .bg(self.c(self.col().card))
-                            .border_1()
-                            .border_color(self.c(self.col().line))
-                            .cursor_pointer()
-                            .hover(|d| d.bg(self.c(self.col().hover)))
-                            .focus(|d| d.border_color(self.c(self.col().accent)))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Keyboard shortcuts"),
-                            )
-                            .child(Icon::new(IconName::ChevronRight).size(px(16.)))
-                            .on_click(cx.listener(|s, _, w, cx| s.open_shortcuts(w, cx))),
-                    )
-                    .child(terminal)
-                    .child(
-                        self.settings_section("Connection")
-                            .child(self.setting_number(
-                                f,
-                                "keepalive",
-                                "SSH keepalive interval (seconds)",
-                                cx,
-                            )),
-                    )
-                    .child(
-                        self.settings_section("Monitoring")
-                            .child(self.setting_toggle(
-                                "Enable NPU Monitor",
-                                f.npu_monitor_enabled,
-                                |f, on| f.npu_monitor_enabled = on,
-                                cx,
-                            )),
+                            .flex_col()
+                            .gap_4()
+                            .flex_basis(px(406.))
+                            .flex_grow()
+                            .min_w_0()
+                            .child(connection)
+                            .child(monitoring),
                     );
+                body = body
+                    .child(self.settings_section("Appearance").child(themes))
+                    .child(sections)
+                    .child(shortcuts);
             }
             FormKind::Monitor | FormKind::MonitorReplace(_) => {
                 body = body.child(self.monitor_host_picker(f, cx));
@@ -1370,7 +1385,7 @@ impl AppView {
                 d.child(self.muted(error).text_color(self.c(self.col().red)))
             })
     }
-    pub(super) fn inline_credential(&self, width: f32, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn inline_credential(&self, cx: &mut Context<Self>) -> AnyElement {
         let f = self.drawer.as_ref().unwrap();
         let (title, delete) = match &f.kind {
             FormKind::Key(key) => ("Key", key.clone().map(Confirm::Key)),
@@ -1378,7 +1393,8 @@ impl AppView {
             _ => return div().into_any_element(),
         };
         div()
-            .w(px(width))
+            .w_full()
+            .min_w_0()
             .rounded_lg()
             .border_1()
             .border_color(self.c(self.col().accent))
@@ -1435,33 +1451,34 @@ impl AppView {
             if let Some(editor) = &f.shortcut_editor {
                 return self.shortcut_page(editor, window, cx);
             }
-            let body = self
-                .tool_content(window)
-                // The actions are the last visible content. Spare space below
-                // them must not extend the scroll range when they already fit.
-                .pb_0()
-                .max_w(px(720. + 2. * Self::tool_gutter(window)))
+            let header = self
+                .tool_header(window)
                 .child(self.title("Settings"))
-                .child(self.form_content(f, None, cx))
                 .child(
                     div()
                         .flex()
-                        .justify_end()
+                        .items_center()
                         .gap_2()
-                        .pt_2()
-                        .border_t_1()
-                        .border_color(self.c(self.col().line))
-                        .child(
-                            self.button("cancel", "Cancel")
-                                .on_click(cx.listener(|s, _, w, cx| s.close_form(w, cx))),
-                        )
                         .child(
                             self.button("save", "Save")
+                                .min_w(px(80.))
+                                .h(px(38.))
                                 .bg(self.c(self.col().soft))
                                 .on_click(cx.listener(|s, _, w, cx| s.save_form(w, cx))),
+                        )
+                        .child(
+                            self.button("cancel", "Cancel")
+                                .min_w(px(80.))
+                                .h(px(38.))
+                                .on_click(cx.listener(|s, _, w, cx| s.close_form(w, cx))),
                         ),
                 );
-            return self.tool_scroll("drawer-scroll", body).into_any_element();
+            let body = self
+                .tool_content(window)
+                .child(self.form_content(f, None, cx));
+            return self
+                .tool_page("drawer-scroll", header, body)
+                .into_any_element();
         }
         let title = match &f.kind {
             FormKind::Host(Some(_)) => "Edit Host",

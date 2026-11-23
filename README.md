@@ -28,7 +28,7 @@ TermViAI combines WezTerm's terminal, SSH and PTY foundations with a native Rust
 - Edit keys and identities in their cards, and find or create a group while editing a host.
 - Per-session `Ctrl` + mouse-wheel font sizing and a persistent global font size.
 - Configurable SSH keepalive interval, defaulting to 30 seconds; `0` disables it.
-- A real empty Hosts start page: no hidden local terminal is created at launch.
+- Launch into New Tab with the search field focused. Use Local terminal or Quick Connect to start a session.
 
 ## Download
 
@@ -45,6 +45,22 @@ This portable package contains `TermViAI.exe`, `README.txt` and `LICENSES.txt`. 
 5. Save a workspace from the tab menu. Right-click a sidebar tab group to save its set of tabs.
 
 Settings and local host data stay on this device. On Windows the application data directory is normally `%APPDATA%\wezterm\termviai`; `TERMVIAI_DATA_DIR` can override it.
+
+SSH connection diagnostics are enabled automatically in the native app and saved
+under that data directory's `logs` folder (`ssh-<process>-<start-time>.jsonl`).
+Each JSON line includes a UTC timestamp, connection ID, local/peer IP and port,
+the underlying channel/transport error, and keepalive interval, attempts, send
+results and last-send times. `terminal_ended` records when the terminal observes
+EOF, an error, cancellation or process exit; correlate its connection ID with
+`channel_read_closed` and `transport_error` for the underlying cause. Channel
+read/write ages measure terminal payload activity, not TCP ACKs. IGNORE keepalive
+send success does **not** establish that the server replied. Proxy connections
+may expose proxy/socketpair endpoints instead of the final SSH server.
+Terminal contents, commands, passwords and keys are not recorded. Logs rotate at
+4 MiB with three backups per app process; logs untouched for seven days are
+removed when a new process log is created. Logging failures do not disconnect
+sessions. Logs begin after starting the updated app; they cannot recover earlier
+disconnects.
 
 ## Build
 

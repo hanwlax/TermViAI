@@ -1,12 +1,15 @@
 use super::*;
 
-const TOOL_CONTENT_WIDTH: f32 = 1248.;
+const CARD_GAP: f32 = 12.;
+const ASSET_CARD_MIN_WIDTH: f32 = 292.;
+const SERVICE_CARD_MIN_WIDTH: f32 = 336.;
+
 impl AppView {
     fn host_tiles(
         &self,
         query: &str,
         group: &str,
-        width: f32,
+        columns: u16,
         cx: &mut Context<Self>,
     ) -> (Div, usize) {
         let hosts: Vec<_> = self
@@ -16,40 +19,16 @@ impl AppView {
             .filter(|h| self.matches_host(h, query, group))
             .collect();
         let host_count = hosts.len();
-        let grid = div()
-            .flex()
-            .flex_wrap()
-            .gap_3()
-            .children(hosts.into_iter().enumerate().map(|(i, h)| {
+        let grid =
+            Self::card_grid(columns).children(hosts.into_iter().enumerate().map(|(i, h)| {
                 let connect = h.clone();
                 let menu = h.clone();
                 let selected = self.host_selection.contains(h);
-                div()
-                    .id(("host", i))
+                self.asset_card(("host", i), IconName::SquareTerminal)
                     .group("host-card")
-                    .w(px(width))
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(self.c(self.col().card))
-                    .border_1()
-                    .border_color(self.c(self.col().line))
-                    .cursor_pointer()
-                    .hover(|d| d.bg(self.c(self.col().hover)))
                     .when(selected, |d| {
                         d.bg(self.c(self.col().soft))
                             .border_color(self.c(self.col().accent))
-                    })
-                    .child(if self.page == Page::Hosts {
-                        self.asset_icon(Icon::new(IconName::SquareTerminal))
-                            .into_any_element()
-                    } else {
-                        Icon::new(IconName::SquareTerminal)
-                            .size(px(19.))
-                            .text_color(self.c(self.col().accent))
-                            .into_any_element()
                     })
                     .child(
                         div()
@@ -127,20 +106,74 @@ impl AppView {
         (f32::from(window.viewport_size().width)
             - self.sidebar_width()
             - 2. * Self::tool_gutter(window))
-        .clamp(1., TOOL_CONTENT_WIDTH)
+        .max(1.)
     }
 
     pub(super) fn tool_content(&self, window: &Window) -> Div {
         let gutter = Self::tool_gutter(window);
         div()
             .w_full()
-            .max_w(px(TOOL_CONTENT_WIDTH + 2. * gutter))
+            .min_w_0()
             .px(px(gutter))
             .pt(px(gutter))
             .pb(px(32.))
             .flex()
             .flex_col()
             .gap_4()
+    }
+
+    pub(super) fn tool_header(&self, window: &Window) -> Div {
+        self.tool_content(window).py_3().gap_2().items_start()
+    }
+
+    pub(super) fn tool_page(&self, id: &'static str, header: Div, body: Div) -> Div {
+        div()
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .w_full()
+                    .flex_shrink_0()
+                    .bg(self.c(self.col().hover))
+                    .border_b_1()
+                    .border_color(self.c(self.col().line))
+                    .child(header),
+            )
+            .child(div().flex_1().min_h_0().child(self.tool_scroll(id, body)))
+    }
+
+    pub(super) fn add_button(&self, id: &'static str, label: &'static str) -> Stateful<Div> {
+        self.toolbar_button(id, label, IconName::Plus)
+    }
+
+    fn toolbar_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        icon: IconName,
+    ) -> Stateful<Div> {
+        let colors = self.col();
+        self.icon_label_button(id, label, icon)
+            .min_w(px(96.))
+            .h(px(38.))
+            .bg(self.c(colors.add))
+            .border_color(self.c(colors.add_border))
+            .text_color(self.c(colors.text))
+            .hover(|d| d.bg(self.c(colors.add_hover)))
+            .active(|d| d.bg(self.c(colors.add_pressed)))
+            .focusable()
+            .tab_stop(true)
+            .focus(|d| {
+                d.shadow(vec![BoxShadow {
+                    color: self.c(colors.accent),
+                    offset: Point::default(),
+                    blur_radius: px(0.),
+                    spread_radius: px(2.),
+                }])
+            })
     }
 
     pub(super) fn tool_scroll(&self, id: &'static str, content: Div) -> Div {
@@ -161,18 +194,17 @@ impl AppView {
             .vertical_scrollbar(scroll)
     }
 
-    pub(super) fn grid_tile_width(available: f32, minimum: f32) -> f32 {
-        let columns = ((available + 12.) / (minimum + 12.)).floor().max(1.);
-        ((available + 12.) / columns - 12.).floor().max(1.)
+    pub(super) fn card_columns(available: f32, minimum: f32) -> u16 {
+        (((available + CARD_GAP) / (minimum + CARD_GAP)).floor() as u16).max(1)
     }
 
-    fn tile_width(&self, window: &Window, minimum: f32) -> f32 {
-        let available = if self.page == Page::NewTab {
-            f32::from(window.viewport_size().width) - self.sidebar_width() - 50.
-        } else {
-            self.tool_content_width(window)
-        };
-        Self::grid_tile_width(available, minimum)
+    pub(super) fn card_grid(columns: u16) -> Div {
+        div()
+            .w_full()
+            .grid()
+            .grid_cols(columns)
+            .gap(px(CARD_GAP))
+            .items_start()
     }
 
     fn asset_icon(&self, icon: Icon) -> Div {
@@ -193,11 +225,11 @@ impl AppView {
         icon: Icon,
         name: &str,
         detail: &str,
-        width: f32,
     ) -> Stateful<Div> {
         div()
             .id(id)
-            .w(px(width))
+            .w_full()
+            .min_w_0()
             .min_h(px(72.))
             .p_3()
             .flex()
@@ -253,6 +285,28 @@ impl AppView {
             )
     }
 
+    fn search_toolbar(
+        &self,
+        w: &Window,
+        action: Stateful<Div>,
+        input: &Entity<InputState>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let compact = self.tool_content_width(w) < 640.;
+        let search = self.search_bar(input, cx);
+        div()
+            .w_full()
+            .flex()
+            .gap_3()
+            .when_else(
+                compact,
+                |d| d.flex_col().items_start(),
+                |d| d.items_center(),
+            )
+            .child(action)
+            .child(search.when_else(compact, |d| d.w_full(), |d| d.flex_1().min_w_0()))
+    }
+
     fn selection_actions(&self, cx: &mut Context<Self>) -> Div {
         if self.host_selection.is_empty() {
             return self.muted("Ctrl + click to select hosts");
@@ -278,10 +332,11 @@ impl AppView {
             )
     }
     pub(super) fn hosts_page(&self, w: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let columns = Self::card_columns(self.tool_content_width(w), ASSET_CARD_MIN_WIDTH);
         let query = self.hosts_search.read(cx).value().trim().to_lowercase();
         let group = self.group.clone();
         let in_group = !group.is_empty();
-        let mut crumb = div().flex().items_center().gap_1().child(
+        let mut crumb = div().flex().flex_wrap().items_center().gap_1().child(
             div()
                 .id("all-hosts")
                 .pr_2()
@@ -322,7 +377,9 @@ impl AppView {
                         })),
                 );
         }
-        let header = div()
+        let title = div()
+            .w_full()
+            .flex_wrap()
             .flex()
             .justify_between()
             .items_center()
@@ -330,25 +387,20 @@ impl AppView {
             .child(self.title("Hosts"))
             .child(self.selection_actions(cx));
         let add = self
-            .action_button("hosts-add", "Add", IconName::Plus)
+            .add_button("hosts-add", "Add")
             .child(Icon::new(IconName::ChevronDown).size(px(13.)))
             .on_click(cx.listener(move |s, e: &ClickEvent, _, cx| {
                 s.menu = Some((MenuKind::AddHost(group.clone()), e.position()));
                 cx.notify();
             }));
         let groups = self.store.child_groups(&self.group);
-        let (host_cards, host_count) =
-            self.host_tiles(&query, &self.group, self.tile_width(w, 240.), cx);
-
-        let body = self.tool_content(w)
-            .child(header)
-            .child(self.search_bar(&self.hosts_search,cx))
-            .child(div().flex().flex_wrap().items_center().gap_3().min_h(px(32.))
-                .child(crumb).child(div().flex_1())
-                .child(add))
+        let (host_cards, host_count) = self.host_tiles(&query, &self.group, columns, cx);
+        let actions = self.search_toolbar(w, add, &self.hosts_search, cx);
+        let header = self.tool_header(w).child(title).child(actions);
+        let body = self.tool_content(w).child(crumb)
             .when_some(self.drawer.as_ref().filter(|f|matches!(f.kind,FormKind::Group(_))),|d,f| d.child(self.name_editor(f,cx).max_w(px(320.))))
             .when(!groups.is_empty(), |d| {
-                d.child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Groups · {}", groups.len()))).child(div().flex().flex_wrap().gap_3().children(
+                d.child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Groups · {}", groups.len()))).child(Self::card_grid(columns).children(
                     groups.into_iter().enumerate().map(|(i, g)| {
                         let id = g.id.clone();
                         let menu = g.clone();
@@ -361,7 +413,7 @@ impl AppView {
                         div()
                             .id(("group", i))
                             .group("group-card")
-                            .w(px(self.tile_width(w, 240.))).min_h(px(72.))
+                            .w_full().min_w_0().min_h(px(72.))
                             .flex()
                             .items_center()
                             .gap_3()
@@ -415,49 +467,130 @@ impl AppView {
                 }
             })
             ;
-        self.tool_scroll("hosts-page", body).into_any_element()
+        self.tool_page("hosts-page", header, body)
+            .into_any_element()
     }
+    pub(super) fn reload_known_hosts(&mut self) {
+        self.known_hosts = wezterm_ssh::known_hosts::load(&HostStore::known_hosts_path())
+            .map_err(|e| format!("{e:#}"));
+    }
+
+    pub(super) fn known_hosts_page(&self, w: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let header = self.tool_header(w).child(self.title("Known Hosts"));
+        let body = self.tool_content(w);
+        let body = match &self.known_hosts {
+            Err(error) => {
+                body.child(self.compact_state(IconName::File, "Could not read known hosts", error))
+            }
+            Ok(pins) if pins.is_empty() => body.child(self.empty_state(
+                IconName::CircleCheck,
+                "No trusted hosts yet",
+                "Fingerprints appear here when you trust a host in a terminal.",
+            )),
+            Ok(pins) => {
+                let columns = Self::card_columns(self.tool_content_width(w), 384.);
+                body.child(
+                    Self::card_grid(columns).children(pins.iter().enumerate().map(
+                        |(i, (endpoint, pin))| {
+                            let endpoint = endpoint.clone();
+                            let pin = pin.clone();
+                            div()
+                                .id(("trusted-host", i))
+                                .group("known-host-card")
+                                .min_w_0()
+                                .px_4()
+                                .py_3()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .border_1()
+                                .rounded_md()
+                                .border_color(self.c(self.col().line))
+                                .bg(self.c(self.col().card))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(Icon::new(IconName::CircleCheck).size(px(16.)))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(endpoint.clone()),
+                                        )
+                                        .child(
+                                            self.close(("forget-host", i))
+                                                .opacity(0.)
+                                                .group_hover("known-host-card", |d| d.opacity(1.))
+                                                .focusable()
+                                                .tab_stop(true)
+                                                .focus(|d| d.opacity(1.))
+                                                .tooltip(|_, cx| {
+                                                    cx.new(|_| {
+                                                        gpui_component::tooltip::Tooltip::new(
+                                                            "Remove trusted host",
+                                                        )
+                                                    })
+                                                    .into()
+                                                })
+                                                .on_click(cx.listener({
+                                                    let pin = pin.clone();
+                                                    move |s, _, _, cx| {
+                                                        let result =
+                                                            wezterm_ssh::known_hosts::remove(
+                                                                &HostStore::known_hosts_path(),
+                                                                &endpoint,
+                                                                &pin,
+                                                            );
+                                                        s.reload_known_hosts();
+                                                        s.notify_error(result, cx);
+                                                    }
+                                                })),
+                                        ),
+                                )
+                                .child(self.muted(pin).text_size(px(12.)))
+                        },
+                    )),
+                )
+            }
+        };
+        self.tool_page("known-hosts-page", header, body)
+            .into_any_element()
+    }
+
     pub(super) fn keychain_page(&self, w: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let columns = Self::card_columns(self.tool_content_width(w), ASSET_CARD_MIN_WIDTH);
+        let header = self.tool_header(w).child(self.title("Keychain")).child(
+            self.add_button("add-credential", "Add")
+                .child(Icon::new(IconName::ChevronDown).size(px(13.)))
+                .on_click(cx.listener(|s, e: &ClickEvent, _, cx| {
+                    s.menu = Some((MenuKind::AddCredential, e.position()));
+                    cx.notify();
+                })),
+        );
         let body = self
             .tool_content(w)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .justify_between()
-                    .child(self.title("Keychain"))
-                    .child(
-                        self.action_button("add-credential", "Add", IconName::Plus)
-                            .child(Icon::new(IconName::ChevronDown).size(px(13.)))
-                            .on_click(cx.listener(|s, e: &ClickEvent, _, cx| {
-                                s.menu = Some((MenuKind::AddCredential, e.position()));
-                                cx.notify();
-                            })),
-                    ),
-            )
             .child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(format!("Keys · {}", self.store.keys.len())),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_start()
-                    .gap_3()
+                Self::card_grid(columns)
                     .when(
                         self.drawer
                             .as_ref()
                             .is_some_and(|f| matches!(f.kind, FormKind::Key(None))),
-                        |d| d.child(self.inline_credential(self.tile_width(w, 240.), cx)),
+                        |d| d.child(self.inline_credential(cx)),
                     )
                     .children(self.store.keys.iter().enumerate().map(|(i, k)| {
                         if self.drawer.as_ref().is_some_and(
                             |f| matches!(&f.kind, FormKind::Key(Some(item)) if item == k),
                         ) {
-                            return self.inline_credential(self.tile_width(w, 240.), cx);
+                            return self.inline_credential(cx);
                         }
                         let k = k.clone();
                         self.credential_card(
@@ -465,7 +598,6 @@ impl AppView {
                             Icon::new(IconName::Settings2).path("termviai/key.svg"),
                             &k.label,
                             &k.path,
-                            self.tile_width(w, 240.),
                         )
                         .on_click(cx.listener(move |s, _, w, cx| {
                             s.open_form(FormKind::Key(Some(k.clone())), w, cx)
@@ -502,22 +634,18 @@ impl AppView {
                     .child(format!("Identities · {}", self.store.identities.len())),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_start()
-                    .gap_3()
+                Self::card_grid(columns)
                     .when(
                         self.drawer
                             .as_ref()
                             .is_some_and(|f| matches!(f.kind, FormKind::Identity(None))),
-                        |d| d.child(self.inline_credential(self.tile_width(w, 240.), cx)),
+                        |d| d.child(self.inline_credential(cx)),
                     )
                     .children(self.store.identities.iter().enumerate().map(|(i, v)| {
                         if self.drawer.as_ref().is_some_and(
                             |f| matches!(&f.kind, FormKind::Identity(Some(item)) if item == v),
                         ) {
-                            return self.inline_credential(self.tile_width(w, 240.), cx);
+                            return self.inline_credential(cx);
                         }
                         let v = v.clone();
                         self.credential_card(
@@ -525,7 +653,6 @@ impl AppView {
                             Icon::new(IconName::CircleUser),
                             &v.label,
                             &format!("Username · {}", v.username),
-                            self.tile_width(w, 240.),
                         )
                         .on_click(cx.listener(move |s, _, w, cx| {
                             s.open_form(FormKind::Identity(Some(v.clone())), w, cx)
@@ -559,11 +686,31 @@ impl AppView {
                     )
                 },
             );
-        self.tool_scroll("keychain-page", body).into_any_element()
+        self.tool_page("keychain-page", header, body)
+            .into_any_element()
     }
+    fn asset_card(&self, id: impl Into<ElementId>, icon: IconName) -> Stateful<Div> {
+        div()
+            .id(id)
+            .w_full()
+            .min_w_0()
+            .min_h(px(72.))
+            .flex()
+            .items_center()
+            .gap_3()
+            .p_3()
+            .rounded_lg()
+            .bg(self.c(self.col().card))
+            .border_1()
+            .border_color(self.c(self.col().line))
+            .cursor_pointer()
+            .hover(|d| d.bg(self.c(self.col().hover)))
+            .child(self.asset_icon(Icon::new(icon)))
+    }
+
     pub(super) fn new_tab_page(&self, w: &Window, cx: &mut Context<Self>) -> AnyElement {
         let query = self.new_tab_search.read(cx).value().trim().to_lowercase();
-        let width = self.tile_width(w, 242.);
+        let columns = Self::card_columns(self.tool_content_width(w), ASSET_CARD_MIN_WIDTH);
         let groups: Vec<_> = self
             .workspaces
             .tab_groups
@@ -592,84 +739,60 @@ impl AppView {
             .iter()
             .filter(|v| self.matches_host(&v.host, &query, ""))
             .collect();
-        let (host_cards, host_count) = self.host_tiles(&query, "", width, cx);
+        let (host_cards, host_count) = self.host_tiles(&query, "", columns, cx);
         let has_results =
             !groups.is_empty() || !saved.is_empty() || !recent.is_empty() || host_count > 0;
-        div()
-            .id("new-tab-page")
-            .w_full()
-            .flex_1()
-            .min_h_0()
-            .relative()
-            .overflow_y_scroll()
-            .track_scroll(&self.scrollers["new-tab-page"])
-            .p_6()
-            .flex()
-            .flex_col()
-            .gap_5()
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(self.title("New Tab"))
-                    .child(
-                        self.button("local-terminal", "Local terminal")
-                            .on_click(cx.listener(|s, _, w, cx| s.connect(None, w, cx))),
-                    ),
-            )
-            .child(self.search_bar(&self.new_tab_search, cx))
-            .child(self.muted("Enter user@hostname to connect, or reopen a saved workspace."))
+        let local = self
+            .toolbar_button("local-terminal", "Local terminal", IconName::SquareTerminal)
+            .on_click(cx.listener(|s, _, w, cx| s.connect(None, w, cx)));
+        let header = self
+            .tool_header(w)
+            .child(self.title("New Tab"))
+            .child(self.search_toolbar(w, local, &self.new_tab_search, cx))
+            .child(self.muted("Enter user@hostname to connect, or reopen a saved workspace."));
+        let body = self
+            .tool_content(w)
             .when(!groups.is_empty(), |d| {
                 d.child(div().font_weight(FontWeight::SEMIBOLD).child("Tab groups"))
-                    .child(div().flex().flex_wrap().gap_3().children(
-                        groups.into_iter().enumerate().map(|(i, g)| {
-                            let group = g.clone();
-                            let menu = g.clone();
-                            let count = g.tabs.len() + usize::from(g.new_tab_open);
-                            div()
-                                .id(("saved-tab-group", i))
-                                .w(px(width))
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .p_3()
-                                .rounded_md()
-                                .bg(self.c(self.col().card))
-                                .hover(|d| d.bg(self.c(self.col().hover)))
-                                .cursor_pointer()
-                                .child(Icon::new(IconName::Folder).size(px(18.)))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .child(div().truncate().child(g.name.clone()))
-                                        .child(self.muted(format!(
-                                            "{count} {}",
-                                            if count == 1 { "tab" } else { "tabs" }
-                                        ))),
-                                )
-                                .child(
-                                    self.icon(("saved-group-menu", i), IconName::Ellipsis)
-                                        .on_click(cx.listener(move |s, e: &ClickEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            s.menu = Some((
-                                                MenuKind::SavedGroup(menu.clone()),
-                                                e.position(),
-                                            ));
-                                            cx.notify();
-                                        })),
-                                )
-                                .on_click(
-                                    cx.listener(move |s, _, w, cx| {
+                    .child(
+                        Self::card_grid(columns).children(groups.into_iter().enumerate().map(
+                            |(i, g)| {
+                                let group = g.clone();
+                                let menu = g.clone();
+                                let count = g.tabs.len() + usize::from(g.new_tab_open);
+                                self.asset_card(("saved-tab-group", i), IconName::Folder)
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(div().truncate().child(g.name.clone()))
+                                            .child(self.muted(format!(
+                                                "{count} {}",
+                                                if count == 1 { "tab" } else { "tabs" }
+                                            ))),
+                                    )
+                                    .child(
+                                        self.icon(("saved-group-menu", i), IconName::Ellipsis)
+                                            .on_click(cx.listener(
+                                                move |s, e: &ClickEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    s.menu = Some((
+                                                        MenuKind::SavedGroup(menu.clone()),
+                                                        e.position(),
+                                                    ));
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    .on_click(cx.listener(move |s, _, w, cx| {
                                         s.open_saved_group(&group, w, cx)
-                                    }),
-                                )
-                        }),
-                    ))
+                                    }))
+                            },
+                        )),
+                    )
             })
             .when(!saved.is_empty(), |d| {
                 d.child(
@@ -677,28 +800,21 @@ impl AppView {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("Saved workspaces"),
                 )
-                .child(div().flex().flex_wrap().gap_3().children(
+                .child(Self::card_grid(columns).children(
                     saved.into_iter().enumerate().map(|(i, v)| {
                         if let Some(f) = self.drawer.as_ref().filter(
                             |f| matches!(&f.kind, FormKind::RenameWorkspace(ws) if ws.id == v.id),
                         ) {
-                            return self.name_editor(f, cx).w(px(width)).into_any_element();
+                            return self
+                                .name_editor(f, cx)
+                                .w_full()
+                                .min_w_0()
+                                .into_any_element();
                         }
                         let open = v.clone();
                         let remove = v.clone();
-                        div()
-                            .id(("workspace", i))
+                        self.asset_card(("workspace", i), IconName::LayoutDashboard)
                             .group("workspace")
-                            .w(px(width))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .p_3()
-                            .rounded_md()
-                            .bg(self.c(self.col().card))
-                            .hover(|d| d.bg(self.c(self.col().hover)))
-                            .cursor_pointer()
-                            .child(Icon::new(IconName::LayoutDashboard).size(px(18.)))
                             .child(
                                 div()
                                     .flex_1()
@@ -728,27 +844,15 @@ impl AppView {
             .when(!recent.is_empty(), |d| {
                 d.child(
                     div()
-                        .mt_3()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("Recent connections"),
                 )
-                .child(div().flex().flex_wrap().gap_3().children(
+                .child(Self::card_grid(columns).children(
                     recent.into_iter().enumerate().map(|(i, v)| {
                         let host = v.host.clone();
                         let remove = v.clone();
-                        div()
-                            .id(("recent", i))
+                        self.asset_card(("recent", i), IconName::SquareTerminal)
                             .group("recent")
-                            .w(px(width))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .p_3()
-                            .rounded_md()
-                            .bg(self.c(self.col().card))
-                            .hover(|d| d.bg(self.c(self.col().hover)))
-                            .cursor_pointer()
-                            .child(Icon::new(IconName::SquareTerminal).size(px(18.)))
                             .child(
                                 div()
                                     .flex_1()
@@ -757,7 +861,7 @@ impl AppView {
                                     .flex_col()
                                     .gap_1()
                                     .child(div().truncate().child(v.host.label.clone()))
-                                    .child(self.muted(v.host.endpoint())),
+                                    .child(self.muted(v.host.endpoint()).truncate()),
                             )
                             .child(
                                 self.close(("remove-recent", i))
@@ -790,7 +894,9 @@ impl AppView {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child("Saved hosts")
+                        .flex_wrap()
+                        .gap_2()
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Saved hosts"))
                         .child(self.selection_actions(cx)),
                 )
                 .child(host_cards)
@@ -825,47 +931,53 @@ impl AppView {
                         ),
                     )
                 }
-            })
+            });
+        self.tool_page("new-tab-page", header, body)
             .into_any_element()
     }
     pub(super) fn forwarding_page(&self, w: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let body = self
-            .tool_content(w)
+        let filters = div().flex().flex_wrap().gap_2().children(
+            [
+                (ForwardFilter::All, "All services"),
+                (ForwardFilter::Active, "Active"),
+                (ForwardFilter::Attention, "Needs attention"),
+                (ForwardFilter::Stopped, "Stopped"),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (filter, label))| {
+                self.button(("service-filter", i), label)
+                    .when(self.forward_filter == filter, |d| {
+                        d.bg(self.c(self.col().soft))
+                    })
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        s.forward_filter = filter;
+                        cx.notify();
+                    }))
+            }),
+        );
+        let header = self
+            .tool_header(w)
+            .child(self.title("Port Forwarding"))
             .child(
                 div()
+                    .w_full()
                     .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(self.title("Port Forwarding"))
-                    .child(
-                        self.action_button("forward-add", "Add Service", IconName::Plus)
-                            .on_click(cx.listener(|s, _, w, cx| {
-                                s.open_form(FormKind::Forward(None), w, cx)
-                            })),
-                    ),
-            )
-            .child(
-                div().flex().flex_wrap().gap_2().children(
-                    [
-                        (ForwardFilter::All, "All services"),
-                        (ForwardFilter::Active, "Active"),
-                        (ForwardFilter::Attention, "Needs attention"),
-                        (ForwardFilter::Stopped, "Stopped"),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (filter, label))| {
-                        self.button(("service-filter", i), label)
-                            .when(self.forward_filter == filter, |d| {
-                                d.bg(self.c(self.col().soft))
-                            })
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                s.forward_filter = filter;
-                                cx.notify();
-                            }))
-                    }),
-                ),
-            )
+                    .flex_wrap()
+                    .gap_3()
+                    .when_else(
+                        self.tool_content_width(w) < 640.,
+                        |d| d.flex_col().items_start(),
+                        |d| d.items_center().justify_between(),
+                    )
+                    .child(self.add_button("forward-add", "Add Service").on_click(
+                        cx.listener(|s, _, w, cx| s.open_form(FormKind::Forward(None), w, cx)),
+                    ))
+                    .child(filters),
+            );
+        let columns = Self::card_columns(self.tool_content_width(w), SERVICE_CARD_MIN_WIDTH);
+        let body = self
+            .tool_content(w)
             .when(
                 !self.forwarding.is_empty()
                     && !self
@@ -896,7 +1008,7 @@ impl AppView {
                 },
             )
             .child(
-                div().flex().flex_wrap().gap_3().children(
+                Self::card_grid(columns).children(
                     self.forwarding
                         .iter()
                         .enumerate()
@@ -905,9 +1017,93 @@ impl AppView {
                             let id = v.rule.id.clone();
                             let menu = id.clone();
                             let active = v.state.active();
+                            let failed = matches!(
+                                v.state,
+                                forwarding::State::Attention | forwarding::State::Failed
+                            );
+                            let color = if failed {
+                                self.col().red
+                            } else if v.state == forwarding::State::Running {
+                                self.col().green
+                            } else {
+                                self.col().muted
+                            };
+                            let info = div()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(v.rule.name.clone()),
+                                )
+                                .child(self.muted(format!(
+                                    "{}:{} → 127.0.0.1:{}",
+                                    v.rule.host.label, v.rule.remote_port, v.rule.local_port
+                                )));
+                            let controls = div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .w_full()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .size(px(7.))
+                                                .flex_shrink_0()
+                                                .rounded_full()
+                                                .bg(self.c(color)),
+                                        )
+                                        .child(self.muted(v.status()).text_color(self.c(color))),
+                                )
+                                .child(
+                                    self.button(
+                                        ("service-toggle", i),
+                                        if active {
+                                            "Stop"
+                                        } else if failed {
+                                            "Retry"
+                                        } else {
+                                            "Start"
+                                        },
+                                    )
+                                    .min_w(px(74.))
+                                    .on_click(cx.listener(
+                                        move |s, _, _, cx| {
+                                            let r = if active {
+                                                forwarding::manager().lock().unwrap().stop(&id)
+                                            } else {
+                                                forwarding::manager()
+                                                    .lock()
+                                                    .unwrap()
+                                                    .start(&id, &s.store)
+                                            };
+                                            s.notify_error(r, cx);
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    self.icon(("edit-service", i), IconName::Ellipsis).on_click(
+                                        cx.listener(move |s, e: &ClickEvent, _, cx| {
+                                            s.menu = Some((
+                                                MenuKind::Forward(menu.clone()),
+                                                e.position(),
+                                            ));
+                                            cx.notify();
+                                        }),
+                                    ),
+                                );
                             div()
                                 .id(("service", i))
-                                .w(px(self.tile_width(w, 240.)))
+                                .w_full()
+                                .min_w_0()
                                 .p_4()
                                 .rounded_lg()
                                 .bg(self.c(self.col().card))
@@ -916,95 +1112,18 @@ impl AppView {
                                 .flex()
                                 .flex_col()
                                 .gap_3()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .justify_between()
-                                        .items_center()
-                                        .child(
-                                            div()
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .child(v.rule.name.clone()),
-                                        )
-                                        .child(
-                                            self.icon(("edit-service", i), IconName::Ellipsis)
-                                                .on_click(cx.listener(
-                                                    move |s, e: &ClickEvent, _, cx| {
-                                                        s.menu = Some((
-                                                            MenuKind::Forward(menu.clone()),
-                                                            e.position(),
-                                                        ));
-                                                        cx.notify();
-                                                    },
-                                                )),
-                                        ),
-                                )
-                                .child(self.muted(format!(
-                                    "{}:{} → 127.0.0.1:{}",
-                                    v.rule.host.label, v.rule.remote_port, v.rule.local_port
-                                )))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap_2()
-                                        .pt_2()
-                                        .border_t_1()
-                                        .border_color(self.c(self.col().line))
-                                        .child(self.muted(v.status()).text_color(self.c(
-                                            if matches!(
-                                                v.state,
-                                                forwarding::State::Attention
-                                                    | forwarding::State::Failed
-                                            ) {
-                                                self.col().red
-                                            } else if v.state == forwarding::State::Running {
-                                                self.col().green
-                                            } else {
-                                                self.col().muted
-                                            },
-                                        )))
-                                        .child(
-                                            self.button(
-                                                ("service-toggle", i),
-                                                if active {
-                                                    "Stop"
-                                                } else if matches!(
-                                                    v.state,
-                                                    forwarding::State::Attention
-                                                        | forwarding::State::Failed
-                                                ) {
-                                                    "Retry"
-                                                } else {
-                                                    "Start"
-                                                },
-                                            )
-                                            .on_click(
-                                                cx.listener(move |s, _, _, cx| {
-                                                    let r = if active {
-                                                        forwarding::manager()
-                                                            .lock()
-                                                            .unwrap()
-                                                            .stop(&id)
-                                                    } else {
-                                                        forwarding::manager()
-                                                            .lock()
-                                                            .unwrap()
-                                                            .start(&id, &s.store)
-                                                    };
-                                                    s.notify_error(r, cx);
-                                                }),
-                                            ),
-                                        ),
-                                )
+                                .child(info)
+                                .child(controls)
                                 .when(self.forward_detail.as_ref() == Some(&v.rule.id), |d| {
                                     d.child(
                                         div()
                                             .flex()
                                             .flex_col()
                                             .gap_1()
+                                            .items_start()
+                                            .pt_3()
+                                            .border_t_1()
+                                            .border_color(self.c(self.col().line))
                                             .child(self.muted(v.rule.host.endpoint()))
                                             .when_some(v.last_attempt, |d, time| {
                                                 let seconds =
@@ -1039,6 +1158,7 @@ impl AppView {
                         }),
                 ),
             );
-        self.tool_scroll("forward-page", body).into_any_element()
+        self.tool_page("forward-page", header, body)
+            .into_any_element()
     }
 }

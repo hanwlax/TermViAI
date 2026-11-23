@@ -45,6 +45,7 @@ fn preserve_input_focus(_: &MouseDownEvent, window: &mut Window, _: &mut App) {
 pub enum Page {
     Hosts,
     Keychain,
+    KnownHosts,
     NewTab,
     EmptyTabGroup,
     Terminal(usize),
@@ -229,6 +230,7 @@ impl Render for ResizeDrag {
 
 pub struct AppView {
     store: HostStore,
+    known_hosts: Result<BTreeMap<String, String>, String>,
     workspaces: WorkspaceStore,
     settings: Settings,
     theme: Theme,
@@ -401,6 +403,7 @@ impl AppView {
         .detach();
         Self {
             store,
+            known_hosts: Ok(BTreeMap::new()),
             workspaces,
             settings,
             theme,
@@ -450,6 +453,7 @@ impl AppView {
                 "tab-picker",
                 "hosts-page",
                 "keychain-page",
+                "known-hosts-page",
                 "new-tab-page",
                 "monitor-page",
                 "monitor-detail",
@@ -470,6 +474,8 @@ impl AppView {
         self.apply_theme(self.settings.theme, w, cx);
         if local {
             self.connect(None, w, cx);
+        } else {
+            self.open_new_tab(w, cx);
         }
     }
     fn c(&self, s: &str) -> Hsla {

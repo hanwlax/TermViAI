@@ -164,6 +164,18 @@ impl AppView {
         label: impl Into<SharedString>,
         icon: IconName,
     ) -> Stateful<Div> {
+        self.icon_label_button(id, label, icon).hover(|d| {
+            d.bg(self.c(self.col().soft))
+                .text_color(self.c(self.col().accent))
+        })
+    }
+
+    pub(super) fn icon_label_button(
+        &self,
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        icon: IconName,
+    ) -> Stateful<Div> {
         div()
             .id(id)
             .flex()
@@ -180,9 +192,5 @@ impl AppView {
             .cursor_pointer()
             .child(Icon::new(icon).size(px(15.)))
             .child(label.into())
-            .hover(|d| {
-                d.bg(self.c(self.col().soft))
-                    .text_color(self.c(self.col().accent))
-            })
     }
 }

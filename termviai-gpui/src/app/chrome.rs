@@ -886,6 +886,7 @@ impl AppView {
                     (Page::Keychain, "Keychain", IconName::Asterisk),
                     (Page::Monitor, "Monitor", IconName::ChartPie),
                     (Page::Forwarding, "Port Forwarding", IconName::Replace),
+                    (Page::KnownHosts, "Known Hosts", IconName::CircleCheck),
                 ]
                 .into_iter()
                 .enumerate()
@@ -1608,6 +1609,7 @@ impl Render for AppView {
         let page = match self.page {
             Page::Hosts => self.hosts_page(w, cx),
             Page::Keychain => self.keychain_page(w, cx),
+            Page::KnownHosts => self.known_hosts_page(w, cx),
             Page::NewTab => self.new_tab_page(w, cx),
             Page::EmptyTabGroup => self
                 .empty_state(

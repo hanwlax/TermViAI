@@ -385,6 +385,15 @@ impl TerminalView {
                 modifiers: modifiers(mods),
             });
     }
+    #[cfg(all(test, windows))]
+    pub(crate) fn pointer_test_state(&self) -> (Bounds<Pixels>, f32, bool) {
+        (
+            self.bounds,
+            self.scroll,
+            self.selection.dragging || self.thumb_drag.is_some(),
+        )
+    }
+
     fn history(&self) -> usize {
         self.session.state.lock().unwrap().term.screen().phys_row(0)
     }
@@ -402,6 +411,21 @@ impl TerminalView {
     fn paint(&mut self, bounds: Bounds<Pixels>, w: &mut Window, cx: &mut Context<Self>) {
         // Element move handlers are hit-tested. Capture an active drag at window
         // level so leaving this pane cannot freeze the endpoint or affect a sibling.
+        // A release can be lost while a pane is hidden or Windows transfers capture.
+        // A new left press starts a distinct gesture, including on sibling controls.
+        let view = cx.entity().downgrade();
+        w.on_mouse_event(move |e: &MouseDownEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture && e.button == MouseButton::Left {
+                let _ = view.update(cx, |s, cx| {
+                    if s.selection.dragging || s.thumb_drag.is_some() {
+                        s.selection.dragging = false;
+                        s.selection_pointer = None;
+                        s.thumb_drag = None;
+                        cx.notify();
+                    }
+                });
+            }
+        });
         let view = cx.entity().downgrade();
         w.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
             if phase == DispatchPhase::Capture {
@@ -411,6 +435,8 @@ impl TerminalView {
                             s.selection.dragging = false;
                             s.selection_pointer = None;
                             s.thumb_drag = None;
+                            cx.notify();
+                            return;
                         } else if s.thumb_drag.is_some() {
                             s.drag_scroll(e.position);
                         } else {

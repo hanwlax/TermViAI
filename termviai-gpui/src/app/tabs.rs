@@ -567,6 +567,9 @@ impl AppView {
         }
         self.clear_page_search(w, cx);
         self.page = page;
+        if page == Page::KnownHosts {
+            self.reload_known_hosts();
+        }
         self.remember_group_page();
         self.tab_picker = false;
         self.menu = None;

@@ -119,6 +119,7 @@ impl AppView {
         let p = &self.panes[&id];
         let view = p.session.auth.view();
         let title = match view.phase {
+            Phase::Verify if view.host_key_changed => "SSH host key changed",
             Phase::Verify => "Verify SSH host",
             Phase::Challenge => "Additional authentication",
             Phase::Waiting => "Choose authentication",
@@ -137,43 +138,24 @@ impl AppView {
             )
             .child(self.muted(p.host.as_ref().map(|h| h.endpoint()).unwrap_or_default()));
         if view.phase == Phase::Verify {
-            let fingerprint = view
-                .error
-                .lines()
-                .find_map(|line| line.split_once("Fingerprint: "));
-            let (label, value) = match fingerprint {
-                Some((algorithm, hash)) => (
-                    format!(
-                        "{}fingerprint",
-                        if algorithm.trim().is_empty() {
-                            String::new()
-                        } else {
-                            format!("{} ", algorithm.trim())
-                        }
-                    ),
-                    hash.strip_suffix('.').unwrap_or(hash),
-                ),
-                None => ("Host verification".to_owned(), view.error.as_str()),
-            };
-            content = content
-                .child(
-                    div()
-                        .max_w(px(540.))
-                        .p_3()
-                        .rounded_md()
-                        .bg(self.c(self.col().card))
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(self.muted(label))
-                        .child(
-                            div()
-                                .font_family("JetBrains Mono")
-                                .text_color(self.c(self.col().text))
-                                .child(value.to_owned()),
-                        ),
-                )
-                .child(self.muted("Compare the fingerprint with one from a trusted source."));
+            content =
+                content
+                    .child(
+                        div()
+                            .w_full()
+                            .max_w(px(640.))
+                            .min_w_0()
+                            .p_3()
+                            .rounded_md()
+                            .bg(self.c(self.col().card))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .children(view.error.lines().map(|line| {
+                                div().min_w_0().text_size(px(13.)).child(line.to_owned())
+                            })),
+                    )
+                    .child(self.muted("Compare the fingerprint with one from a trusted source."));
         } else if !view.error.is_empty() {
             content = content.child(
                 div()
@@ -220,16 +202,22 @@ impl AppView {
         match view.phase {
             Phase::Verify => {
                 let control = p.session.auth.clone();
-                footer = footer.child(self.button(("trust-host", id), "Trust & Connect").on_click(
+                let revision = view.revision;
+                let action = if view.host_key_changed {
+                    "Replace key & Connect"
+                } else {
+                    "Trust & Connect"
+                };
+                footer = footer.child(self.button(("trust-host", id), action).on_click(
                     cx.listener(move |s, _, _, cx| {
-                        let r = control.send(authentication::Command::Trust(true));
+                        let r = control.answer_host(revision, true);
                         s.notify_error(r, cx);
                     }),
                 ));
                 let reject = p.session.auth.clone();
                 footer = footer.child(self.button(("reject-host", id), "Cancel").on_click(
                     cx.listener(move |s, _, _, cx| {
-                        s.notify_error(reject.send(authentication::Command::Trust(false)), cx);
+                        s.notify_error(reject.answer_host(revision, false), cx);
                     }),
                 ));
             }
@@ -787,28 +775,46 @@ impl AppView {
             .rounded_t(px(11.))
             .border_b_1()
             .border_color(self.c(self.col().line).opacity(0.55))
-            .cursor(CursorStyle::PointingHand)
             .child(
                 div()
-                    .id(("pane-actions", id))
-                    .size(px(24.))
+                    .id(("pane-drag", id))
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .hover(|d| d.bg(self.c(self.col().hover)))
+                    .gap_2()
+                    .cursor(CursorStyle::PointingHand)
                     .child(
-                        Icon::new(IconName::EllipsisVertical)
-                            .path("termviai/grip.svg")
-                            .size(px(15.)),
+                        div()
+                            .id(("pane-actions", id))
+                            .size(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .hover(|d| d.bg(self.c(self.col().hover)))
+                            .child(
+                                Icon::new(IconName::EllipsisVertical)
+                                    .path("termviai/grip.svg")
+                                    .size(px(15.)),
+                            )
+                            .on_click(cx.listener(move |s, e: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                s.menu = Some((MenuKind::Pane(tab, id), e.position()));
+                                cx.notify();
+                            })),
                     )
-                    .on_click(cx.listener(move |s, e: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        s.menu = Some((MenuKind::Pane(tab, id), e.position()));
-                        cx.notify();
-                    })),
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .on_drag(drag, move |d: &Drag, _, _, cx| {
+                        owner.update(cx, |s, cx| {
+                            s.clear_drag();
+                            s.drag_source = Some(d.clone());
+                            cx.notify();
+                        });
+                        cx.new(|_| d.clone())
+                    }),
             )
-            .child(div().flex_1().min_w_0().truncate().child(label))
             .child(p.notices.clone())
             .child(
                 div()
@@ -871,15 +877,7 @@ impl AppView {
                 s.focused = Some(id);
                 s.panes[&id].view.focus_handle(cx).focus(w);
                 cx.notify();
-            }))
-            .on_drag(drag, move |d: &Drag, _, _, cx| {
-                owner.update(cx, |s, cx| {
-                    s.clear_drag();
-                    s.drag_source = Some(d.clone());
-                    cx.notify();
-                });
-                cx.new(|_| d.clone())
-            });
+            }));
         let content = if !has_terminal && !matches!(state.phase, Phase::Connected) {
             self.auth_view(id, tab, cx)
         } else {
